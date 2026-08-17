@@ -1,0 +1,31 @@
+# CI for gh-runnerd itself (plan §16 phase 6: pin GitHub Actions).
+# Actions are pinned to full commit SHAs; bump deliberately.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      # actions/checkout v5.0.0
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      # actions/setup-go v6.0.0
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+      - run: go vet ./...
+      - run: gofmt -l . | tee /dev/stderr | (! read)
+      - run: go test -race ./...
+      - name: dry-run example config
+        run: go run ./cmd/gh-runnerd --config configs/config.example.yaml --dry-run
