@@ -1,0 +1,55 @@
+# gh-runnerd example config.
+#
+# Paths are repo-relative so `gh-runnerd --config configs/config.example.yaml
+# --dry-run` works on a dev box (backend=process, throwaway key). For
+# production, copy to /etc/gh-runnerd/config.yaml, point the paths at the
+# plan §4 locations, set backend=systemd, and fill in a real sha256.
+
+github:
+  url: https://github.com
+  app:
+    client_id: Iv1.xxxxxxxx
+    installation_id: 12345678
+    private_key_path: testdata/dry-run.pem
+  scope:
+    kind: organization          # organization | repository
+    owner: my-org
+    repository: ""              # required if kind=repository
+
+scale_set:
+  name: debian-host             # this is runs-on
+  runner_group: Default
+  extra_labels: []              # github.com cloud: usually just the name
+
+capacity:
+  min_runners: 0
+  max_runners: 4
+  job_cpu_quota_percent: 400    # systemd CPUQuota
+  job_memory_max: 8G
+
+runner:
+  version: 2.328.0              # pin; do not float
+  download_url: ""              # optional override; default GitHub release
+  sha256: 01066fad3a2893e63e6ca880ae3a1fad5bf9329d60e77ee15f2b97c148c3cd4e  # actions-runner-linux-x64-2.328.0.tar.gz
+  work_directory: _work
+  disable_update: true
+  user: gha-runner
+  group: gha-runner
+  environment_file: configs/runner.env.example
+
+paths:
+  state_dir: var/lib/gh-runnerd
+  cache_dir: var/cache/gh-runnerd
+  log_dir: var/log/gh-runnerd
+
+runtime:
+  backend: process              # systemd | process; process for local dry-run
+  slot_start_timeout: 90s
+  slot_stop_timeout: 30s
+  cleanup_timeout: 60s
+  acquire_grace: 3m
+
+observability:
+  listen: 127.0.0.1:9090
+  log_level: info
+  ship_diag: true
