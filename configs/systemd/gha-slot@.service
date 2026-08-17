@@ -1,0 +1,40 @@
+# gha-slot@.service — one ephemeral GitHub Actions runner slot.
+#
+# ALTERNATIVE unit. The daemon's default is to create transient units at
+# runtime via `systemd-run --unit=gha-slot-<id>` whose properties (User,
+# CPUQuota, MemoryMax, EnvironmentFile, hardening) come from config. This
+# static template exists for operators who prefer fixed units:
+#
+#     systemctl enable --now gha-slot@0001.service
+#
+# ExecStart follows the phase-0 spike decision (docs/spike.md): the
+# official agent (pinned 2.328.x) only accepts `run.sh --jitconfig
+# <value>` on argv. The value is read by the shell from a 0600 tmpfs file
+# (`/run/gh-runnerd/<slot>.jit`, written by the daemon, unlinked on slot
+# wipe) so it never sits in a long-lived argv; the shell `exec`s run.sh so
+# the unit's main process is the runner itself.
+
+[Unit]
+Description=GitHub Actions runner slot %i
+StopWhenUnneeded=no
+
+[Service]
+Type=exec
+User=gha-runner
+Group=gha-runner
+WorkingDirectory=/var/lib/gh-runnerd/slots/%i
+EnvironmentFile=/etc/gh-runnerd/runner.env
+ExecStart=/bin/sh -c 'exec ./run.sh --jitconfig "$(cat /run/gh-runnerd/%i.jit)"'
+KillMode=mixed
+TimeoutStopSec=30
+Nice=5
+CPUQuota=400%
+MemoryMax=8G
+TasksMax=4096
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/gh-runnerd/slots/%i /tmp
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes

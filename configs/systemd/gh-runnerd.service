@@ -1,0 +1,29 @@
+# gh-runnerd.service — GitHub Actions host runner supervisor (daemon unit).
+#
+# The daemon must be able to start/stop transient slot units
+# (gha-slot-<id>.service) as an unprivileged user. That requires a narrow
+# polkit rule allowing `gh-runnerd` to manage only `gha-slot-*.service`
+# (or a systemd user transient scope). See the "systemd integration"
+# section of the README.
+#
+# If polkit/dbus is too heavy for v1, the daemon may run as root with the
+# hardening below (NoNewPrivileges=yes, ProtectSystem=strict) — documented
+# technical debt; confine it further when you can.
+
+[Unit]
+Description=GitHub Actions host runner supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=gh-runnerd
+ExecStart=/usr/local/sbin/gh-runnerd --config /etc/gh-runnerd/config.yaml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/gh-runnerd /var/log/gh-runnerd /run/gh-runnerd
+
+[Install]
+WantedBy=multi-user.target
