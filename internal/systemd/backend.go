@@ -13,7 +13,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
+	"os/user"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -37,6 +40,15 @@ type Options struct {
 	// StopTimeout is the TimeoutStopSec value set on each slot unit.
 	StopTimeout time.Duration
 }
+
+// lookupUser resolves a unix user; swapped in tests.
+var lookupUser = user.Lookup
+
+// runnerCacheSubdirs are the HOME-relative shared cache locations jobs
+// may write (plan §12: "~/.cache, mise, go/pkg/mod are allowed and
+// desirable") despite ProtectHome=read-only. Without them the runner
+// user cannot use the host toolchain (acceptance criterion 8).
+var runnerCacheSubdirs = []string{".cache", ".local/share/mise", "go/pkg/mod"}
 
 // Backend starts, stops, and waits on transient gha-slot-<id>.service
 // units. All methods are safe for concurrent use.
@@ -111,6 +123,7 @@ func (b *Backend) startArgs(spec runner.Spec) []string {
 	addProp("EnvironmentFile", spec.EnvFile)
 	addProp("CPUQuota", spec.CPUQuota)
 	addProp("MemoryMax", spec.MemoryMax)
+	paths := append([]string{spec.SlotDir, "/tmp"}, b.writableCachePaths(spec)...)
 	args = append(args,
 		"-p", "Nice=5",
 		"-p", "KillMode=mixed",
@@ -120,12 +133,57 @@ func (b *Backend) startArgs(spec runner.Spec) []string {
 		"-p", "NoNewPrivileges=yes",
 		"-p", "ProtectSystem=strict",
 		"-p", "ProtectHome=read-only",
-		"-p", "ReadWritePaths="+spec.SlotDir+":/tmp",
+		"-p", "ReadWritePaths="+strings.Join(paths, ":"),
 		"-p", "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
 		"-p", "LockPersonality=yes",
 		"/bin/sh", "-c", runner.JITScript(spec.JITPath), "--", spec.JITPath,
 	)
 	return args
+}
+
+// writableCachePaths returns the runner user's shared cache directories
+// (plan §12) to exempt from ProtectHome=read-only, creating them first
+// so they exist and — when the daemon runs as root — belong to the
+// runner user (systemd auto-creates missing ReadWritePaths entries as
+// root-owned, which the runner user then cannot write). Unresolvable
+// users and uncreatable paths are skipped; the host bootstrap (plan
+// §12) is the fallback.
+func (b *Backend) writableCachePaths(spec runner.Spec) []string {
+	if spec.User == "" {
+		return nil
+	}
+	u, err := lookupUser(spec.User)
+	if err != nil {
+		b.log.Debug("runner user unresolvable; shared caches not writable", "user", spec.User, "err", err)
+		return nil
+	}
+	var paths []string
+	for _, sub := range runnerCacheSubdirs {
+		p := filepath.Join(u.HomeDir, sub)
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			b.log.Debug("runner cache dir unavailable", "path", p, "err", err)
+			continue
+		}
+		b.chownIfRoot(p, u)
+		paths = append(paths, p)
+	}
+	return paths
+}
+
+// chownIfRoot hands a pre-created cache directory to the runner user.
+// Best-effort: failures are logged at debug and the path stays listed.
+func (b *Backend) chownIfRoot(path string, u *user.User) {
+	if os.Geteuid() != 0 {
+		return
+	}
+	uid, err1 := strconv.Atoi(u.Uid)
+	gid, err2 := strconv.Atoi(u.Gid)
+	if err1 != nil || err2 != nil {
+		return
+	}
+	if err := os.Chown(path, uid, gid); err != nil {
+		b.log.Debug("cache dir chown failed", "path", path, "err", err)
+	}
 }
 
 // Stop terminates the unit and returns once it is gone. The started set

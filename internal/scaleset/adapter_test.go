@@ -20,6 +20,9 @@ import (
 type fakeSessionClient struct {
 	totalAssigned int
 	getErr        error
+	// messages, when non-empty, are returned by GetMessage one at a
+	// time (nil, nil once drained).
+	messages []*scaleset.RunnerScaleSetMessage
 
 	mu     sync.Mutex
 	closed bool
@@ -28,6 +31,11 @@ type fakeSessionClient struct {
 func (f *fakeSessionClient) GetMessage(ctx context.Context, lastMessageID, maxCapacity int) (*scaleset.RunnerScaleSetMessage, error) {
 	if f.getErr != nil {
 		return nil, f.getErr
+	}
+	if len(f.messages) > 0 {
+		msg := f.messages[0]
+		f.messages = f.messages[1:]
+		return msg, nil
 	}
 	return nil, nil
 }
@@ -341,5 +349,89 @@ func TestRunSessionCreateError(t *testing.T) {
 	}
 	if !errors.Is(sessionErr, boom) {
 		t.Fatalf("ev.Session error %v does not wrap %v", sessionErr, boom)
+	}
+}
+
+// TestRunEmitsSessionStarted: the adapter reports session establishment
+// (plan §11 gates sd_notify READY on the listener session being started).
+func TestRunEmitsSessionStarted(t *testing.T) {
+	fake := &fakeSessionClient{totalAssigned: 1}
+	a := &Adapter{
+		cfg:            Config{MinRunners: 0, MaxRunners: 5, SessionOwner: "test-host"},
+		log:            discardLogger(),
+		scaleSetID:     42,
+		newSessionFunc: fakeSession(fake),
+	}
+	startedCh := make(chan struct{}, 1)
+	a.ev.SessionStarted = func() { startedCh <- struct{}{} }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- a.Run(ctx) }()
+
+	select {
+	case <-startedCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SessionStarted never fired after session creation")
+	}
+	cancel()
+	<-runErr
+}
+
+// TestRunSessionCreateErrorDoesNotEmitSessionStarted: readiness is only
+// reported for a session that actually exists.
+func TestRunSessionCreateErrorDoesNotEmitSessionStarted(t *testing.T) {
+	a := &Adapter{
+		cfg:        Config{MinRunners: 0, MaxRunners: 5},
+		log:        discardLogger(),
+		scaleSetID: 42,
+		newSessionFunc: func(context.Context, int, string) (listener.Client, error) {
+			return nil, errors.New("session create boom")
+		},
+	}
+	fired := make(chan struct{}, 1)
+	a.ev.SessionStarted = func() { fired <- struct{}{} }
+	if err := a.Run(context.Background()); err == nil {
+		t.Fatal("expected Run to fail on session-create error")
+	}
+	select {
+	case <-fired:
+		t.Fatal("SessionStarted fired despite failed session creation")
+	default:
+	}
+}
+
+// TestRunReportsMessageIDs: the adapter wraps the session client so
+// every fetched message ID reaches ev.MessageID (the
+// gh_runnerd_last_message_id metric, plan §14).
+func TestRunReportsMessageIDs(t *testing.T) {
+	fake := &fakeSessionClient{
+		totalAssigned: 1,
+		messages: []*scaleset.RunnerScaleSetMessage{{
+			MessageID:  7,
+			Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 1},
+		}},
+	}
+	a := &Adapter{
+		cfg:            Config{MinRunners: 0, MaxRunners: 5, SessionOwner: "test-host"},
+		log:            discardLogger(),
+		scaleSetID:     42,
+		newSessionFunc: fakeSession(fake),
+	}
+	idCh := make(chan int64, 1)
+	a.ev.MessageID = func(id int64) { idCh <- id }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = a.Run(ctx) }()
+
+	select {
+	case id := <-idCh:
+		if id != 7 {
+			t.Fatalf("MessageID = %d, want 7", id)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("MessageID never fired for the fetched message")
 	}
 }

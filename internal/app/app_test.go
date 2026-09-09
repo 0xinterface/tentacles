@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -29,11 +30,12 @@ import (
 // adapter: it reports a scale set, pushes desired counts, and mints
 // deterministic fake JIT configs.
 type fakeScaleSet struct {
-	mu       sync.Mutex
-	events   scaleset.Events
-	ensured  bool
-	jitCount int
-	runFn    func(ctx context.Context, f *fakeScaleSet) error
+	mu          sync.Mutex
+	events      scaleset.Events
+	ensured     bool
+	jitCount    int
+	workFolders []string
+	runFn       func(ctx context.Context, f *fakeScaleSet) error
 }
 
 func (f *fakeScaleSet) SetEvents(ev scaleset.Events) {
@@ -51,10 +53,11 @@ func (f *fakeScaleSet) EnsureScaleSet(context.Context) error {
 
 func (f *fakeScaleSet) ScaleSetID() int { return 42 }
 
-func (f *fakeScaleSet) GenerateJIT(_ context.Context, runnerName, _ string) (string, error) {
+func (f *fakeScaleSet) GenerateJIT(_ context.Context, runnerName, workFolder string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.jitCount++
+	f.workFolders = append(f.workFolders, workFolder)
 	return "fake-jit-" + runnerName, nil
 }
 
@@ -85,6 +88,30 @@ func (f *fakeScaleSet) jobStart(name string) {
 	if ev.JobStart != nil {
 		ev.JobStart(name)
 	}
+}
+
+func (f *fakeScaleSet) pushMessageID(id int64) {
+	f.mu.Lock()
+	ev := f.events
+	f.mu.Unlock()
+	if ev.MessageID != nil {
+		ev.MessageID(id)
+	}
+}
+
+func (f *fakeScaleSet) sessionStart() {
+	f.mu.Lock()
+	ev := f.events
+	f.mu.Unlock()
+	if ev.SessionStarted != nil {
+		ev.SessionStarted()
+	}
+}
+
+func (f *fakeScaleSet) startedJITs() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.jitCount
 }
 
 // fixtureRunnerTar builds a runner tarball whose run.sh delegates to
@@ -152,13 +179,18 @@ func freePort(t *testing.T) string {
 
 // writeIntegrationConfig assembles a fully valid config for the process
 // backend, with the runner tarball served from srv.
-func writeIntegrationConfig(t *testing.T, dir, tarURL, sha string, minRunners, maxRunners int) string {
+func writeIntegrationConfig(t *testing.T, dir, tarURL, sha string, minRunners, maxRunners int, extraEnv ...string) (string, string) {
 	t.Helper()
 	envFile := filepath.Join(dir, "runner.env")
 	cwd, _ := os.Getwd()
-	if err := os.WriteFile(envFile, []byte(fmt.Sprintf("PATH=%s:/bin:/usr/bin\nHOME=%s\n", filepath.Join(cwd, "bin-tmp"), dir)), 0o644); err != nil {
+	envBody := fmt.Sprintf("PATH=%s:/bin:/usr/bin\nHOME=%s\n", filepath.Join(cwd, "bin-tmp"), dir)
+	for _, kv := range extraEnv {
+		envBody += kv + "\n"
+	}
+	if err := os.WriteFile(envFile, []byte(envBody), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	listenAddr := freePort(t)
 	stateDir := filepath.Join(dir, "state")
 	cfg := fmt.Sprintf(`github:
   url: https://github.com
@@ -210,14 +242,13 @@ observability:
 		genPEM(t, dir), minRunners, maxRunners, tarURL, sha,
 		currentUser(t), envFile,
 		stateDir, filepath.Join(dir, "cache"), filepath.Join(dir, "logs"),
-		filepath.Join(dir, "jit"), freePort(t))
+		filepath.Join(dir, "jit"), listenAddr)
 	path := filepath.Join(dir, "config.yaml")
 	if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	return path
+	return path, listenAddr
 }
-
 func currentUser(t *testing.T) string {
 	t.Helper()
 	u := os.Getenv("USER")
@@ -258,7 +289,7 @@ func TestDaemonScaleUpDownEphemeral(t *testing.T) {
 	defer srv.Close()
 
 	dir := t.TempDir()
-	cfgPath := writeIntegrationConfig(t, dir, srv.URL, sha, 0, 2)
+	cfgPath, listenAddr := writeIntegrationConfig(t, dir, srv.URL, sha, 0, 2)
 
 	fake := &fakeScaleSet{}
 	fake.runFn = func(ctx context.Context, f *fakeScaleSet) error {
@@ -294,6 +325,18 @@ func TestDaemonScaleUpDownEphemeral(t *testing.T) {
 		t.Errorf("jit file missing while slot live: %v", err)
 	} else if fi.Mode().Perm() != 0o600 {
 		t.Errorf("jit file mode = %v, want 0600", fi.Mode().Perm())
+	}
+
+	// The slot_start histogram observes exactly one start per slot
+	// (materialize and JIT mint used to double-count it).
+	if out, err := http.Get("http://" + listenAddr + "/metrics"); err != nil {
+		t.Errorf("metrics scrape failed: %v", err)
+	} else {
+		b, _ := io.ReadAll(out.Body)
+		out.Body.Close()
+		if want := "gh_runnerd_slot_start_seconds_count 1"; !strings.Contains(string(b), want) {
+			t.Errorf("metrics missing %q (double-counted start?)", want)
+		}
 	}
 
 	// Scale down: slot dir, jit file, and processes are gone.
@@ -348,7 +391,7 @@ func TestDaemonMinRunnersWarmPool(t *testing.T) {
 	defer srv.Close()
 
 	dir := t.TempDir()
-	cfgPath := writeIntegrationConfig(t, dir, srv.URL, sha, 1, 2)
+	cfgPath, _ := writeIntegrationConfig(t, dir, srv.URL, sha, 1, 2)
 
 	fake := &fakeScaleSet{}
 	fake.runFn = func(ctx context.Context, f *fakeScaleSet) error {
@@ -397,7 +440,7 @@ func TestDryRunValidatesConfig(t *testing.T) {
 	}))
 	defer srv.Close()
 	dir := t.TempDir()
-	cfgPath := writeIntegrationConfig(t, dir, srv.URL, sha, 0, 2)
+	cfgPath, _ := writeIntegrationConfig(t, dir, srv.URL, sha, 0, 2)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -427,4 +470,141 @@ func ls(t *testing.T, dir string) []string {
 		names = append(names, e.Name())
 	}
 	return names
+}
+
+// TestDaemonReplenishesWarmPoolAfterExit: plan §9 — "a local watcher
+// pushes process exits" into reconcile. A warm-pool runner that dies is
+// replaced without waiting for the next statistics push (the periodic
+// tick from plan §13 is the backstop; the exit nudge is the fast path).
+func TestDaemonReplenishesWarmPoolAfterExit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("end-to-end test")
+	}
+	tarBytes, sha := fixtureRunnerTar(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(tarBytes)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cfgPath, _ := writeIntegrationConfig(t, dir, srv.URL, sha, 1, 2, "FAKE_RUNNER_SLEEP=1")
+
+	fake := &fakeScaleSet{}
+	fake.runFn = func(ctx context.Context, f *fakeScaleSet) error {
+		f.pushDesired(0) // statistics idle; the min pool keeps desired=1
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, Options{ConfigPath: cfgPath, ScaleSet: fake}) }()
+
+	// Each fake runner exits after ~1s; the daemon must keep minting
+	// replacements for the warm slot.
+	if !poll(t, 30*time.Second, func() bool { return fake.startedJITs() >= 3 }) {
+		cancel()
+		t.Fatalf("warm pool not replenished after runner exits; jit mints = %d", fake.startedJITs())
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run returned error: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatalf("daemon did not shut down")
+	}
+}
+
+// TestDaemonReadinessGatedOnSessionStart: plan §11 — sd_notify READY=1
+// only after the listener session started, never when the daemon shuts
+// down before a session came up. Also proves the last_message_id metric
+// is wired end to end (plan §14).
+func TestDaemonReadinessGatedOnSessionStart(t *testing.T) {
+	if testing.Short() {
+		t.Skip("end-to-end test")
+	}
+	tarBytes, sha := fixtureRunnerTar(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(tarBytes)
+	}))
+	defer srv.Close()
+
+	runCase := func(t *testing.T, fireSession bool) {
+		dir := t.TempDir()
+		cfgPath, listenAddr := writeIntegrationConfig(t, dir, srv.URL, sha, 0, 2)
+		fake := &fakeScaleSet{}
+		fake.runFn = func(ctx context.Context, f *fakeScaleSet) error {
+			if fireSession {
+				f.sessionStart()
+				f.pushMessageID(7)
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		}
+
+		var mu sync.Mutex
+		var states []string
+		orig := sdNotify
+		sdNotify = func(state string) error {
+			mu.Lock()
+			states = append(states, state)
+			mu.Unlock()
+			return nil
+		}
+		defer func() { sdNotify = orig }()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- Run(ctx, Options{ConfigPath: cfgPath, ScaleSet: fake}) }()
+
+		if fireSession {
+			if !poll(t, 15*time.Second, func() bool {
+				mu.Lock()
+				defer mu.Unlock()
+				return len(states) > 0
+			}) {
+				t.Fatal("READY=1 never sent after session start")
+			}
+			mu.Lock()
+			first := states[0]
+			mu.Unlock()
+			if first != "READY=1" {
+				t.Fatalf("first sd_notify = %q, want READY=1", first)
+			}
+			// The last message ID reached the metrics registry.
+			if !poll(t, 5*time.Second, func() bool {
+				out, err := http.Get("http://" + listenAddr + "/metrics")
+				if err != nil {
+					return false
+				}
+				defer out.Body.Close()
+				b, _ := io.ReadAll(out.Body)
+				return strings.Contains(string(b), "gh_runnerd_last_message_id 7")
+			}) {
+				t.Error("gh_runnerd_last_message_id not exposed after MessageID event")
+			}
+		} else {
+			time.Sleep(2 * time.Second)
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("Run returned error: %v", err)
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("daemon did not shut down")
+			}
+			time.Sleep(200 * time.Millisecond) // let the notify goroutine settle
+			mu.Lock()
+			defer mu.Unlock()
+			if len(states) != 0 {
+				t.Fatalf("sd_notify fired without a listener session: %v", states)
+			}
+		}
+	}
+	t.Run("session started", func(t *testing.T) { runCase(t, true) })
+	t.Run("no session before shutdown", func(t *testing.T) { runCase(t, false) })
 }

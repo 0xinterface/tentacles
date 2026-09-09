@@ -2,6 +2,7 @@ package slot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hkust/gh-runnerd/internal/cleanup"
 	"github.com/hkust/gh-runnerd/internal/runner"
 )
 
@@ -32,8 +34,9 @@ type tableOptions struct {
 	stopTimeout    time.Duration
 	cleanupTimeout time.Duration
 	startTimeout   time.Duration
+	startObserver  func(time.Duration)
 	diagHook       func(Slot) error
-	eventHook      func(event string, s Slot)
+	eventHook      func(Event, Slot)
 	envFile        string
 	user           string
 	group          string
@@ -46,9 +49,12 @@ type tableOptions struct {
 // one wins for each field.
 type TableOption func(*tableOptions)
 
-// WithAcquireGrace sets how long a started-but-idle slot may wait for a
-// job to claim it before the Table treats it as an acquire failure and
-// tears it down. Non-positive values disable the check. Default 3m.
+// WithAcquireGrace sets the window a freshly started runner has to claim
+// its first job. A process exit before the window closes without a job
+// is classified as an acquire failure (plan §13), and a slot still in
+// "starting" past the window may be stopped as surplus (plan §9). Idle
+// slots are never reaped — idleness is the warm pool. Non-positive
+// values disable both uses. Default 3m.
 func WithAcquireGrace(d time.Duration) TableOption {
 	return func(o *tableOptions) { o.acquireGrace = d }
 }
@@ -70,6 +76,13 @@ func WithStartTimeout(d time.Duration) TableOption {
 	return func(o *tableOptions) { o.startTimeout = d }
 }
 
+// WithStartObserver registers a callback invoked once per successful
+// slot start with the total provision time (materialize + JIT mint +
+// backend start). Used for the slot_start histogram.
+func WithStartObserver(fn func(time.Duration)) TableOption {
+	return func(o *tableOptions) { o.startObserver = fn }
+}
+
 // WithDiagHook registers a best-effort diagnostic callback invoked with
 // the exiting slot before its directory is wiped. Errors are logged, not
 // fatal. Used to ship _diag before cleanup.
@@ -77,11 +90,9 @@ func WithDiagHook(hook func(Slot) error) TableOption {
 	return func(o *tableOptions) { o.diagHook = hook }
 }
 
-// WithEventHook registers a lifecycle event sink. Events: "started" (slot
-// reached idle), "exited" (process exited on its own), "stopped" (Table
-// stopped a surplus slot), "acquire_failure" (start failed or a started
-// slot never claimed a job within the acquire grace).
-func WithEventHook(hook func(event string, s Slot)) TableOption {
+// WithEventHook registers a lifecycle event sink. See the Event constants
+// for the vocabulary.
+func WithEventHook(hook func(Event, Slot)) TableOption {
 	return func(o *tableOptions) { o.eventHook = hook }
 }
 
@@ -110,10 +121,11 @@ func WithWorkDir(rel string) TableOption {
 }
 
 // slotRec is the internal bookkeeping for one slot. The embedded Slot is
-// the public view; busySince is used only for diagnostics.
+// the public view; busySince and provStart drive lifecycle decisions.
 type slotRec struct {
 	Slot
-	busySince time.Time
+	busySince time.Time // set when the runner first claims a job; zero = never busy
+	provStart time.Time // when provisioning began; drives starting-past-grace stops
 }
 
 // Table is the concrete Manager: it allocates slot IDs, materializes and
@@ -188,6 +200,13 @@ func (t *Table) SetDesired(n int) {
 	t.mu.Lock()
 	t.desired = n
 	t.mu.Unlock()
+}
+
+// WorkDir returns the absolute work-directory path for a slot ID (the
+// JIT work folder, plan §8). It is the single source of truth for the
+// configured work-directory name.
+func (t *Table) WorkDir(id ID) string {
+	return filepath.Join(t.root, string(id), t.opts.workDir)
 }
 
 // Active returns the slots that count toward the actual runner count
@@ -268,17 +287,20 @@ func (t *Table) startOne(ctx context.Context) ID {
 		t.log.Error("no free slot ids", "max", maxSlotID)
 		return ""
 	}
+	t0 := time.Now()
 	rec := &slotRec{Slot: Slot{
 		ID:    id,
 		Dir:   filepath.Join(t.root, string(id)),
 		Unit:  unitName(id),
 		State: StateStarting,
-	}}
+	}, provStart: t0}
 	t.slots[id] = rec
 	t.mu.Unlock()
 
-	// fail records the failure, frees the ID for retry, and emits the
-	// acquire_failure event with a failed-state snapshot.
+	// fail records the failure, frees the ID for retry, removes anything
+	// the failed attempt left behind (a partial materialization would
+	// wedge the ID: payload.CopySlot refuses an existing destination),
+	// and emits the acquire_failure event with a failed-state snapshot.
 	fail := func(err error) {
 		t.log.Warn("slot start failed", "slot", id, "err", err)
 		t.mu.Lock()
@@ -286,7 +308,11 @@ func (t *Table) startOne(ctx context.Context) ID {
 		rec.State = StateFailed
 		snap := rec.Slot
 		t.mu.Unlock()
-		t.emit("acquire_failure", snap)
+		_ = os.RemoveAll(rec.Dir)
+		if rec.JITPath != "" {
+			_ = os.Remove(rec.JITPath)
+		}
+		t.emit(EventAcquireFailure, snap)
 	}
 
 	if err := t.materialize(rec.Dir); err != nil {
@@ -296,19 +322,16 @@ func (t *Table) startOne(ctx context.Context) ID {
 	jit, err := t.jit(ctx, id)
 	if err != nil {
 		fail(fmt.Errorf("mint JIT: %w", err))
-		_ = os.RemoveAll(rec.Dir)
 		return ""
 	}
 	rec.RunnerName = jit.RunnerName
 	rec.JITPath = filepath.Join(t.jitDir, string(id)+".jit")
 	if err := runner.WriteJIT(rec.JITPath, jit.Encoded); err != nil {
 		fail(fmt.Errorf("write JIT: %w", err))
-		_ = os.RemoveAll(rec.Dir)
 		return ""
 	}
 	spec := runner.Spec{
 		SlotDir:   rec.Dir,
-		WorkDir:   filepath.Join(rec.Dir, t.opts.workDir),
 		JITPath:   rec.JITPath,
 		EnvFile:   t.opts.envFile,
 		User:      t.opts.user,
@@ -321,8 +344,6 @@ func (t *Table) startOne(ctx context.Context) ID {
 	defer cancel()
 	if err := t.backend.Start(startCtx, spec); err != nil {
 		fail(fmt.Errorf("backend start: %w", err))
-		_ = os.RemoveAll(rec.Dir)
-		_ = os.Remove(rec.JITPath)
 		// The backend may have partially forked the process; stop it.
 		if serr := t.backend.Stop(context.Background(), rec.Unit); serr != nil {
 			t.log.Debug("best-effort stop after failed start", "slot", id, "err", serr)
@@ -334,9 +355,11 @@ func (t *Table) startOne(ctx context.Context) ID {
 	rec.State = StateIdle
 	snap := rec.Slot
 	t.log.Info("slot started", "slot", id, "unit", rec.Unit, "runner_name", rec.RunnerName)
-	t.emit("started", snap)
+	t.emit(EventStarted, snap)
+	if t.opts.startObserver != nil {
+		t.opts.startObserver(time.Since(t0))
+	}
 	go t.watch(rec)
-	go t.watchGrace(rec)
 	return id
 }
 
@@ -364,9 +387,18 @@ func (t *Table) stopSurplus(desired int) {
 	excess := t.countLiveLocked() - desired
 	if excess > 0 {
 		for _, rec := range t.slots {
-			if rec.State == StateIdle || rec.State == StateStarting {
-				candidates = append(candidates, candidate{rec: rec, snap: rec.Slot})
+			switch rec.State {
+			case StateIdle:
+				// Eligible immediately.
+			case StateStarting:
+				// Plan §9: stop only slots "in idle or starting-past-grace".
+				if t.opts.acquireGrace > 0 && time.Since(rec.provStart) <= t.opts.acquireGrace {
+					continue
+				}
+			default:
+				continue
 			}
+			candidates = append(candidates, candidate{rec: rec, snap: rec.Slot})
 		}
 		// Oldest first; StartedAt ties broken by ID for determinism.
 		sort.Slice(candidates, func(i, j int) bool {
@@ -398,7 +430,7 @@ func (t *Table) stopSurplus(desired int) {
 			t.mu.Unlock()
 			continue
 		}
-		t.emit("stopped", c.snap)
+		t.emit(EventStopped, c.snap)
 	}
 }
 
@@ -411,46 +443,6 @@ func (t *Table) watch(rec *slotRec) {
 		return // Table closed; leave unit and dir for boot adoption.
 	}
 	t.ObserveExit(rec.ID, err)
-}
-
-// watchGrace tears a started slot down if it never claims a job within
-// the acquire grace. The timer exits early once the slot is busy, is
-// already being torn down, or has been freed (and possibly its ID
-// reused — the pointer check guards against stopping a successor slot).
-func (t *Table) watchGrace(rec *slotRec) {
-	if t.opts.acquireGrace <= 0 {
-		return
-	}
-	timer := time.NewTimer(t.opts.acquireGrace)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-	case <-t.ctx.Done():
-		return
-	}
-
-	t.mu.Lock()
-	cur, ok := t.slots[rec.ID]
-	if !ok || cur != rec || (rec.State != StateIdle && rec.State != StateStarting) {
-		t.mu.Unlock()
-		return
-	}
-	rec.State = StateStopping
-	snap := rec.Slot
-	t.mu.Unlock()
-
-	t.log.Warn("slot acquire grace expired", "slot", rec.ID)
-	t.emit("acquire_failure", snap)
-	stopCtx, cancel := context.WithTimeout(context.Background(), t.opts.stopTimeout)
-	defer cancel()
-	if err := t.backend.Stop(stopCtx, rec.Unit); err != nil {
-		t.log.Warn("stop after acquire grace failed", "slot", rec.ID, "err", err)
-		t.mu.Lock()
-		if cur, ok := t.slots[rec.ID]; ok && cur == rec && rec.State == StateStopping {
-			rec.State = StateIdle
-		}
-		t.mu.Unlock()
-	}
 }
 
 // MarkBusy flags the slot as busy so scale-down will not stop it. Only
@@ -512,11 +504,34 @@ func (t *Table) ObserveExit(id ID, err error) {
 	delete(t.slots, id)
 	t.mu.Unlock()
 
-	// Natural exits (idle/busy/starting) are "exited"; teardowns we
-	// initiated are already reported as "stopped" or "acquire_failure".
+	// Teardowns we initiated are already reported as "stopped" or
+	// "acquire_failure". Natural exits are "exited", except a quick
+	// never-busy exit, which is an acquire failure (plan §13).
 	if prev != StateStopping {
-		t.emit("exited", snap)
+		if t.quickNeverBusyExit(rec, prev) {
+			t.emit(EventAcquireFailure, snap)
+		} else {
+			t.emit(EventExited, snap)
+		}
 	}
+}
+
+// quickNeverBusyExit reports whether an exit counts as an acquire
+// failure per plan §13: the process exited before any JobStarted and
+// before the acquire grace elapsed. Adopted slots that were running a
+// job count as busy (boot adoption is conservative).
+func (t *Table) quickNeverBusyExit(rec *slotRec, prev State) bool {
+	if t.opts.acquireGrace <= 0 {
+		return false
+	}
+	if prev == StateBusy || !rec.busySince.IsZero() {
+		return false
+	}
+	start := rec.StartedAt
+	if start.IsZero() {
+		start = rec.provStart
+	}
+	return time.Since(start) < t.opts.acquireGrace
 }
 
 // wipe runs the post-exit teardown for a slot: diag hook, JIT removal,
@@ -527,6 +542,10 @@ func (t *Table) wipe(id ID, dir string) {
 		if err := t.opts.diagHook(snap); err != nil {
 			t.log.Warn("slot diag hook failed", "slot", id, "err", err)
 		}
+	}
+	// Shred credential leftovers before the tree goes (plan §10).
+	if err := cleanup.ShredCredentials(dir); err != nil {
+		t.log.Warn("slot credential shred failed", "slot", id, "err", err)
 	}
 	if t.jitDir != "" {
 		jitPath := filepath.Join(t.jitDir, string(id)+".jit")
@@ -579,11 +598,12 @@ func (t *Table) Adopt(ctx context.Context, units []string) error {
 		}
 		if running[unitName(id)] {
 			rec := &slotRec{Slot: Slot{
-				ID:        id,
-				Dir:       dir,
-				Unit:      unitName(id),
-				State:     StateBusy,
-				StartedAt: time.Now(),
+				ID:         id,
+				Dir:        dir,
+				Unit:       unitName(id),
+				RunnerName: readRunnerName(dir),
+				State:      StateBusy,
+				StartedAt:  time.Now(),
 			}}
 			t.mu.Lock()
 			t.slots[id] = rec
@@ -632,7 +652,7 @@ func (t *Table) Close() {
 	t.mu.Unlock()
 }
 
-func (t *Table) emit(event string, s Slot) {
+func (t *Table) emit(event Event, s Slot) {
 	if t.opts.eventHook != nil {
 		t.opts.eventHook(event, s)
 	}
@@ -674,6 +694,24 @@ func validID(id ID) bool {
 		n = n*10 + int(c-'0')
 	}
 	return n >= 1 && n <= maxSlotID
+}
+
+// readRunnerName extracts the runner name the agent persisted in the
+// slot's .runner file at registration, so an adopted in-flight job can
+// still be correlated with JobStarted messages. Any parse failure
+// yields "" (the pre-adoption behavior).
+func readRunnerName(dir string) string {
+	b, err := os.ReadFile(filepath.Join(dir, ".runner"))
+	if err != nil {
+		return ""
+	}
+	var cfg struct {
+		AgentName string `json:"agentName"`
+	}
+	if json.Unmarshal(b, &cfg) != nil {
+		return ""
+	}
+	return cfg.AgentName
 }
 
 // removeAllBounded removes dir, giving up after timeout. If the removal

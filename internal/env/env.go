@@ -54,13 +54,18 @@ func unquote(s string) string {
 	return s
 }
 
-// Validate reports an error when a required variable is missing or empty.
-// PATH and HOME are mandatory for the runner agent.
+// Validate reports an error naming every required variable that is
+// missing or empty. PATH and HOME are mandatory for the runner agent
+// (the mise/PATH failure mode, plan §6).
 func Validate(vars map[string]string) error {
+	var missing []string
 	for _, k := range []string{"PATH", "HOME"} {
 		if strings.TrimSpace(vars[k]) == "" {
-			return fmt.Errorf("env: %s must be set and non-empty", k)
+			missing = append(missing, k)
 		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("env: %s must be set and non-empty", strings.Join(missing, ", "))
 	}
 	return nil
 }

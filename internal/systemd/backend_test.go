@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"os/user"
+
 	"github.com/hkust/gh-runnerd/internal/runner"
 )
 
@@ -18,7 +20,6 @@ import (
 func sampleSpec() runner.Spec {
 	return runner.Spec{
 		SlotDir:   "/var/lib/gh-runnerd/slots/0001",
-		WorkDir:   "/var/lib/gh-runnerd/slots/0001/_work",
 		JITPath:   "/run/gh-runnerd/0001.jit",
 		EnvFile:   "/etc/gh-runnerd/runner.env",
 		User:      "gha-runner",
@@ -153,6 +154,38 @@ func TestStartGoldenArgVector(t *testing.T) {
 
 	if got := readLog(t, runLog); got != strings.Join(want, "\n")+"\n" {
 		t.Fatalf("Start argv mismatch\n--- got ---\n%s\n--- want ---\n%s", got, strings.Join(want, "\n"))
+	}
+}
+
+// TestStartAddsRunnerCacheDirs: plan §12 — shared caches (~/.cache,
+// mise, go/pkg/mod) must stay writable despite ProtectHome=read-only,
+// or jobs cannot use the host toolchain (acceptance criterion 8). The
+// cache dirs are created up front so they cannot appear as root-owned
+// systemd auto-creates.
+func TestStartAddsRunnerCacheDirs(t *testing.T) {
+	b, runLog, _ := newTestBackend(t)
+	home := t.TempDir()
+	orig := lookupUser
+	lookupUser = func(string) (*user.User, error) {
+		return &user.User{Username: "gha-runner", HomeDir: home, Uid: "1234", Gid: "1234"}, nil
+	}
+	defer func() { lookupUser = orig }()
+
+	if err := b.Start(context.Background(), sampleSpec()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	log := readLog(t, runLog)
+	want := "ReadWritePaths=/var/lib/gh-runnerd/slots/0001:/tmp:" +
+		filepath.Join(home, ".cache") + ":" +
+		filepath.Join(home, ".local/share/mise") + ":" +
+		filepath.Join(home, "go/pkg/mod")
+	if !strings.Contains(log, want) {
+		t.Fatalf("argv missing %q\ngot:\n%s", want, log)
+	}
+	for _, sub := range runnerCacheSubdirs {
+		if fi, err := os.Stat(filepath.Join(home, sub)); err != nil || !fi.IsDir() {
+			t.Errorf("cache dir %s not created (stat err: %v)", sub, err)
+		}
 	}
 }
 

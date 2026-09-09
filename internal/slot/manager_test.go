@@ -145,16 +145,16 @@ func fakeJIT(_ context.Context, id ID) (runner.JIT, error) {
 
 type eventRecorder struct {
 	mu     sync.Mutex
-	events []string
+	events []Event
 }
 
-func (r *eventRecorder) hook(event string, _ Slot) {
+func (r *eventRecorder) hook(event Event, _ Slot) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.events = append(r.events, event)
 }
 
-func (r *eventRecorder) has(event string) bool {
+func (r *eventRecorder) has(event Event) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, e := range r.events {
@@ -237,8 +237,8 @@ func TestTableStartN(t *testing.T) {
 		if spec.SlotDir != filepath.Join(tab.root, string(id)) {
 			t.Errorf("spec %d slot dir = %q", i, spec.SlotDir)
 		}
-		if spec.WorkDir != filepath.Join(spec.SlotDir, "_work") {
-			t.Errorf("spec %d work dir = %q", i, spec.WorkDir)
+		if wd := tab.WorkDir(id); wd != filepath.Join(spec.SlotDir, "_work") {
+			t.Errorf("spec %d work dir = %q, want %q", i, wd, filepath.Join(spec.SlotDir, "_work"))
 		}
 		if spec.JITPath != filepath.Join(jitDir, string(id)+".jit") {
 			t.Errorf("spec %d jit path = %q", i, spec.JITPath)
@@ -439,31 +439,29 @@ func TestTableObserveExitWipesEvenWhenDiagHookFails(t *testing.T) {
 	}
 }
 
-func TestTableAcquireGraceFailure(t *testing.T) {
+// TestTableWarmIdleSlotSurvivesAcquireGrace: an idle slot is the warm
+// pool (plan §9: "min_runners: 1 keeps one run.sh registered and idle").
+// Idleness is never an acquire failure; only a start failure or a quick
+// never-busy exit is (plan §13).
+func TestTableWarmIdleSlotSurvivesAcquireGrace(t *testing.T) {
 	backend := &fakeBackend{}
-	tab, rec, jitDir := newTestTable(t, backend, WithAcquireGrace(30*time.Millisecond))
-	ctx := context.Background()
+	tab, rec, _ := newTestTable(t, backend, WithAcquireGrace(30*time.Millisecond))
 
-	if err := tab.Ensure(ctx, 1); err != nil {
+	if err := tab.Ensure(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
-	// Slot starts idle and never claims a job. Wait for the full teardown
-	// (event + dir gone), not just the state flip to stopping.
-	eventually(t, 3*time.Second, func() bool {
-		_, err := os.Stat(filepath.Join(tab.root, "0001"))
-		return rec.has("acquire_failure") && os.IsNotExist(err)
-	})
+	time.Sleep(150 * time.Millisecond)
+	if got := slotIDs(tab.Active()); fmt.Sprint(got) != fmt.Sprint([]ID{"0001"}) {
+		t.Fatalf("warm idle slot torn down after grace: active=%v events=%v", got, rec.events)
+	}
 	backend.mu.Lock()
-	stopped := append([]string(nil), backend.stopped...)
+	nStopped := len(backend.stopped)
 	backend.mu.Unlock()
-	if fmt.Sprint(stopped) != fmt.Sprint([]string{"gha-slot-0001.service"}) {
-		t.Fatalf("stopped = %v, want the grace-expired unit", stopped)
+	if nStopped != 0 {
+		t.Fatalf("idle warm slot stopped: %v", backend.stopped)
 	}
-	if _, err := os.Stat(filepath.Join(tab.root, "0001")); !os.IsNotExist(err) {
-		t.Errorf("grace-expired slot dir not wiped: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(jitDir, "0001.jit")); !os.IsNotExist(err) {
-		t.Errorf("grace-expired slot jit not wiped: %v", err)
+	if rec.has(EventAcquireFailure) {
+		t.Fatalf("idle warm slot classified acquire failure: %v", rec.events)
 	}
 }
 
@@ -662,5 +660,208 @@ func TestCloseLeavesRunningSlotsAlone(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(jitDir, "0001.jit")); err != nil {
 		t.Errorf("Close wiped jit file: %v", err)
+	}
+}
+
+// TestTableStartFailureLeavesNoPartialDir: a start that fails after
+// partially materializing must remove the slot directory, otherwise the
+// ID is wedged (CopySlot refuses an existing destination) until reboot.
+func TestTableStartFailureLeavesNoPartialDir(t *testing.T) {
+	backend := &fakeBackend{}
+	root := t.TempDir()
+	jitDir := filepath.Join(t.TempDir(), "jit")
+	if err := os.MkdirAll(jitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rec := &eventRecorder{}
+	var calls int
+	partial := func(dst string) error {
+		calls++
+		if calls == 1 {
+			if err := os.MkdirAll(dst, 0o755); err != nil {
+				return err
+			}
+			if err := os.WriteFile(filepath.Join(dst, "run.sh"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+				return err
+			}
+			return errors.New("simulated partial copy")
+		}
+		return markerMaterialize(dst)
+	}
+	tab := NewTable(root, backend, partial, fakeJIT, jitDir, nil, WithEventHook(rec.hook))
+	t.Cleanup(tab.Close)
+
+	if err := tab.Ensure(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "0001")); !os.IsNotExist(err) {
+		t.Fatalf("partial slot dir left behind after failed start: %v", err)
+	}
+	if !rec.has(EventAcquireFailure) {
+		t.Fatalf("expected acquire_failure event, got %v", rec.events)
+	}
+
+	// The ID is not wedged: a retry starts cleanly on the same ID.
+	if err := tab.Ensure(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if got := slotIDs(tab.Active()); fmt.Sprint(got) != fmt.Sprint([]ID{"0001"}) {
+		t.Fatalf("active after retry = %v, want [0001]", got)
+	}
+}
+
+// TestTableExitBeforeGraceCountsAcquireFailure: plan §13 — run.sh exits
+// before JobStarted and before acquire_grace → wipe, count as acquire
+// failure.
+func TestTableExitBeforeGraceCountsAcquireFailure(t *testing.T) {
+	backend := &fakeBackend{}
+	tab, rec, _ := newTestTable(t, backend, WithAcquireGrace(time.Hour))
+
+	if err := tab.Ensure(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	backend.exit("gha-slot-0001.service")
+	eventually(t, 3*time.Second, func() bool {
+		return len(tab.Active()) == 0 && rec.has(EventAcquireFailure)
+	})
+	if rec.has(EventExited) {
+		t.Errorf("never-busy quick exit reported as plain exit: %v", rec.events)
+	}
+}
+
+// TestTableBusyExitIsPlainExit: a runner that exits after claiming a job
+// (the normal one-job JIT lifecycle) is a plain exit, not an acquire
+// failure.
+func TestTableBusyExitIsPlainExit(t *testing.T) {
+	backend := &fakeBackend{}
+	tab, rec, _ := newTestTable(t, backend, WithAcquireGrace(time.Hour))
+
+	if err := tab.Ensure(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	tab.MarkBusy("0001")
+	backend.exit("gha-slot-0001.service")
+	eventually(t, 3*time.Second, func() bool { return len(tab.Active()) == 0 })
+	if rec.has(EventAcquireFailure) {
+		t.Fatalf("busy exit classified acquire failure: %v", rec.events)
+	}
+	if !rec.has(EventExited) {
+		t.Fatalf("expected exited event, got %v", rec.events)
+	}
+}
+
+// TestTableStartObserverOncePerStart: the start observer fires exactly
+// once per successful slot start, with the total provision time.
+func TestTableStartObserverOncePerStart(t *testing.T) {
+	backend := &fakeBackend{}
+	var mu sync.Mutex
+	var count int
+	var total time.Duration
+	tab, _, _ := newTestTable(t, backend, WithStartObserver(func(d time.Duration) {
+		mu.Lock()
+		count++
+		total += d
+		mu.Unlock()
+	}))
+	if err := tab.Ensure(context.Background(), 2); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if count != 2 {
+		t.Fatalf("start observer called %d times for 2 slots, want 2", count)
+	}
+	if total <= 0 {
+		t.Fatalf("start observer durations not positive: %v", total)
+	}
+}
+
+// TestTableWipeRemovesCredentialFiles: wipe completes when the runner
+// dropped .runner/.credentials files into the slot tree (they are
+// shredded first; see cleanup.ShredCredentials).
+func TestTableWipeRemovesCredentialFiles(t *testing.T) {
+	backend := &fakeBackend{}
+	tab, _, _ := newTestTable(t, backend)
+	if err := tab.Ensure(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(tab.root, "0001")
+	for _, name := range []string{".runner", ".credentials", ".credentials_rsaparams"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("secret-"+name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	backend.exit("gha-slot-0001.service")
+	eventually(t, 3*time.Second, func() bool {
+		_, err := os.Stat(dir)
+		return os.IsNotExist(err)
+	})
+}
+
+// TestTableWorkDirOption: WorkDir is the single source for the slot work
+// directory (the JIT work folder), honoring the configured name.
+func TestTableWorkDirOption(t *testing.T) {
+	backend := &fakeBackend{}
+	tab, _, _ := newTestTable(t, backend, WithWorkDir("w"))
+	if got, want := tab.WorkDir("0002"), filepath.Join(tab.root, "0002", "w"); got != want {
+		t.Fatalf("WorkDir = %q, want %q", got, want)
+	}
+	def, _, _ := newTestTable(t, backend)
+	if got, want := def.WorkDir("0001"), filepath.Join(def.root, "0001", "_work"); got != want {
+		t.Fatalf("default WorkDir = %q, want %q", got, want)
+	}
+}
+
+// TestTableAdoptReadsRunnerName: an adopted running slot recovers its
+// runner name from the .runner file the agent wrote at registration, so
+// JobStarted correlation and diag shipping keep working across restarts.
+func TestTableAdoptReadsRunnerName(t *testing.T) {
+	backend := &fakeBackend{}
+	root := t.TempDir()
+	dir := filepath.Join(root, "0001")
+	if err := markerMaterialize(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".runner"),
+		[]byte(`{"agentId":42,"agentName":"debian-host-0001-ab12","poolId":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tab := NewTable(root, backend, markerMaterialize, fakeJIT, t.TempDir(), nil)
+	t.Cleanup(tab.Close)
+
+	backend.active = []string{"gha-slot-0001.service"}
+	if err := tab.Adopt(context.Background(), backend.active); err != nil {
+		t.Fatal(err)
+	}
+	got := tab.Active()
+	if len(got) != 1 || got[0].RunnerName != "debian-host-0001-ab12" {
+		t.Fatalf("adopted slot = %+v, want runner name debian-host-0001-ab12", got)
+	}
+	if !tab.MarkBusyByRunner("debian-host-0001-ab12") {
+		t.Fatal("adopted runner name does not correlate with JobStarted")
+	}
+}
+
+// TestStopSurplusStartingPastGraceOnly: plan §9 — surplus stops hit idle
+// slots and starting slots only once they are past the acquire grace.
+func TestStopSurplusStartingPastGraceOnly(t *testing.T) {
+	backend := &fakeBackend{}
+	tab, _, _ := newTestTable(t, backend, WithAcquireGrace(time.Hour))
+	fresh := &slotRec{Slot: Slot{ID: "0001", Unit: "gha-slot-0001.service", State: StateStarting}, provStart: time.Now()}
+	stuck := &slotRec{Slot: Slot{ID: "0002", Unit: "gha-slot-0002.service", State: StateStarting}, provStart: time.Now().Add(-2 * time.Hour)}
+	tab.mu.Lock()
+	tab.slots["0001"] = fresh
+	tab.slots["0002"] = stuck
+	tab.mu.Unlock()
+
+	tab.stopSurplus(0)
+	backend.mu.Lock()
+	stopped := append([]string(nil), backend.stopped...)
+	backend.mu.Unlock()
+	if fmt.Sprint(stopped) != fmt.Sprint([]string{"gha-slot-0002.service"}) {
+		t.Fatalf("stopped = %v, want only the past-grace starting slot", stopped)
+	}
+	if st, ok := stateOf(tab, "0001"); !ok || st != StateStarting {
+		t.Fatalf("fresh starting slot = %q ok=%v; want untouched starting", st, ok)
 	}
 }

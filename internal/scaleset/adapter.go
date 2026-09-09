@@ -23,6 +23,8 @@ import (
 
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
+
+	"github.com/hkust/gh-runnerd/internal/reconcile"
 )
 
 // Config carries the GitHub App credentials and scale-set settings. The
@@ -48,12 +50,19 @@ type Config struct {
 // Events is the callback surface the rest of the daemon consumes. Every
 // function is optional; nil functions are safe to call.
 type Events struct {
+	// SessionStarted is called once per successfully created message
+	// session, before the listener loop takes over. The daemon gates
+	// sd_notify READY on it (plan §11).
+	SessionStarted func()
 	// Desired is called with the clamped desired runner count.
 	Desired func(n int)
 	// JobStart is called when a runner claims a job.
 	JobStart func(runnerName string)
 	// JobEnd is called when a job finishes on a runner.
 	JobEnd func(runnerName, result string)
+	// MessageID is called with the ID of every message fetched from the
+	// scale-set queue (the gh_runnerd_last_message_id metric, plan §14).
+	MessageID func(id int64)
 	// Session is called on every listener/session stop with the reason
 	// (nil on graceful context cancellation).
 	Session func(err error)
@@ -191,6 +200,12 @@ func (a *Adapter) Run(ctx context.Context) error {
 		a.sessionEvent(retErr)
 		return retErr
 	}
+	if a.ev.SessionStarted != nil {
+		a.ev.SessionStarted()
+	}
+	// Observe fetched message IDs for the last_message_id metric without
+	// changing the official listener loop.
+	sessionClient = &watchedClient{Client: sessionClient, onMessage: a.ev.MessageID}
 
 	var retErr error
 	defer func() {
@@ -265,7 +280,7 @@ func (a *Adapter) sessionEvent(err error) {
 // via ev.Desired. The clamped value is returned so the listener can record
 // it.
 func (a *Adapter) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
-	d := clamp(count, a.cfg.MinRunners, a.cfg.MaxRunners)
+	d := reconcile.Clamp(count, a.cfg.MinRunners, a.cfg.MaxRunners)
 	if a.ev.Desired != nil {
 		a.ev.Desired(d)
 	}
@@ -294,21 +309,34 @@ func (a *Adapter) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobC
 	return nil
 }
 
-// clamp bounds n into [lo, hi].
-func clamp(n, lo, hi int) int {
-	if n < lo {
-		return lo
-	}
-	if n > hi {
-		return hi
-	}
-	return n
-}
-
 // logger returns the adapter logger, defaulting to the process logger.
 func (a *Adapter) logger() *slog.Logger {
 	if a.log == nil {
 		return slog.Default()
 	}
 	return a.log
+}
+
+// watchedClient wraps a listener.Client so the adapter can observe the
+// ID of every fetched message. Close is forwarded explicitly: it is not
+// part of the listener.Client interface, so embedding alone would hide
+// the underlying session delete.
+type watchedClient struct {
+	listener.Client
+	onMessage func(id int64)
+}
+
+func (w *watchedClient) GetMessage(ctx context.Context, lastMessageID, maxCapacity int) (*scaleset.RunnerScaleSetMessage, error) {
+	msg, err := w.Client.GetMessage(ctx, lastMessageID, maxCapacity)
+	if err == nil && msg != nil && w.onMessage != nil {
+		w.onMessage(int64(msg.MessageID))
+	}
+	return msg, err
+}
+
+func (w *watchedClient) Close(ctx context.Context) error {
+	if c, ok := w.Client.(interface{ Close(context.Context) error }); ok {
+		return c.Close(ctx)
+	}
+	return nil
 }

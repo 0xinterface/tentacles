@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"time"
+
+	"github.com/hkust/gh-runnerd/internal/env"
 )
 
 // HardCapMaxRunners is the compiled ceiling for capacity.max_runners.
@@ -36,6 +38,12 @@ const (
 	DefaultBackend     = "systemd"
 	DefaultListen      = "127.0.0.1:9090"
 	DefaultLogLevel    = "info"
+)
+
+// Backend names for runtime.backend.
+const (
+	BackendSystemd = "systemd"
+	BackendProcess = "process"
 )
 
 // Default timeouts per implementation plan §6.
@@ -219,6 +227,10 @@ func (c *Config) Validate() error {
 		fail("runner.environment_file must not be empty")
 	} else if _, err := os.Stat(c.Runner.EnvironmentFile); err != nil {
 		fail("runner.environment_file %q does not exist: %v", c.Runner.EnvironmentFile, err)
+	} else if vars, err := env.ParseFile(c.Runner.EnvironmentFile); err != nil {
+		fail("runner.environment_file %q is not a valid environment file: %v", c.Runner.EnvironmentFile, err)
+	} else if err := env.Validate(vars); err != nil {
+		fail("runner.environment_file %q: %v", c.Runner.EnvironmentFile, err)
 	}
 
 	// Runtime backend.
@@ -272,7 +284,9 @@ func (c *Config) Validate() error {
 
 // EnsureDirs creates the daemon's directory tree: state, cache, logs,
 // the slot and template subdirectories, and the runtime JIT dir (tmpfs
-// in production). All directories are created 0755 with MkdirAll.
+// in production). All directories are created 0755 with MkdirAll and
+// then probed for writability (plan §6: "state/cache directories
+// writable" — MkdirAll alone succeeds on existing read-only dirs).
 func (c *Config) EnsureDirs() error {
 	dirs := []string{
 		c.Paths.StateDir,
@@ -289,6 +303,20 @@ func (c *Config) EnsureDirs() error {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return fmt.Errorf("create directory %s: %w", d, err)
 		}
+		if err := probeWritable(d); err != nil {
+			return fmt.Errorf("directory %s is not writable: %w", d, err)
+		}
 	}
 	return nil
+}
+
+// probeWritable verifies the daemon can create a file in dir.
+func probeWritable(dir string) error {
+	f, err := os.CreateTemp(dir, ".probe-*")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	_ = f.Close()
+	return os.Remove(name)
 }

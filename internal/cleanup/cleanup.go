@@ -1,6 +1,6 @@
-// Package cleanup removes every trace of a runner slot after its process
-// exits: the JIT config, any credential material the agent may have
-// dropped, and the slot directory itself.
+// Package cleanup shreds the credential material a runner slot may
+// leave behind (plan §10: "shred/unlink any leftover JIT or credential
+// files"). The slot-directory teardown itself lives in internal/slot.
 package cleanup
 
 import (
@@ -10,32 +10,22 @@ import (
 	"path/filepath"
 )
 
-// Wipe deletes a slot: first the JIT config file (if jitPath is set),
-// then any leftover credential files in the slot tree (truncated before
-// removal so the key material is not left in slack space), then the whole
-// slot directory. Shredding is best-effort — failures are collected, not
-// fatal — but removal of the slot directory itself must succeed. All
-// collected failures are joined into the returned error.
-func Wipe(slotDir, jitPath string) error {
-	if slotDir == "" {
-		return errors.New("cleanup: empty slot directory")
-	}
+// credentialFiles are the files the official agent drops into a slot
+// directory when it registers: the runner identity and the credentials
+// used to talk to the service.
+var credentialFiles = [...]string{".runner", ".credentials", ".credentials_rsaparams"}
+
+// ShredCredentials truncates then removes the credential files in
+// slotDir, so key material does not survive in unallocated blocks.
+// A missing file is fine; other failures are joined into the returned
+// error. Shredding is best-effort by design — the caller logs and
+// proceeds with the wipe.
+func ShredCredentials(slotDir string) error {
 	var errs []error
-
-	if jitPath != "" {
-		if err := os.Remove(jitPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			errs = append(errs, fmt.Errorf("cleanup: remove jit %s: %w", jitPath, err))
-		}
-	}
-
-	for _, name := range []string{".runner", ".credentials", ".credentials_rsaparams"} {
+	for _, name := range credentialFiles {
 		if err := shredFile(filepath.Join(slotDir, name)); err != nil {
 			errs = append(errs, err)
 		}
-	}
-
-	if err := os.RemoveAll(slotDir); err != nil {
-		errs = append(errs, fmt.Errorf("cleanup: remove slot dir %s: %w", slotDir, err))
 	}
 	return errors.Join(errs...)
 }

@@ -317,10 +317,12 @@ Event surface the rest of the daemon consumes:
 
 ```go
 type Events struct {
-    Desired   func(n int)          // from statistics.TotalAssignedJobs
-    JobStart  func(runnerName string)
-    JobEnd    func(runnerName string, result string)
-    Session   func(err error)      // session drop / auth refresh failure
+    SessionStarted func()            // after the message session is created; gates sd_notify READY
+    Desired        func(n int)       // from statistics.TotalAssignedJobs
+    JobStart       func(runnerName string)
+    JobEnd         func(runnerName, result string)
+    MessageID      func(id int64)    // every fetched message; feeds gh_runnerd_last_message_id
+    Session        func(err error)   // session drop / auth refresh failure
 }
 ```
 
@@ -478,7 +480,10 @@ PrivateTmp=yes
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/var/lib/gh-runnerd/slots/%i /tmp
+# Plan §12: shared caches (~/.cache, mise, go/pkg/mod) stay writable so
+# jobs can use the host toolchain. The daemon creates these as the
+# runner user before the first slot unit starts.
+ReadWritePaths=/var/lib/gh-runnerd/slots/%i /tmp %h/.cache %h/.local/share/mise %h/go/pkg/mod
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=yes
 ```
@@ -580,7 +585,7 @@ Required fields: `scale_set`, `slot`, `runner_name`, `desired`, `actual`, `event
 
 Never: JIT payload, PEM, installation tokens.
 
-Metrics on `127.0.0.1:9090`:
+Metrics on `127.0.0.1:9090` (plus a liveness `/healthz` on the same listener):
 
 - `gh_runnerd_desired_runners`
 - `gh_runnerd_actual_runners{state=}`

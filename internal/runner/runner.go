@@ -18,7 +18,6 @@ type JIT struct {
 // mechanism (systemd properties, exec attrs, ...).
 type Spec struct {
 	SlotDir   string // slot root (contains run.sh, bin/, _work/)
-	WorkDir   string // absolute path of _work inside the slot
 	JITPath   string // 0600 file holding the encoded JIT config
 	EnvFile   string // systemd EnvironmentFile with PATH/HOME/mise
 	User      string // unix user for the runner process

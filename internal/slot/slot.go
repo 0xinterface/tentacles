@@ -27,6 +27,24 @@ func (s State) Live() bool {
 	return s == StateStarting || s == StateIdle || s == StateBusy
 }
 
+// Event is a slot lifecycle event reported through the event hook. The
+// zero Event is not a valid event.
+type Event string
+
+const (
+	// EventStarted fires once per successful slot start, when the slot
+	// reaches idle.
+	EventStarted Event = "started"
+	// EventExited fires when a runner process exits on its own after
+	// having run a job (or past the acquire grace without one).
+	EventExited Event = "exited"
+	// EventStopped fires when the Table stops a surplus slot.
+	EventStopped Event = "stopped"
+	// EventAcquireFailure fires when a slot start fails, or a runner
+	// exits before claiming a job within the acquire grace (plan §13).
+	EventAcquireFailure Event = "acquire_failure"
+)
+
 // Slot is one runner position on the host.
 type Slot struct {
 	ID         ID

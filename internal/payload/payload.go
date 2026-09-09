@@ -70,11 +70,6 @@ func DownloadURL(version string) string {
 		"/actions-runner-linux-x64-" + version + ".tar.gz"
 }
 
-// TemplateDir returns the path of the extracted template directory.
-func (m *Manager) TemplateDir() string {
-	return m.templateDir
-}
-
 // Ensure makes sure the payload for version is cached, verified, and
 // extracted into the template directory. When the template already matches
 // version+sha256, download and extraction are skipped entirely. An empty
@@ -292,6 +287,13 @@ func (m *Manager) extract(cachePath, version, sha256 string) (err error) {
 	if err := writeMarker(filepath.Join(tmp, markerName), version, sha256); err != nil {
 		return fmt.Errorf("payload: write template marker: %w", err)
 	}
+	// fsync the staging directory (plan §10: "extract to template.tmp,
+	// fsync, rename") so the rename cannot outrun the metadata. Best
+	// effort: some filesystems do not support directory fsync.
+	if d, err := os.Open(tmp); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
 	m.log.Info("payload extracted", "version", version, "template", tmp)
 	if err := os.RemoveAll(m.templateDir); err != nil {
 		return fmt.Errorf("payload: remove old template %s: %w", m.templateDir, err)
@@ -332,6 +334,12 @@ func (m *Manager) extractEntry(tr *tar.Reader, hdr *tar.Header, base string) err
 		if _, err := io.Copy(out, tr); err != nil {
 			_ = out.Close()
 			return fmt.Errorf("payload: write %s: %w", target, err)
+		}
+		// fsync before rename (plan §10) so a crash cannot promote a
+		// template with zero-length files.
+		if err := out.Sync(); err != nil {
+			_ = out.Close()
+			return fmt.Errorf("payload: fsync %s: %w", target, err)
 		}
 		if err := out.Close(); err != nil {
 			return fmt.Errorf("payload: close %s: %w", target, err)
@@ -433,9 +441,22 @@ func cacheUsable(path string) bool {
 	return err == nil && info.Mode().IsRegular() && info.Size() > 0
 }
 
-// writeMarker records the version and sha256 of an extracted template.
+// writeMarker records the version and sha256 of an extracted template,
+// fsynced like the payload files it accompanies.
 func writeMarker(path, version, sha256 string) error {
-	return os.WriteFile(path, []byte(version+"\n"+sha256+"\n"), 0o644)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString(version + "\n" + sha256 + "\n"); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // readMarker parses a marker file. ok is false when the file is absent or

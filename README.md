@@ -143,8 +143,9 @@ Validation is fail-closed on boot: `max_runners >= 1`, `min_runners <=
 max_runners`, `max_runners` under the hard cap (32); PEM readable and
 `installation_id > 0`; `scale_set.name` a valid Actions label (no
 spaces); `runner.sha256` set unless `GH_RUNNERD_ALLOW_UNVERIFIED_PAYLOAD=1`;
-`environment_file` exists; `backend=systemd` only if `/run/systemd/system`
-exists; state/cache dirs writable.
+`environment_file` exists and parses with `PATH` and `HOME` set;
+`backend=systemd` only if `/run/systemd/system` exists; state/cache dirs
+writable.
 
 `runner.env` is a systemd `EnvironmentFile`, not YAML:
 
@@ -167,11 +168,19 @@ for the "systemd does not see `mise`/`node`" failure mode (plan §12).
 - `min_runners: 1` keeps one idle `run.sh` registered as a warm pool
   (latency knob); `min_runners: 0` scales to **zero processes and zero
   slot directories** when idle.
-- Scale-down stops only `idle`/`starting` slots (oldest first). **Busy
-  slots are never killed**, no matter how far desired drops.
+- Scale-down stops only `idle` slots (oldest first) and `starting` slots
+  past the acquire grace. **Busy slots are never killed**, no matter how
+  far desired drops.
 - A slot in `starting` counts toward `actual` so reconcile never
   overshoots `max_runners`; message bodies cap at 50 items and can
   truncate a backlog, but statistics already reflect current truth.
+- Reconcile runs when the listener pushes a new desired count, when a
+  slot exits (plan §9's local watcher), and on a 30s safety-net tick
+  (plan §13's "retry next tick"), so a failed start or a dead warm
+  runner is retried without waiting for the next statistics message.
+- A runner that exits before claiming a job and before the acquire
+  grace is an **acquire failure** (plan §13); after a job it is a plain
+  exit. Idle warm-pool runners are never reaped for idleness.
 
 ## Observability
 
@@ -180,7 +189,7 @@ for the "systemd does not see `mise`/`node`" failure mode (plan §12).
   `runner_name`, `desired`, `actual`, `event`, `err`. Never logged: JIT
   payload, PEM, installation tokens.
 - **Metrics** on `127.0.0.1:9090` (hand-rolled Prometheus text
-  exposition):
+  exposition), plus a liveness `/healthz` on the same listener:
 
   - `gh_runnerd_desired_runners`
   - `gh_runnerd_actual_runners{state=}`
@@ -208,6 +217,12 @@ for the "systemd does not see `mise`/`node`" failure mode (plan §12).
   root-owned drop-ins, and tests inject fake binaries via `PATH`.
   `configs/systemd/gha-slot@.service` is a **static alternative** with
   equivalent properties for operators who prefer fixed units.
+- Shared caches stay writable despite `ProtectHome=read-only` (plan
+  §12): the daemon adds the runner user's `~/.cache`,
+  `~/.local/share/mise`, and `~/go/pkg/mod` to each unit's
+  `ReadWritePaths`, creating them first (as the runner user, when the
+  daemon runs as root) so they are never root-owned. Without this, jobs
+  cannot use the host toolchain.
 - Unprivileged slot control: `gh-runnerd` needs a narrow polkit rule for
   `org.freedesktop.systemd1` limited to `gha-slot-*.service`, or a systemd
   user transient scope. If polkit is too heavy for v1, the daemon may run

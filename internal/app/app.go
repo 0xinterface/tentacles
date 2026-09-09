@@ -101,26 +101,40 @@ type desiredCell struct {
 func (c *desiredCell) Store(n int) { c.mu.Lock(); c.n = n; c.mu.Unlock() }
 func (c *desiredCell) Load() int   { c.mu.Lock(); defer c.mu.Unlock(); return c.n }
 
+// defaultReconcileInterval is the safety-net reconcile tick (plan §13
+// "retry next tick"): events nudge reconcile immediately; the tick
+// retries failed starts and replenishes the warm pool even if an event
+// is lost.
+const defaultReconcileInterval = 30 * time.Second
+
+// sd_notify seam; swapped in tests to observe readiness signalling.
+var sdNotify = systemd.SdNotify
+
 type daemon struct {
-	cfg     *config.Config
-	log     *slog.Logger
-	met     *metrics.Registry
-	table   *slot.Table
-	rec     *reconcile.Reconciler
-	ss      ScaleSet
-	backend runner.Backend
-	httpSrv *http.Server
-	desired *desiredCell
-	reconCh chan struct{}
+	cfg               *config.Config
+	log               *slog.Logger
+	met               *metrics.Registry
+	table             *slot.Table
+	rec               *reconcile.Reconciler
+	ss                ScaleSet
+	backend           runner.Backend
+	httpSrv           *http.Server
+	desired           *desiredCell
+	reconCh           chan struct{}
+	reconcileInterval time.Duration
+	sessionUp         chan struct{}
+	sessionOnce       sync.Once
 }
 
 func newDaemon(cfg *config.Config, log *slog.Logger, opts Options) (*daemon, error) {
 	d := &daemon{
-		cfg:     cfg,
-		log:     log,
-		met:     metrics.NewRegistry(),
-		desired: &desiredCell{},
-		reconCh: make(chan struct{}, 1),
+		cfg:               cfg,
+		log:               log,
+		met:               metrics.NewRegistry(),
+		desired:           &desiredCell{},
+		reconCh:           make(chan struct{}, 1),
+		reconcileInterval: defaultReconcileInterval,
+		sessionUp:         make(chan struct{}),
 	}
 
 	// Runner payload: download + verify + extract template.
@@ -191,7 +205,7 @@ func newDaemon(cfg *config.Config, log *slog.Logger, opts Options) (*daemon, err
 
 	// Provisioning backend.
 	switch cfg.Runtime.Backend {
-	case "systemd":
+	case config.BackendSystemd:
 		d.backend = systemd.New(systemd.Options{
 			Log:         log.WithGroup("systemd"),
 			StopTimeout: cfg.Runtime.SlotStopTimeout,
@@ -219,8 +233,8 @@ func newDaemon(cfg *config.Config, log *slog.Logger, opts Options) (*daemon, err
 		slot.WithStopTimeout(cfg.Runtime.SlotStopTimeout),
 		slot.WithCleanupTimeout(cfg.Runtime.CleanupTimeout),
 		slot.WithStartTimeout(cfg.Runtime.SlotStartTimeout),
-		slot.WithEnvFile(cfg.Runner.EnvironmentFile),
-		slot.WithRunUser(cfg.Runner.User, group),
+		slot.WithWorkDir(cfg.Runner.WorkDirectory),
+		slot.WithStartObserver(func(dur time.Duration) { d.met.ObserveSlotStart(dur.Seconds()) }),
 		slot.WithLimits(fmt.Sprintf("%d%%", cfg.Capacity.JobCPUQuotaPercent), cfg.Capacity.JobMemoryMax),
 		slot.WithDiagHook(d.shipDiag),
 		slot.WithEventHook(d.onSlotEvent),
@@ -233,6 +247,11 @@ func newDaemon(cfg *config.Config, log *slog.Logger, opts Options) (*daemon, err
 // marks, and metrics. Scaling is statistics-driven only (plan §8).
 func (d *daemon) buildEvents(requestReconcile func()) scaleset.Events {
 	return scaleset.Events{
+		SessionStarted: func() {
+			// Gate sd_notify READY on the first established session
+			// (plan §11); later reconnects do not re-signal.
+			d.sessionOnce.Do(func() { close(d.sessionUp) })
+		},
 		Desired: func(n int) {
 			d.desired.Store(n)
 			requestReconcile()
@@ -252,6 +271,9 @@ func (d *daemon) buildEvents(requestReconcile func()) scaleset.Events {
 			d.met.IncJobsCompleted(result)
 			d.log.Info("job completed", "runner_name", runnerName, "result", result)
 		},
+		MessageID: func(id int64) {
+			d.met.SetLastMessageID(id)
+		},
 		Session: func(err error) {
 			if err != nil {
 				d.met.IncListenerErrors()
@@ -261,9 +283,10 @@ func (d *daemon) buildEvents(requestReconcile func()) scaleset.Events {
 	}
 }
 
-// materializeSlot copies the payload template into a fresh slot dir,
-// timing the operation for the slot_start histogram. It refuses to
-// materialize when the state filesystem is nearly full (plan §16).
+// materializeSlot copies the payload template into a fresh slot dir. It
+// refuses to materialize when the state filesystem is nearly full (plan
+// §16); the slot_start histogram itself is timed by the Table around
+// the whole start, once per slot.
 func (d *daemon) materializeSlot(pm *payload.Manager) func(dst string) error {
 	return func(dst string) error {
 		// Disk watermark (plan §16): refuse new slots under 10% free on
@@ -272,30 +295,23 @@ func (d *daemon) materializeSlot(pm *payload.Manager) func(dst string) error {
 		if err == nil && total > 0 && free*10 < total {
 			return fmt.Errorf("disk watermark: only %.1f%% free on %s", 100*float64(free)/float64(total), d.cfg.Paths.StateDir)
 		}
-		t0 := time.Now()
-		if err := pm.CopySlot(dst); err != nil {
-			return err
-		}
-		d.met.ObserveSlotStart(time.Since(t0).Seconds())
-		return nil
+		return pm.CopySlot(dst)
 	}
 }
 
 // mintJIT mints a JIT config named <scale-set>-<slot>-<rand> for the
-// slot's work folder. The encoded value is a secret; it never gets logged.
+// slot's work folder (the Table owns that path). The encoded value is a
+// secret; it never gets logged.
 func (d *daemon) mintJIT(ctx context.Context, id slot.ID) (runner.JIT, error) {
 	var b [3]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return runner.JIT{}, fmt.Errorf("rand: %w", err)
 	}
 	name := fmt.Sprintf("%s-%s-%s", d.cfg.ScaleSet.Name, id, hex.EncodeToString(b[:]))
-	work := filepath.Join(d.cfg.Paths.StateDir, "slots", string(id), d.cfg.Runner.WorkDirectory)
-	t0 := time.Now()
-	encoded, err := d.ss.GenerateJIT(ctx, name, work)
+	encoded, err := d.ss.GenerateJIT(ctx, name, d.table.WorkDir(id))
 	if err != nil {
 		return runner.JIT{}, fmt.Errorf("generate jit: %w", err)
 	}
-	d.met.ObserveSlotStart(time.Since(t0).Seconds())
 	return runner.JIT{Encoded: encoded, RunnerName: name}, nil
 }
 
@@ -313,17 +329,20 @@ func (d *daemon) shipDiag(s slot.Slot) error {
 	return nil
 }
 
-func (d *daemon) onSlotEvent(event string, s slot.Slot) {
+func (d *daemon) onSlotEvent(event slot.Event, s slot.Slot) {
 	switch event {
-	case "acquire_failure":
+	case slot.EventAcquireFailure:
 		d.met.IncAcquireFailures()
 		d.log.Warn("slot acquire failure", "slot", s.ID, "runner_name", s.RunnerName)
-	case "started":
+		d.requestReconcile()
+	case slot.EventStarted:
 		d.log.Info("slot started", "slot", s.ID, "runner_name", s.RunnerName, "unit", s.Unit)
-	case "exited":
+	case slot.EventExited:
 		d.log.Info("slot exited", "slot", s.ID, "runner_name", s.RunnerName, "unit", s.Unit)
-	case "stopped":
+		d.requestReconcile()
+	case slot.EventStopped:
 		d.log.Info("slot stopped", "slot", s.ID, "runner_name", s.RunnerName, "unit", s.Unit)
+		d.requestReconcile()
 	}
 }
 
@@ -384,11 +403,19 @@ func (d *daemon) run(ctx context.Context) error {
 	}()
 
 	// Type=notify readiness (plan §11): config validated, payload
-	// verified/extracted, scale set ensured, boot adoption done, listener
-	// session goroutine running. No-op without NOTIFY_SOCKET.
-	if err := systemd.SdNotify("READY=1"); err != nil {
-		d.log.Warn("sd_notify failed", "err", err)
-	}
+	// verified/extracted, scale set ensured, boot adoption done, AND the
+	// listener session started. No-op without NOTIFY_SOCKET; never
+	// signalled when the daemon shuts down before a session came up.
+	go func() {
+		select {
+		case <-d.sessionUp:
+		case <-ctx.Done():
+			return
+		}
+		if err := sdNotify("READY=1"); err != nil {
+			d.log.Warn("sd_notify failed", "err", err)
+		}
+	}()
 
 	// Metrics state sync.
 	syncStop := make(chan struct{})
@@ -414,8 +441,13 @@ func (d *daemon) run(ctx context.Context) error {
 	}()
 
 	// Reconcile loop; also drives the warm pool at boot (min_runners).
+	// The listener's desired pushes, slot exits (plan §9's local
+	// watcher), and the safety-net tick (plan §13's "retry next tick")
+	// all funnel through here.
 	d.desired.Store(d.cfg.Capacity.MinRunners)
 	d.requestReconcile()
+	tick := time.NewTicker(d.reconcileInterval)
+	defer tick.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -425,13 +457,14 @@ func (d *daemon) run(ctx context.Context) error {
 			<-syncStop
 			return nil
 		case <-d.reconCh:
-			n := d.desired.Load()
-			rctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-			if err := d.rec.Reconcile(rctx, n); err != nil {
-				d.log.Error("reconcile failed", "desired", n, "err", err)
-			}
-			cancel()
+		case <-tick.C:
 		}
+		n := d.desired.Load()
+		rctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		if err := d.rec.Reconcile(rctx, n); err != nil {
+			d.log.Error("reconcile failed", "desired", n, "err", err)
+		}
+		cancel()
 	}
 }
 

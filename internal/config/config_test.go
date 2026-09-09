@@ -459,3 +459,61 @@ func TestHardCap(t *testing.T) {
 		t.Fatalf("HardCapMaxRunners = %d, want 32", HardCapMaxRunners)
 	}
 }
+
+// TestEnsureDirsRejectsUnwritableDir: plan §6 — "state/cache directories
+// writable" fails closed; an existing read-only directory must not pass
+// (MkdirAll alone would succeed on it).
+func TestEnsureDirsRejectsUnwritableDir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission-based failure does not apply to root")
+	}
+	dir := t.TempDir()
+	blocked := filepath.Join(dir, "blocked")
+	if err := os.MkdirAll(blocked, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(blocked, 0o755) // let t.TempDir clean up
+	c := &Config{
+		Paths:   Paths{StateDir: blocked, CacheDir: filepath.Join(dir, "cache"), LogDir: filepath.Join(dir, "log")},
+		Runtime: Runtime{JitDir: filepath.Join(dir, "run")},
+	}
+	err := c.EnsureDirs()
+	if err == nil || !strings.Contains(err.Error(), "not writable") {
+		t.Fatalf("EnsureDirs() = %v, want not-writable error", err)
+	}
+}
+
+// TestValidateRejectsEnvFileMissingRequiredVars: plan §6 — the
+// environment file must carry PATH and HOME, or the "systemd does not
+// see mise/node" failure mode comes back.
+func TestValidateRejectsEnvFileMissingRequiredVars(t *testing.T) {
+	c := baseValid(t)
+	envFile := filepath.Join(t.TempDir(), "runner.env")
+	if err := os.WriteFile(envFile, []byte("LANG=C.UTF-8\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c.Runner.EnvironmentFile = envFile
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("Validate: expected error for env file without PATH/HOME")
+	}
+	for _, want := range []string{"PATH", "HOME"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Validate error %q missing %q", err, want)
+		}
+	}
+}
+
+// TestValidateRejectsMalformedEnvFile: a broken KEY=VALUE line fails at
+// validation time, not at the first slot start.
+func TestValidateRejectsMalformedEnvFile(t *testing.T) {
+	c := baseValid(t)
+	envFile := filepath.Join(t.TempDir(), "runner.env")
+	if err := os.WriteFile(envFile, []byte("this line has no equals\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c.Runner.EnvironmentFile = envFile
+	if err := c.Validate(); err == nil {
+		t.Fatal("Validate: expected error for malformed env file")
+	}
+}

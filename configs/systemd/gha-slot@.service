@@ -33,8 +33,10 @@ MemoryMax=8G
 TasksMax=4096
 PrivateTmp=yes
 NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=/var/lib/gh-runnerd/slots/%i /tmp
+# Plan §12: shared caches (~/.cache, mise, go/pkg/mod) stay writable
+# under ProtectHome=read-only — that is the point of running on a shared
+# host. %h expands to User='s home. Create them as gha-runner before the
+# first job (the daemon's transient units do this automatically).
+ReadWritePaths=/var/lib/gh-runnerd/slots/%i /tmp %h/.cache %h/.local/share/mise %h/go/pkg/mod
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=yes

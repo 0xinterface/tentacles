@@ -76,46 +76,6 @@ func TestClamp(t *testing.T) {
 	}
 }
 
-func TestPlan(t *testing.T) {
-	busy, idle, starting := slot.StateBusy, slot.StateIdle, slot.StateStarting
-	tests := []struct {
-		name    string
-		desired int
-		live    []slot.State
-		starts  int
-		stops   []int
-	}{
-		{"start missing", 5, []slot.State{idle, busy}, 3, nil},
-		{"start all from empty", 2, nil, 2, nil},
-		{"balanced", 3, []slot.State{idle, idle, busy}, 0, nil},
-		{"nothing to do when zero and empty", 0, nil, 0, nil},
-		{"stop idle only", 1, []slot.State{idle, busy}, 0, []int{0}},
-		{"stop two idle", 1, []slot.State{idle, idle, busy}, 0, []int{0, 1}},
-		{"busy only never stopped", 0, []slot.State{busy, busy}, 0, nil},
-		{"mixed prefers idle over starting", 1, []slot.State{starting, idle}, 0, []int{1}},
-		{"stop starting when no idle", 1, []slot.State{busy, starting}, 0, []int{1}},
-		{"busy beyond excess untouched", 0, []slot.State{idle, busy, busy}, 0, []int{0}},
-		{"more busy than surplus", 1, []slot.State{busy, busy, idle}, 0, []int{2}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			starts, stops := Plan(tt.desired, tt.live)
-			if starts != tt.starts {
-				t.Errorf("Plan(%d, %v) starts = %d, want %d", tt.desired, tt.live, starts, tt.starts)
-			}
-			if len(stops) != len(tt.stops) {
-				t.Fatalf("Plan(%d, %v) stops = %v, want %v", tt.desired, tt.live, stops, tt.stops)
-			}
-			for i := range stops {
-				if stops[i] != tt.stops[i] {
-					t.Errorf("Plan(%d, %v) stops = %v, want %v", tt.desired, tt.live, stops, tt.stops)
-					break
-				}
-			}
-		})
-	}
-}
-
 func TestReconcileCallsSetDesiredWithClampedValue(t *testing.T) {
 	mgr := &fakeManager{}
 	r := New(mgr, 1, 4, nil)

@@ -61,34 +61,3 @@ func (r *Reconciler) Reconcile(ctx context.Context, desiredRaw int) error {
 	r.mgr.SetDesired(desired)
 	return r.mgr.Ensure(ctx, desired)
 }
-
-// Plan is the pure decision helper for a reconcile tick. Given the
-// desired count and the live slot states (starting|idle|busy), it
-// returns how many slots to start and the indexes into live to stop.
-// Surplus slots are stopped only when idle or starting (a starting slot
-// is by definition past the brief provision call and has not claimed a
-// job); busy slots are never stopped. When fewer slots must stop than
-// there are idle ones, the preference order (oldest first) is the
-// caller's job — Plan returns indexes in live order.
-func Plan(desired int, live []slot.State) (starts int, stops []int) {
-	n := len(live)
-	if n < desired {
-		return desired - n, nil
-	}
-	if n == desired {
-		return 0, nil
-	}
-	excess := n - desired
-	// Prefer idle slots over starting ones; never busy.
-	for _, pass := range []slot.State{slot.StateIdle, slot.StateStarting} {
-		for i, st := range live {
-			if len(stops) == excess {
-				return 0, stops
-			}
-			if st == pass {
-				stops = append(stops, i)
-			}
-		}
-	}
-	return 0, stops
-}
