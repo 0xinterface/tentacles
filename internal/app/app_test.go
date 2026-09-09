@@ -178,8 +178,9 @@ func freePort(t *testing.T) string {
 }
 
 // writeIntegrationConfig assembles a fully valid config for the process
-// backend, with the runner tarball served from srv.
-func writeIntegrationConfig(t *testing.T, dir, tarURL, sha string, minRunners, maxRunners int, extraEnv ...string) (string, string) {
+// backend, with the runner tarball served from srv. An empty version
+// leaves runner.version unset (dynamic latest-release resolution).
+func writeIntegrationConfig(t *testing.T, dir, tarURL, sha string, minRunners, maxRunners int, version string, extraEnv ...string) (string, string) {
 	t.Helper()
 	envFile := filepath.Join(dir, "runner.env")
 	cwd, _ := os.Getwd()
@@ -213,7 +214,7 @@ capacity:
   job_memory_max: 1G
 
 runner:
-  version: 2.328.0
+  version: %s
   download_url: %s
   sha256: %s
   work_directory: _work
@@ -239,7 +240,7 @@ observability:
   log_level: warn
   ship_diag: true
 `,
-		genPEM(t, dir), minRunners, maxRunners, tarURL, sha,
+		genPEM(t, dir), minRunners, maxRunners, version, tarURL, sha,
 		currentUser(t), envFile,
 		stateDir, filepath.Join(dir, "cache"), filepath.Join(dir, "logs"),
 		filepath.Join(dir, "jit"), listenAddr)
@@ -248,6 +249,56 @@ observability:
 		t.Fatal(err)
 	}
 	return path, listenAddr
+}
+
+// TestDaemonResolvesLatestRunnerVersion: with runner.version unset the
+// daemon resolves the latest actions/runner release from the releases
+// API and verifies the payload against the release asset digest.
+func TestDaemonResolvesLatestRunnerVersion(t *testing.T) {
+	if testing.Short() {
+		t.Skip("end-to-end test")
+	}
+	tarBytes, sha := fixtureRunnerTar(t)
+	releaseSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"tag_name":"v9.9.9","assets":[{"name":"actions-runner-linux-x64-9.9.9.tar.gz","digest":"sha256:%s"}]}`, sha)
+	}))
+	defer releaseSrv.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(tarBytes)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cfgPath, _ := writeIntegrationConfig(t, dir, srv.URL, "", 0, 1, "")
+
+	fake := &fakeScaleSet{}
+	fake.runFn = func(ctx context.Context, f *fakeScaleSet) error {
+		f.pushDesired(1)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Options{ConfigPath: cfgPath, ScaleSet: fake, releasesURL: releaseSrv.URL})
+	}()
+
+	slotDir := filepath.Join(dir, "state", "slots", "0001")
+	if !poll(t, 30*time.Second, func() bool { return fileExists(filepath.Join(slotDir, ".fake-claimed")) }) {
+		cancel()
+		t.Fatalf("runner never started via resolved latest version")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run returned error: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatalf("daemon did not shut down")
+	}
 }
 func currentUser(t *testing.T) string {
 	t.Helper()
@@ -289,7 +340,7 @@ func TestDaemonScaleUpDownEphemeral(t *testing.T) {
 	defer srv.Close()
 
 	dir := t.TempDir()
-	cfgPath, listenAddr := writeIntegrationConfig(t, dir, srv.URL, sha, 0, 2)
+	cfgPath, listenAddr := writeIntegrationConfig(t, dir, srv.URL, sha, 0, 2, "2.328.0")
 
 	fake := &fakeScaleSet{}
 	fake.runFn = func(ctx context.Context, f *fakeScaleSet) error {
@@ -391,7 +442,7 @@ func TestDaemonMinRunnersWarmPool(t *testing.T) {
 	defer srv.Close()
 
 	dir := t.TempDir()
-	cfgPath, _ := writeIntegrationConfig(t, dir, srv.URL, sha, 1, 2)
+	cfgPath, _ := writeIntegrationConfig(t, dir, srv.URL, sha, 1, 2, "2.328.0")
 
 	fake := &fakeScaleSet{}
 	fake.runFn = func(ctx context.Context, f *fakeScaleSet) error {
@@ -440,7 +491,7 @@ func TestDryRunValidatesConfig(t *testing.T) {
 	}))
 	defer srv.Close()
 	dir := t.TempDir()
-	cfgPath, _ := writeIntegrationConfig(t, dir, srv.URL, sha, 0, 2)
+	cfgPath, _ := writeIntegrationConfig(t, dir, srv.URL, sha, 0, 2, "2.328.0")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -487,7 +538,7 @@ func TestDaemonReplenishesWarmPoolAfterExit(t *testing.T) {
 	defer srv.Close()
 
 	dir := t.TempDir()
-	cfgPath, _ := writeIntegrationConfig(t, dir, srv.URL, sha, 1, 2, "FAKE_RUNNER_SLEEP=1")
+	cfgPath, _ := writeIntegrationConfig(t, dir, srv.URL, sha, 1, 2, "2.328.0", "FAKE_RUNNER_SLEEP=1")
 
 	fake := &fakeScaleSet{}
 	fake.runFn = func(ctx context.Context, f *fakeScaleSet) error {
@@ -533,7 +584,7 @@ func TestDaemonReadinessGatedOnSessionStart(t *testing.T) {
 
 	runCase := func(t *testing.T, fireSession bool) {
 		dir := t.TempDir()
-		cfgPath, listenAddr := writeIntegrationConfig(t, dir, srv.URL, sha, 0, 2)
+		cfgPath, listenAddr := writeIntegrationConfig(t, dir, srv.URL, sha, 0, 2, "2.328.0")
 		fake := &fakeScaleSet{}
 		fake.runFn = func(ctx context.Context, f *fakeScaleSet) error {
 			if fireSession {

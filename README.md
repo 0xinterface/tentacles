@@ -191,9 +191,9 @@ strict: an unknown key is a startup error, not a silent no-op.
 | `capacity.max_runners` | required | hard cap 32 |
 | `capacity.job_cpu_quota_percent` | required | systemd `CPUQuota`, e.g. 400 |
 | `capacity.job_memory_max` | required | e.g. `8G` |
-| `runner.version` | required | `X.Y.Z`; pins the payload |
+| `runner.version` | unset | `X.Y.Z` pins the payload; unset tracks the latest release |
 | `runner.download_url` | official release URL | override for mirrors |
-| `runner.sha256` | required | unless `TENTACLES_ALLOW_UNVERIFIED_PAYLOAD=1` |
+| `runner.sha256` | unset (required when `version` is pinned) | unless `TENTACLES_ALLOW_UNVERIFIED_PAYLOAD=1` |
 | `runner.work_directory` | `_work` | JIT work folder inside the slot |
 | `runner.disable_update` | `true` | runner self-update off at scale-set creation |
 | `runner.user` | `gha-runner` | |
@@ -265,6 +265,22 @@ only works after `eval "$(mise activate bash)"`, fix this file instead.
 ## Payload and slot lifecycle
 
 On start (and on a `runner.version` or sha change):
+
+The version comes from one of two modes:
+
+- **Pinned** (recommended for production): `runner.version` plus
+  `runner.sha256` are set. The daemon downloads exactly those bytes or
+  fails.
+- **Tracking** (`runner.version` unset): the daemon queries the GitHub
+  releases API for the latest `actions/runner` release, reads the
+  version from the tag and the sha256 from the release asset's digest,
+  and verifies the download against it. This still fails closed: if the
+  API is unreachable or the release carries no digest, startup fails
+  and tells you to pin the version instead. Unauthenticated GitHub API
+  calls are rate limited (60/hour per IP), and each daemon start makes
+  exactly one; pin the version in production.
+
+Then, in both modes:
 
 1. Download `actions-runner-linux-x64-<ver>.tar.gz` into
    `paths.cache_dir` if not cached. Downloads are capped at 1 GiB.

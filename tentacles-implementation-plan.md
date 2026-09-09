@@ -216,8 +216,9 @@ Validation on boot, fail closed:
 - `max_runners` not greater than a compiled or config hard cap (suggest 32)
 - PEM readable, installation id > 0
 - `scale_set.name` is a valid Actions label (no spaces)
-- `runner.sha256` set unless `TENTACLES_ALLOW_UNVERIFIED_PAYLOAD=1`
-- `environment_file` exists
+- `runner.version` either pinned `X.Y.Z`, or unset to track the latest release (version + asset digest resolved from the releases API at startup)
+- `runner.sha256` set when `runner.version` is pinned, unless `TENTACLES_ALLOW_UNVERIFIED_PAYLOAD=1`; must be unset when tracking
+- `environment_file` exists and parses with `PATH`/`HOME` set
 - `backend=systemd` only if `/run/systemd/system` exists
 - State/cache directories writable
 
@@ -392,7 +393,7 @@ Startup race: a slot in `starting` counts toward `actual` so the reconciler does
 
 ## 10. Official runner payload
 
-Do not install the runner the way GitHub’s Linux UI describes (`config.sh` + `svc.sh`). Use the tarball as a cacheable payload.
+An unset `runner.version` tracks the latest release: the daemon resolves the version and the linux-x64 asset digest from the GitHub releases API (`payload.ResolveLatest`) and verifies the download against it. Fail closed when the API is unreachable or the release has no digest; pin instead. `runner.sha256` cannot be pinned while tracking.
 
 On daemon start, and on config change of `runner.version`:
 

@@ -108,7 +108,7 @@ func TestValidate(t *testing.T) {
 		{"label with space", func(c *Config) { c.ScaleSet.Name = "bad name" }, nil, "scale_set.name"},
 		{"label leading dash", func(c *Config) { c.ScaleSet.Name = "-bad" }, nil, "scale_set.name"},
 		{"label with slash", func(c *Config) { c.ScaleSet.Name = "bad/name" }, nil, "scale_set.name"},
-		{"version empty", func(c *Config) { c.Runner.Version = "" }, nil, "runner.version"},
+		{"version empty with sha pinned", func(c *Config) { c.Runner.Version = "" }, nil, "runner.sha256 cannot be pinned"},
 		{"version two parts", func(c *Config) { c.Runner.Version = "2.328" }, nil, "runner.version"},
 		{"version prefixed", func(c *Config) { c.Runner.Version = "v2.328.0" }, nil, "runner.version"},
 		{"version non-numeric", func(c *Config) { c.Runner.Version = "latest" }, nil, "runner.version"},
@@ -168,7 +168,7 @@ func TestValidateJoinsAllErrors(t *testing.T) {
 	}
 	for _, want := range []string{
 		"max_runners", "installation_id", "client_id", "private_key_path",
-		"scope.kind", "owner", "scale_set.name", "version", "sha256",
+		"scope.kind", "owner", "scale_set.name",
 		"environment_file", "backend", "state_dir", "cache_dir", "log_dir",
 		"job_cpu_quota_percent", "job_memory_max", "slot_start_timeout",
 		"slot_stop_timeout", "cleanup_timeout", "acquire_grace",
@@ -457,6 +457,28 @@ func TestExampleConfigRoundTrips(t *testing.T) {
 func TestHardCap(t *testing.T) {
 	if HardCapMaxRunners != 32 {
 		t.Fatalf("HardCapMaxRunners = %d, want 32", HardCapMaxRunners)
+	}
+}
+
+// TestValidateDynamicVersion: an unset runner.version means "track the
+// latest release"; the daemon resolves version and digest at startup.
+func TestValidateDynamicVersion(t *testing.T) {
+	c := baseValid(t)
+	c.Runner.Version = ""
+	c.Runner.SHA256 = ""
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate with unset version/sha = %v, want ok", err)
+	}
+}
+
+// TestValidateShaWithoutVersionRejected: a digest cannot pin a version
+// that moves with every release.
+func TestValidateShaWithoutVersionRejected(t *testing.T) {
+	c := baseValid(t)
+	c.Runner.Version = ""
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "runner.sha256") {
+		t.Fatalf("Validate = %v, want sha256-without-version error", err)
 	}
 }
 

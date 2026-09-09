@@ -214,11 +214,19 @@ func (c *Config) Validate() error {
 		fail("scale_set.name %q is not a valid Actions label (must match %s)", c.ScaleSet.Name, labelRe.String())
 	}
 
-	// Runner payload.
-	if !versionRe.MatchString(c.Runner.Version) {
-		fail("runner.version %q must look like X.Y.Z (e.g. 2.328.0)", c.Runner.Version)
+	// Runner payload. An unset version means "track the latest
+	// release": the daemon resolves the version and its asset digest
+	// from the GitHub releases API at startup (plan §10). A pinned
+	// sha256 requires a pinned version — a digest cannot constrain a
+	// version that moves with every release.
+	dynamicVersion := c.Runner.Version == ""
+	if !dynamicVersion && !versionRe.MatchString(c.Runner.Version) {
+		fail("runner.version %q must look like X.Y.Z (e.g. 2.328.0), or be unset to track the latest release", c.Runner.Version)
 	}
-	if os.Getenv(AllowUnverifiedPayloadEnv) != "1" {
+	if dynamicVersion && c.Runner.SHA256 != "" {
+		fail("runner.sha256 cannot be pinned while runner.version tracks the latest release; set runner.version too")
+	}
+	if !dynamicVersion && os.Getenv(AllowUnverifiedPayloadEnv) != "1" {
 		if !sha256Re.MatchString(c.Runner.SHA256) {
 			fail("runner.sha256 must be a 64-character hex digest (got %d characters); set %s=1 to allow an unverified payload", len(c.Runner.SHA256), AllowUnverifiedPayloadEnv)
 		}

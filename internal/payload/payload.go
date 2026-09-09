@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -16,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +40,72 @@ const (
 	// the overall operation with the context passed to Ensure.
 	defaultHTTPTimeout = 30 * time.Minute
 )
+
+// resolveHTTPTimeout bounds a single releases-API call.
+const resolveHTTPTimeout = 30 * time.Second
+
+// versionShape matches the bare X.Y.Z versions the config contract and
+// the release asset names are built from.
+var versionShape = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
+
+// ReleasesAPIURL is the GitHub API endpoint ResolveLatest queries when
+// the config leaves runner.version unset.
+const ReleasesAPIURL = "https://api.github.com/repos/actions/runner/releases/latest"
+
+// releaseResponse and releaseAsset are the fields of the GitHub
+// releases API response this daemon consumes.
+type releaseResponse struct {
+	TagName string         `json:"tag_name"`
+	Assets  []releaseAsset `json:"assets"`
+}
+
+type releaseAsset struct {
+	Name   string `json:"name"`
+	Digest string `json:"digest"`
+}
+
+// ResolveLatest queries the GitHub releases API for the latest
+// actions/runner release and returns the version (tag without the "v")
+// and the sha256 of the linux-x64 tarball taken from the release asset
+// digest. It fails closed when the release carries no matching asset or
+// no usable digest; in that case pin runner.version and runner.sha256
+// instead of running unverified.
+func ResolveLatest(ctx context.Context, apiURL string) (string, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return "", "", fmt.Errorf("payload: build releases request: %w", err)
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	client := &http.Client{Timeout: resolveHTTPTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("payload: query releases API %s: %w", apiURL, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("payload: releases API %s: unexpected status %s", apiURL, resp.Status)
+	}
+	var rel releaseResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&rel); err != nil {
+		return "", "", fmt.Errorf("payload: decode releases response: %w", err)
+	}
+	version := strings.TrimPrefix(rel.TagName, "v")
+	if !versionShape.MatchString(version) {
+		return "", "", fmt.Errorf("payload: releases API returned unusable tag %q", rel.TagName)
+	}
+	want := fmt.Sprintf(cacheFileFmt, version)
+	for _, a := range rel.Assets {
+		if a.Name != want {
+			continue
+		}
+		sha, ok := strings.CutPrefix(a.Digest, "sha256:")
+		if !ok || checkSHA256(sha) != nil {
+			return "", "", fmt.Errorf("payload: asset %s carries unusable digest %q; pin runner.version and runner.sha256 instead", a.Name, a.Digest)
+		}
+		return version, sha, nil
+	}
+	return "", "", fmt.Errorf("payload: release %s has no %s asset; pin runner.version and runner.sha256 instead", rel.TagName, want)
+}
 
 // Manager downloads, verifies, and extracts the official runner tarball.
 // Ensure is safe for concurrent use; CopySlot may run while a different

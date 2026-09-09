@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -171,6 +172,92 @@ func TestDownloadURL(t *testing.T) {
 	if got != want {
 		t.Fatalf("DownloadURL() = %q, want %q", got, want)
 	}
+}
+
+func TestResolveLatest(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("ab", 32)
+	serve := func(t *testing.T, body string, status int, wantAccept bool) *httptest.Server {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if wantAccept && !strings.Contains(r.Header.Get("Accept"), "vnd.github+json") {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(body))
+		}))
+		t.Cleanup(srv.Close)
+		return srv
+	}
+	release := func(tag, asset, digest string) string {
+		assets := "[]"
+		if asset != "" {
+			assets = fmt.Sprintf(`[{"name": %q, "digest": %q}]`, asset, digest)
+		}
+		return fmt.Sprintf(`{"tag_name": %q, "assets": %s}`, tag, assets)
+	}
+	tarball := func(v string) string { return fmt.Sprintf("actions-runner-linux-x64-%s.tar.gz", v) }
+
+	t.Run("resolves version and digest", func(t *testing.T) {
+		srv := serve(t, release("v2.337.0", tarball("2.337.0"), digest), http.StatusOK, true)
+		version, sha, err := ResolveLatest(context.Background(), srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if version != "2.337.0" {
+			t.Fatalf("version = %q, want 2.337.0", version)
+		}
+		if sha != strings.Repeat("ab", 32) {
+			t.Fatalf("sha = %q", sha)
+		}
+	})
+	t.Run("accepts tag without v prefix", func(t *testing.T) {
+		srv := serve(t, release("2.337.0", tarball("2.337.0"), digest), http.StatusOK, false)
+		version, _, err := ResolveLatest(context.Background(), srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if version != "2.337.0" {
+			t.Fatalf("version = %q", version)
+		}
+	})
+	t.Run("rejects unusable tag", func(t *testing.T) {
+		srv := serve(t, release("latest", tarball("latest"), digest), http.StatusOK, false)
+		if _, _, err := ResolveLatest(context.Background(), srv.URL); err == nil {
+			t.Fatal("expected error for unusable tag")
+		}
+	})
+	t.Run("rejects missing linux asset", func(t *testing.T) {
+		srv := serve(t, release("v2.337.0", "", digest), http.StatusOK, false)
+		if _, _, err := ResolveLatest(context.Background(), srv.URL); err == nil {
+			t.Fatal("expected error for missing linux-x64 asset")
+		}
+	})
+	t.Run("rejects missing digest", func(t *testing.T) {
+		srv := serve(t, release("v2.337.0", tarball("2.337.0"), ""), http.StatusOK, false)
+		if _, _, err := ResolveLatest(context.Background(), srv.URL); err == nil {
+			t.Fatal("expected error for missing digest")
+		}
+	})
+	t.Run("rejects non-sha256 digest", func(t *testing.T) {
+		srv := serve(t, release("v2.337.0", tarball("2.337.0"), "md5:abc"), http.StatusOK, false)
+		if _, _, err := ResolveLatest(context.Background(), srv.URL); err == nil {
+			t.Fatal("expected error for non-sha256 digest")
+		}
+	})
+	t.Run("surfaces http errors", func(t *testing.T) {
+		srv := serve(t, `{"message":"rate limited"}`, http.StatusForbidden, false)
+		if _, _, err := ResolveLatest(context.Background(), srv.URL); err == nil {
+			t.Fatal("expected error for non-200")
+		}
+	})
+	t.Run("rejects malformed json", func(t *testing.T) {
+		srv := serve(t, `{"tag_name":`, http.StatusOK, false)
+		if _, _, err := ResolveLatest(context.Background(), srv.URL); err == nil {
+			t.Fatal("expected error for malformed json")
+		}
+	})
 }
 
 func TestEnsureFreshDownload(t *testing.T) {

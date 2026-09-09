@@ -31,12 +31,15 @@ import (
 	"github.com/hkust/tentacles/internal/version"
 )
 
-// Options are the process-level options from main. ScaleSet is a test
-// seam: non-nil overrides the real adapter (used by integration tests).
 type Options struct {
 	ConfigPath string
 	DryRun     bool
 	ScaleSet   ScaleSet
+
+	// releasesURL overrides the releases API endpoint used to resolve
+	// an unset runner.version; tests inject a fake server. Empty means
+	// payload.ReleasesAPIURL.
+	releasesURL string
 }
 
 // ScaleSet is the narrow surface app consumes from the scale-set adapter.
@@ -137,15 +140,30 @@ func newDaemon(cfg *config.Config, log *slog.Logger, opts Options) (*daemon, err
 		sessionUp:         make(chan struct{}),
 	}
 
-	// Runner payload: download + verify + extract template.
+	// Runner payload: download + verify + extract template. An unset
+	// runner.version tracks the latest release: resolve the version and
+	// its asset digest from the releases API (plan §10).
+	pctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	runnerVersion, sha := cfg.Runner.Version, cfg.Runner.SHA256
+	if runnerVersion == "" {
+		api := opts.releasesURL
+		if api == "" {
+			api = payload.ReleasesAPIURL
+		}
+		resolved, digest, err := payload.ResolveLatest(pctx, api)
+		if err != nil {
+			return nil, fmt.Errorf("resolve latest runner version: %w", err)
+		}
+		runnerVersion, sha = resolved, digest
+		log.Info("runner version resolved from latest release", "runner_version", runnerVersion)
+	}
 	pm := payload.New(cfg.Paths.CacheDir, filepath.Join(cfg.Paths.StateDir, "template"), log)
 	url := cfg.Runner.DownloadURL
 	if url == "" {
-		url = payload.DownloadURL(cfg.Runner.Version)
+		url = payload.DownloadURL(runnerVersion)
 	}
-	pctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-	if err := pm.Ensure(pctx, cfg.Runner.Version, cfg.Runner.SHA256, url); err != nil {
+	if err := pm.Ensure(pctx, runnerVersion, sha, url); err != nil {
 		return nil, fmt.Errorf("ensure runner payload: %w", err)
 	}
 
