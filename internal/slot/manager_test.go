@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hkust/gh-runnerd/internal/runner"
+	"github.com/hkust/tentacles/internal/runner"
 )
 
 // fakeBackend is a runner.Backend for tests. Start registers a per-unit
@@ -231,7 +231,7 @@ func TestTableStartN(t *testing.T) {
 	}
 	for i, spec := range specs {
 		id := ID(fmt.Sprintf("%04d", i+1))
-		if spec.UnitName != "gha-slot-"+string(id)+".service" {
+		if spec.UnitName != "tentacle-"+string(id)+".service" {
 			t.Errorf("spec %d unit = %q", i, spec.UnitName)
 		}
 		if spec.SlotDir != filepath.Join(tab.root, string(id)) {
@@ -269,7 +269,7 @@ func TestTableIDAllocationReuseAfterWipe(t *testing.T) {
 		t.Fatalf("active = %v, want [0001]", got)
 	}
 
-	backend.exit("gha-slot-0001.service")
+	backend.exit("tentacle-0001.service")
 	// The ID is freed only after the wipe completes, so wait for the dir
 	// to be gone before allocating again.
 	eventually(t, 3*time.Second, func() bool {
@@ -335,8 +335,8 @@ func TestTableStopOnlyIdleNeverBusy(t *testing.T) {
 	backend.mu.Lock()
 	stopped := append([]string(nil), backend.stopped...)
 	backend.mu.Unlock()
-	if fmt.Sprint(stopped) != fmt.Sprint([]string{"gha-slot-0002.service"}) {
-		t.Fatalf("stopped = %v, want only [gha-slot-0002.service]", stopped)
+	if fmt.Sprint(stopped) != fmt.Sprint([]string{"tentacle-0002.service"}) {
+		t.Fatalf("stopped = %v, want only [tentacle-0002.service]", stopped)
 	}
 	if !rec.has("stopped") {
 		t.Errorf("expected a stopped event, got %v", rec.events)
@@ -370,8 +370,8 @@ func TestTableStopOldestIdlePreferred(t *testing.T) {
 	backend.mu.Lock()
 	stopped := append([]string(nil), backend.stopped...)
 	backend.mu.Unlock()
-	if fmt.Sprint(stopped) != fmt.Sprint([]string{"gha-slot-0001.service"}) {
-		t.Fatalf("stopped = %v, want oldest idle [gha-slot-0001.service]", stopped)
+	if fmt.Sprint(stopped) != fmt.Sprint([]string{"tentacle-0001.service"}) {
+		t.Fatalf("stopped = %v, want oldest idle [tentacle-0001.service]", stopped)
 	}
 	if got := slotIDs(tab.Active()); fmt.Sprint(got) != fmt.Sprint([]ID{"0002"}) {
 		t.Fatalf("remaining active = %v, want [0002]", got)
@@ -424,7 +424,7 @@ func TestTableObserveExitWipesEvenWhenDiagHookFails(t *testing.T) {
 		t.Fatalf("jit file missing before exit: %v", err)
 	}
 
-	backend.exit("gha-slot-0001.service")
+	backend.exit("tentacle-0001.service")
 	// Wait for the wipe itself, not just the state flip.
 	eventually(t, 3*time.Second, func() bool {
 		_, err := os.Stat(dir)
@@ -598,7 +598,7 @@ func TestTableAdopt(t *testing.T) {
 	}
 	// 0003: running unit with no dir → stop.
 
-	backend.active = []string{"gha-slot-0001.service", "gha-slot-0003.service"}
+	backend.active = []string{"tentacle-0001.service", "tentacle-0003.service"}
 	if err := tab.Adopt(ctx, backend.active); err != nil {
 		t.Fatal(err)
 	}
@@ -616,8 +616,8 @@ func TestTableAdopt(t *testing.T) {
 	backend.mu.Lock()
 	stopped := append([]string(nil), backend.stopped...)
 	backend.mu.Unlock()
-	if fmt.Sprint(stopped) != fmt.Sprint([]string{"gha-slot-0003.service"}) {
-		t.Fatalf("stopped = %v, want unitless [gha-slot-0003.service]", stopped)
+	if fmt.Sprint(stopped) != fmt.Sprint([]string{"tentacle-0003.service"}) {
+		t.Fatalf("stopped = %v, want unitless [tentacle-0003.service]", stopped)
 	}
 }
 
@@ -720,7 +720,7 @@ func TestTableExitBeforeGraceCountsAcquireFailure(t *testing.T) {
 	if err := tab.Ensure(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
-	backend.exit("gha-slot-0001.service")
+	backend.exit("tentacle-0001.service")
 	eventually(t, 3*time.Second, func() bool {
 		return len(tab.Active()) == 0 && rec.has(EventAcquireFailure)
 	})
@@ -740,7 +740,7 @@ func TestTableBusyExitIsPlainExit(t *testing.T) {
 		t.Fatal(err)
 	}
 	tab.MarkBusy("0001")
-	backend.exit("gha-slot-0001.service")
+	backend.exit("tentacle-0001.service")
 	eventually(t, 3*time.Second, func() bool { return len(tab.Active()) == 0 })
 	if rec.has(EventAcquireFailure) {
 		t.Fatalf("busy exit classified acquire failure: %v", rec.events)
@@ -791,7 +791,7 @@ func TestTableWipeRemovesCredentialFiles(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	backend.exit("gha-slot-0001.service")
+	backend.exit("tentacle-0001.service")
 	eventually(t, 3*time.Second, func() bool {
 		_, err := os.Stat(dir)
 		return os.IsNotExist(err)
@@ -829,7 +829,7 @@ func TestTableAdoptReadsRunnerName(t *testing.T) {
 	tab := NewTable(root, backend, markerMaterialize, fakeJIT, t.TempDir(), nil)
 	t.Cleanup(tab.Close)
 
-	backend.active = []string{"gha-slot-0001.service"}
+	backend.active = []string{"tentacle-0001.service"}
 	if err := tab.Adopt(context.Background(), backend.active); err != nil {
 		t.Fatal(err)
 	}
@@ -847,8 +847,8 @@ func TestTableAdoptReadsRunnerName(t *testing.T) {
 func TestStopSurplusStartingPastGraceOnly(t *testing.T) {
 	backend := &fakeBackend{}
 	tab, _, _ := newTestTable(t, backend, WithAcquireGrace(time.Hour))
-	fresh := &slotRec{Slot: Slot{ID: "0001", Unit: "gha-slot-0001.service", State: StateStarting}, provStart: time.Now()}
-	stuck := &slotRec{Slot: Slot{ID: "0002", Unit: "gha-slot-0002.service", State: StateStarting}, provStart: time.Now().Add(-2 * time.Hour)}
+	fresh := &slotRec{Slot: Slot{ID: "0001", Unit: "tentacle-0001.service", State: StateStarting}, provStart: time.Now()}
+	stuck := &slotRec{Slot: Slot{ID: "0002", Unit: "tentacle-0002.service", State: StateStarting}, provStart: time.Now().Add(-2 * time.Hour)}
 	tab.mu.Lock()
 	tab.slots["0001"] = fresh
 	tab.slots["0002"] = stuck
@@ -858,7 +858,7 @@ func TestStopSurplusStartingPastGraceOnly(t *testing.T) {
 	backend.mu.Lock()
 	stopped := append([]string(nil), backend.stopped...)
 	backend.mu.Unlock()
-	if fmt.Sprint(stopped) != fmt.Sprint([]string{"gha-slot-0002.service"}) {
+	if fmt.Sprint(stopped) != fmt.Sprint([]string{"tentacle-0002.service"}) {
 		t.Fatalf("stopped = %v, want only the past-grace starting slot", stopped)
 	}
 	if st, ok := stateOf(tab, "0001"); !ok || st != StateStarting {

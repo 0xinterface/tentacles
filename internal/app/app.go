@@ -18,17 +18,17 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hkust/gh-runnerd/internal/config"
-	"github.com/hkust/gh-runnerd/internal/logship"
-	"github.com/hkust/gh-runnerd/internal/metrics"
-	"github.com/hkust/gh-runnerd/internal/payload"
-	"github.com/hkust/gh-runnerd/internal/process"
-	"github.com/hkust/gh-runnerd/internal/reconcile"
-	"github.com/hkust/gh-runnerd/internal/runner"
-	"github.com/hkust/gh-runnerd/internal/scaleset"
-	"github.com/hkust/gh-runnerd/internal/slot"
-	"github.com/hkust/gh-runnerd/internal/systemd"
-	"github.com/hkust/gh-runnerd/internal/version"
+	"github.com/hkust/tentacles/internal/config"
+	"github.com/hkust/tentacles/internal/logship"
+	"github.com/hkust/tentacles/internal/metrics"
+	"github.com/hkust/tentacles/internal/payload"
+	"github.com/hkust/tentacles/internal/process"
+	"github.com/hkust/tentacles/internal/reconcile"
+	"github.com/hkust/tentacles/internal/runner"
+	"github.com/hkust/tentacles/internal/scaleset"
+	"github.com/hkust/tentacles/internal/slot"
+	"github.com/hkust/tentacles/internal/systemd"
+	"github.com/hkust/tentacles/internal/version"
 )
 
 // Options are the process-level options from main. ScaleSet is a test
@@ -66,7 +66,7 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("create state dirs: %w", err)
 	}
 	log := newLogger(cfg)
-	log.Info("starting gh-runnerd",
+	log.Info("starting tentacles",
 		"version", version.String(),
 		"scale_set", cfg.ScaleSet.Name,
 		"backend", cfg.Runtime.Backend,

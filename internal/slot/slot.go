@@ -49,7 +49,7 @@ const (
 type Slot struct {
 	ID         ID
 	Dir        string
-	Unit       string // backend unit/process name, e.g. gha-slot-0001.service
+	Unit       string // backend unit/process name, e.g. tentacle-0001.service
 	RunnerName string // name registered with GitHub (JIT runner name)
 	State      State
 	StartedAt  time.Time

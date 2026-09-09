@@ -12,21 +12,21 @@ import (
 
 	"os/user"
 
-	"github.com/hkust/gh-runnerd/internal/runner"
+	"github.com/hkust/tentacles/internal/runner"
 )
 
 // sampleSpec is the canonical slot configuration used by the golden
 // Start-argument test.
 func sampleSpec() runner.Spec {
 	return runner.Spec{
-		SlotDir:   "/var/lib/gh-runnerd/slots/0001",
-		JITPath:   "/run/gh-runnerd/0001.jit",
-		EnvFile:   "/etc/gh-runnerd/runner.env",
+		SlotDir:   "/var/lib/tentacles/slots/0001",
+		JITPath:   "/run/tentacles/0001.jit",
+		EnvFile:   "/etc/tentacles/runner.env",
 		User:      "gha-runner",
 		Group:     "gha-runner",
 		CPUQuota:  "400%",
 		MemoryMax: "8G",
-		UnitName:  "gha-slot-0001.service",
+		UnitName:  "tentacle-0001.service",
 	}
 }
 
@@ -129,13 +129,13 @@ func TestStartGoldenArgVector(t *testing.T) {
 
 	want := []string{
 		"--collect",
-		"--unit", "gha-slot-0001.service",
+		"--unit", "tentacle-0001.service",
 		"--description", "GitHub Actions runner slot",
 		"-p", "Type=exec",
 		"-p", "User=gha-runner",
 		"-p", "Group=gha-runner",
-		"-p", "WorkingDirectory=/var/lib/gh-runnerd/slots/0001",
-		"-p", "EnvironmentFile=/etc/gh-runnerd/runner.env",
+		"-p", "WorkingDirectory=/var/lib/tentacles/slots/0001",
+		"-p", "EnvironmentFile=/etc/tentacles/runner.env",
 		"-p", "CPUQuota=400%",
 		"-p", "MemoryMax=8G",
 		"-p", "Nice=5",
@@ -146,7 +146,7 @@ func TestStartGoldenArgVector(t *testing.T) {
 		"-p", "NoNewPrivileges=yes",
 		"-p", "ProtectSystem=strict",
 		"-p", "ProtectHome=read-only",
-		"-p", "ReadWritePaths=/var/lib/gh-runnerd/slots/0001:/tmp",
+		"-p", "ReadWritePaths=/var/lib/tentacles/slots/0001:/tmp",
 		"-p", "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
 		"-p", "LockPersonality=yes",
 		"/bin/sh", "-c", runner.JITScript(spec.JITPath), "--", spec.JITPath,
@@ -175,7 +175,7 @@ func TestStartAddsRunnerCacheDirs(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	log := readLog(t, runLog)
-	want := "ReadWritePaths=/var/lib/gh-runnerd/slots/0001:/tmp:" +
+	want := "ReadWritePaths=/var/lib/tentacles/slots/0001:/tmp:" +
 		filepath.Join(home, ".cache") + ":" +
 		filepath.Join(home, ".local/share/mise") + ":" +
 		filepath.Join(home, "go/pkg/mod")
@@ -192,9 +192,9 @@ func TestStartAddsRunnerCacheDirs(t *testing.T) {
 func TestStartSkipsEmptyProperties(t *testing.T) {
 	b, runLog, _ := newTestBackend(t)
 	spec := runner.Spec{
-		SlotDir:  "/var/lib/gh-runnerd/slots/0002",
-		JITPath:  "/run/gh-runnerd/0002.jit",
-		UnitName: "gha-slot-0002.service",
+		SlotDir:  "/var/lib/tentacles/slots/0002",
+		JITPath:  "/run/tentacles/0002.jit",
+		UnitName: "tentacle-0002.service",
 		// User, Group, EnvFile, CPUQuota, MemoryMax intentionally empty
 	}
 
@@ -208,7 +208,7 @@ func TestStartSkipsEmptyProperties(t *testing.T) {
 			t.Errorf("log contains %q, expected skipped", absent)
 		}
 	}
-	for _, present := range []string{"WorkingDirectory=/var/lib/gh-runnerd/slots/0002", "TimeoutStopSec=30", "Type=exec"} {
+	for _, present := range []string{"WorkingDirectory=/var/lib/tentacles/slots/0002", "TimeoutStopSec=30", "Type=exec"} {
 		if !strings.Contains(log, present) {
 			t.Errorf("log missing %q", present)
 		}
@@ -224,7 +224,7 @@ func TestStartErrorIncludesStderrTail(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	if !strings.Contains(err.Error(), "gha-slot-0001.service") {
+	if !strings.Contains(err.Error(), "tentacle-0001.service") {
 		t.Errorf("error missing unit name: %v", err)
 	}
 	if !strings.Contains(err.Error(), "Operation refused") {
@@ -235,16 +235,16 @@ func TestStartErrorIncludesStderrTail(t *testing.T) {
 func TestStopArgvAndError(t *testing.T) {
 	b, _, ctlLog := newTestBackend(t)
 
-	if err := b.Stop(context.Background(), "gha-slot-0001.service"); err != nil {
+	if err := b.Stop(context.Background(), "tentacle-0001.service"); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
-	if want := "stop\ngha-slot-0001.service\n"; readLog(t, ctlLog) != want {
+	if want := "stop\ntentacle-0001.service\n"; readLog(t, ctlLog) != want {
 		t.Fatalf("Stop argv = %q, want %q", readLog(t, ctlLog), want)
 	}
 
 	t.Setenv("FAKE_SYSTEMCTL_EXIT", "1")
 	t.Setenv("FAKE_SYSTEMCTL_STDERR", "Failed to stop unit: Connection timed out")
-	err := b.Stop(context.Background(), "gha-slot-0001.service")
+	err := b.Stop(context.Background(), "tentacle-0001.service")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -256,10 +256,10 @@ func TestStopArgvAndError(t *testing.T) {
 func TestWaitHappyPath(t *testing.T) {
 	b, _, ctlLog := newTestBackend(t)
 
-	if err := b.Wait(context.Background(), "gha-slot-0001.service"); err != nil {
+	if err := b.Wait(context.Background(), "tentacle-0001.service"); err != nil {
 		t.Fatalf("Wait: %v", err)
 	}
-	if want := "wait\ngha-slot-0001.service\n"; readLog(t, ctlLog) != want {
+	if want := "wait\ntentacle-0001.service\n"; readLog(t, ctlLog) != want {
 		t.Fatalf("Wait argv = %q, want %q", readLog(t, ctlLog), want)
 	}
 }
@@ -271,12 +271,12 @@ func TestWaitFallbackOnUnknownOperation(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := b.Wait(ctx, "gha-slot-0001.service"); err != nil {
+	if err := b.Wait(ctx, "tentacle-0001.service"); err != nil {
 		t.Fatalf("Wait fallback: %v", err)
 	}
 
 	log := readLog(t, ctlLog)
-	want := "wait\ngha-slot-0001.service\nis-active\ngha-slot-0001.service\n"
+	want := "wait\ntentacle-0001.service\nis-active\ntentacle-0001.service\n"
 	if log != want {
 		t.Fatalf("Wait fallback argv = %q, want %q", log, want)
 	}
@@ -293,7 +293,7 @@ func TestWaitFallbackPollingUntilGone(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := b.Wait(ctx, "gha-slot-0001.service"); err != nil {
+	if err := b.Wait(ctx, "tentacle-0001.service"); err != nil {
 		t.Fatalf("Wait fallback: %v", err)
 	}
 	log := readLog(t, ctlLog)
@@ -309,7 +309,7 @@ func TestWaitFallbackContextCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 	defer cancel()
-	err := b.Wait(ctx, "gha-slot-0001.service")
+	err := b.Wait(ctx, "tentacle-0001.service")
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Wait fallback err = %v, want context.DeadlineExceeded", err)
 	}
@@ -318,15 +318,15 @@ func TestWaitFallbackContextCancellation(t *testing.T) {
 func TestActiveParsesLegendOutput(t *testing.T) {
 	b, _, _ := newTestBackend(t)
 	t.Setenv("FAKE_SYSTEMCTL_LIST",
-		"gha-slot-0001.service loaded active running GitHub Actions runner slot\n"+
-			"gha-slot-0002.service loaded active running GitHub Actions runner slot\n"+
+		"tentacle-0001.service loaded active running GitHub Actions runner slot\n"+
+			"tentacle-0002.service loaded active running GitHub Actions runner slot\n"+
 			"not-a-slot loaded active running something else\n")
 
 	got, err := b.Active(context.Background())
 	if err != nil {
 		t.Fatalf("Active: %v", err)
 	}
-	want := []string{"gha-slot-0001.service", "gha-slot-0002.service"}
+	want := []string{"tentacle-0001.service", "tentacle-0002.service"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Active = %v, want %v", got, want)
 	}

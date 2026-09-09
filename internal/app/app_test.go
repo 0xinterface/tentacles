@@ -23,7 +23,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hkust/gh-runnerd/internal/scaleset"
+	"github.com/hkust/tentacles/internal/scaleset"
 )
 
 // fakeScaleSet drives the daemon through the same surface as the real
@@ -334,7 +334,7 @@ func TestDaemonScaleUpDownEphemeral(t *testing.T) {
 	} else {
 		b, _ := io.ReadAll(out.Body)
 		out.Body.Close()
-		if want := "gh_runnerd_slot_start_seconds_count 1"; !strings.Contains(string(b), want) {
+		if want := "tentacles_slot_start_seconds_count 1"; !strings.Contains(string(b), want) {
 			t.Errorf("metrics missing %q (double-counted start?)", want)
 		}
 	}
@@ -582,9 +582,9 @@ func TestDaemonReadinessGatedOnSessionStart(t *testing.T) {
 				}
 				defer out.Body.Close()
 				b, _ := io.ReadAll(out.Body)
-				return strings.Contains(string(b), "gh_runnerd_last_message_id 7")
+				return strings.Contains(string(b), "tentacles_last_message_id 7")
 			}) {
-				t.Error("gh_runnerd_last_message_id not exposed after MessageID event")
+				t.Error("tentacles_last_message_id not exposed after MessageID event")
 			}
 		} else {
 			time.Sleep(2 * time.Second)

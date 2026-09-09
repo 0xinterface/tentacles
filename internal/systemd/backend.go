@@ -23,7 +23,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hkust/gh-runnerd/internal/runner"
+	"github.com/hkust/tentacles/internal/runner"
 )
 
 // Options configures the systemd backend.
@@ -50,7 +50,7 @@ var lookupUser = user.Lookup
 // user cannot use the host toolchain (acceptance criterion 8).
 var runnerCacheSubdirs = []string{".cache", ".local/share/mise", "go/pkg/mod"}
 
-// Backend starts, stops, and waits on transient gha-slot-<id>.service
+// Backend starts, stops, and waits on transient tentacle-<id>.service
 // units. All methods are safe for concurrent use.
 type Backend struct {
 	systemdRunBin string
@@ -256,14 +256,14 @@ func (b *Backend) isActive(ctx context.Context, unit string) (string, error) {
 	return state, nil
 }
 
-// Active lists the running gha-slot-*.service units on the host (used for
+// Active lists the running tentacle-*.service units on the host (used for
 // boot adoption). Command errors — e.g. no systemd running — are returned
 // honestly so the caller can decide how to treat them. The scan also
 // prunes the started set to units that are still around.
 func (b *Backend) Active(ctx context.Context) ([]string, error) {
 	var stderr bytes.Buffer
 	cmd := exec.CommandContext(ctx, b.systemctlBin,
-		"list-units", "gha-slot-*.service", "--no-legend", "--plain", "--no-pager")
+		"list-units", "tentacle-*.service", "--no-legend", "--plain", "--no-pager")
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {

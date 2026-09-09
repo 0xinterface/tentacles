@@ -1,8 +1,8 @@
-# gh-runnerd example config.
+# tentacles example config.
 #
-# Paths are repo-relative so `gh-runnerd --config configs/config.example.yaml
+# Paths are repo-relative so `tentacles --config configs/config.example.yaml
 # --dry-run` works on a dev box (backend=process, throwaway key). For
-# production, copy to /etc/gh-runnerd/config.yaml, point the paths at the
+# production, copy to /etc/tentacles/config.yaml, point the paths at the
 # plan §4 locations, set backend=systemd, and fill in a real sha256.
 
 github:
@@ -38,9 +38,9 @@ runner:
   environment_file: configs/runner.env.example
 
 paths:
-  state_dir: var/lib/gh-runnerd
-  cache_dir: var/cache/gh-runnerd
-  log_dir: var/log/gh-runnerd
+  state_dir: var/lib/tentacles
+  cache_dir: var/cache/tentacles
+  log_dir: var/log/tentacles
 
 runtime:
   backend: process              # systemd | process; process for local dry-run

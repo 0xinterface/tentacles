@@ -7,15 +7,15 @@ import (
 )
 
 func TestJITScript(t *testing.T) {
-	got := JITScript("/run/gh-runnerd/0001.jit")
-	want := `exec ./run.sh --jitconfig "$(cat '/run/gh-runnerd/0001.jit')"`
+	got := JITScript("/run/tentacles/0001.jit")
+	want := `exec ./run.sh --jitconfig "$(cat '/run/tentacles/0001.jit')"`
 	if got != want {
 		t.Fatalf("JITScript() = %q, want %q", got, want)
 	}
 }
 
 func TestBuildCommand(t *testing.T) {
-	spec := Spec{SlotDir: "/srv/gh-runnerd/slots/0001", JITPath: "/run/gh-runnerd/0001.jit"}
+	spec := Spec{SlotDir: "/srv/tentacles/slots/0001", JITPath: "/run/tentacles/0001.jit"}
 	cmd := BuildCommand(spec)
 	if cmd.Dir != spec.SlotDir {
 		t.Fatalf("Dir = %q, want %q", cmd.Dir, spec.SlotDir)

@@ -1,4 +1,4 @@
-# CI for gh-runnerd itself (plan §16 phase 6: pin GitHub Actions).
+# CI for tentacles itself (plan §16 phase 6: pin GitHub Actions).
 # Actions are pinned to full commit SHAs; bump deliberately.
 name: ci
 
@@ -28,4 +28,4 @@ jobs:
       - run: gofmt -l . | tee /dev/stderr | (! read)
       - run: go test -race ./...
       - name: dry-run example config
-        run: go run ./cmd/gh-runnerd --config configs/config.example.yaml --dry-run
+        run: go run ./cmd/tentacles --config configs/config.example.yaml --dry-run

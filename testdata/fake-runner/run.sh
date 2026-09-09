@@ -1,5 +1,5 @@
 #!/bin/sh
-# fake-runner: stub of the official actions/runner run.sh for gh-runnerd
+# fake-runner: stub of the official actions/runner run.sh for tentacles
 # tests. It consumes --jitconfig like the real runner, proves the JIT value
 # reached it by writing a marker file, then either sleeps a fixed time or
 # waits for a signal.

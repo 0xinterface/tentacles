@@ -404,7 +404,7 @@ func TestRunSessionCreateErrorDoesNotEmitSessionStarted(t *testing.T) {
 
 // TestRunReportsMessageIDs: the adapter wraps the session client so
 // every fetched message ID reaches ev.MessageID (the
-// gh_runnerd_last_message_id metric, plan §14).
+// tentacles_last_message_id metric, plan §14).
 func TestRunReportsMessageIDs(t *testing.T) {
 	fake := &fakeSessionClient{
 		totalAssigned: 1,

@@ -1,4 +1,4 @@
-module github.com/hkust/gh-runnerd
+module github.com/hkust/tentacles
 
 go 1.26.5
 

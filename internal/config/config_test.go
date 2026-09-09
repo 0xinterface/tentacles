@@ -214,14 +214,14 @@ runner:
 	if !c.Runner.DisableUpdate {
 		t.Error("Runner.DisableUpdate = false, want default true")
 	}
-	if c.Paths.StateDir != "/var/lib/gh-runnerd" || c.Paths.CacheDir != "/var/cache/gh-runnerd" || c.Paths.LogDir != "/var/log/gh-runnerd" {
+	if c.Paths.StateDir != "/var/lib/tentacles" || c.Paths.CacheDir != "/var/cache/tentacles" || c.Paths.LogDir != "/var/log/tentacles" {
 		t.Errorf("Paths = %+v, want plan §4 defaults", c.Paths)
 	}
 	if c.Runtime.Backend != "systemd" {
 		t.Errorf("Runtime.Backend = %q, want default systemd", c.Runtime.Backend)
 	}
-	if c.Runtime.JitDir != "/run/gh-runnerd" {
-		t.Errorf("Runtime.JitDir = %q, want /run/gh-runnerd", c.Runtime.JitDir)
+	if c.Runtime.JitDir != "/run/tentacles" {
+		t.Errorf("Runtime.JitDir = %q, want /run/tentacles", c.Runtime.JitDir)
 	}
 	if c.Runtime.SlotStartTimeout != 90*time.Second || c.Runtime.SlotStopTimeout != 30*time.Second ||
 		c.Runtime.CleanupTimeout != 60*time.Second || c.Runtime.AcquireGrace != 3*time.Minute {

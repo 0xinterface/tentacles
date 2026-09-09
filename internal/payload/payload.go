@@ -24,13 +24,13 @@ import (
 // AllowUnverifiedEnv is the environment variable that permits a payload
 // without a sha256 checksum. Set it to "1" (or true/yes/on) to bypass
 // verification; never set it in production.
-const AllowUnverifiedEnv = "GH_RUNNERD_ALLOW_UNVERIFIED_PAYLOAD"
+const AllowUnverifiedEnv = "TENTACLES_ALLOW_UNVERIFIED_PAYLOAD"
 
 const (
 	// cacheFileFmt is the cache file name for a given runner version.
 	cacheFileFmt = "actions-runner-linux-x64-%s.tar.gz"
 	// markerName identifies a successfully extracted template directory.
-	markerName = ".gh-runnerd-template"
+	markerName = ".tentacles-template"
 	// maxDownloadSize caps the tarball body size (1 GiB).
 	maxDownloadSize = 1 << 30
 	// defaultHTTPTimeout bounds a single download request. The tarball is

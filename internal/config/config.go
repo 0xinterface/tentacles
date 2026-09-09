@@ -1,4 +1,4 @@
-// Package config loads, validates, and exposes the gh-runnerd YAML
+// Package config loads, validates, and exposes the tentacles YAML
 // configuration. The YAML layout is fixed by the implementation plan §6;
 // do not add fields without updating the example config.
 package config
@@ -12,7 +12,7 @@ import (
 	"regexp"
 	"time"
 
-	"github.com/hkust/gh-runnerd/internal/env"
+	"github.com/hkust/tentacles/internal/env"
 )
 
 // HardCapMaxRunners is the compiled ceiling for capacity.max_runners.
@@ -23,7 +23,7 @@ const HardCapMaxRunners = 32
 // AllowUnverifiedPayloadEnv, when set to "1", skips the runner.sha256
 // requirement so an unverified payload can be fetched. It matches
 // internal/payload.AllowUnverifiedEnv; keep the values in lockstep.
-const AllowUnverifiedPayloadEnv = "GH_RUNNERD_ALLOW_UNVERIFIED_PAYLOAD"
+const AllowUnverifiedPayloadEnv = "TENTACLES_ALLOW_UNVERIFIED_PAYLOAD"
 
 // Default directories and values applied by Load when the YAML omits them.
 const (
@@ -31,10 +31,10 @@ const (
 	DefaultRunnerGroup = "Default"
 	DefaultWorkDir     = "_work"
 	DefaultRunnerUser  = "gha-runner"
-	DefaultStateDir    = "/var/lib/gh-runnerd"
-	DefaultCacheDir    = "/var/cache/gh-runnerd"
-	DefaultLogDir      = "/var/log/gh-runnerd"
-	DefaultJitDir      = "/run/gh-runnerd"
+	DefaultStateDir    = "/var/lib/tentacles"
+	DefaultCacheDir    = "/var/cache/tentacles"
+	DefaultLogDir      = "/var/log/tentacles"
+	DefaultJitDir      = "/run/tentacles"
 	DefaultBackend     = "systemd"
 	DefaultListen      = "127.0.0.1:9090"
 	DefaultLogLevel    = "info"
@@ -59,7 +59,7 @@ const (
 // plausible host).
 const MaxCPUQuotaPercent = 100 * 1024
 
-// Config is the root of the gh-runnerd YAML document.
+// Config is the root of the tentacles YAML document.
 type Config struct {
 	GitHub        GitHub        `yaml:"github"`
 	ScaleSet      ScaleSet      `yaml:"scale_set"`

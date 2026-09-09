@@ -1,8 +1,8 @@
-# gh-runnerd.service — GitHub Actions host runner supervisor (daemon unit).
+# tentacles.service — GitHub Actions host runner supervisor (daemon unit).
 #
 # The daemon must be able to start/stop transient slot units
-# (gha-slot-<id>.service) as an unprivileged user. That requires a narrow
-# polkit rule allowing `gh-runnerd` to manage only `gha-slot-*.service`
+# (tentacle-<id>.service) as an unprivileged user. That requires a narrow
+# polkit rule allowing `tentacles` to manage only `tentacle-*.service`
 # (or a systemd user transient scope). See the "systemd integration"
 # section of the README.
 #
@@ -17,13 +17,13 @@ Wants=network-online.target
 
 [Service]
 Type=notify
-User=gh-runnerd
-ExecStart=/usr/local/sbin/gh-runnerd --config /etc/gh-runnerd/config.yaml
+User=tentacles
+ExecStart=/usr/local/sbin/tentacles --config /etc/tentacles/config.yaml
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/gh-runnerd /var/log/gh-runnerd /run/gh-runnerd
+ReadWritePaths=/var/lib/tentacles /var/log/tentacles /run/tentacles
 
 [Install]
 WantedBy=multi-user.target

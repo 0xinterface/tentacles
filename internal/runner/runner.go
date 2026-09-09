@@ -24,7 +24,7 @@ type Spec struct {
 	Group     string // unix group ("" = same as user)
 	CPUQuota  string // e.g. "400%" (systemd CPUQuota syntax)
 	MemoryMax string // e.g. "8G" (systemd MemoryMax syntax)
-	UnitName  string // e.g. "gha-slot-0001.service"
+	UnitName  string // e.g. "tentacle-0001.service"
 }
 
 // Backend starts and stops runner processes. Implementations:
@@ -40,6 +40,6 @@ type Backend interface {
 	// Wait blocks until the unit/process has exited.
 	Wait(ctx context.Context, unit string) error
 	// Active lists currently-running unit names owned by this backend
-	// (e.g. gha-slot-0001.service). Used for boot adoption.
+	// (e.g. tentacle-0001.service). Used for boot adoption.
 	Active(ctx context.Context) ([]string, error)
 }

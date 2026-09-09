@@ -1,4 +1,4 @@
-// Package scaleset adapts github.com/actions/scaleset for gh-runnerd.
+// Package scaleset adapts github.com/actions/scaleset for tentacles.
 //
 // This is the ONLY package in the module that imports the upstream module
 // (including its listener subpackage). Upstream types must not leak past
@@ -24,7 +24,7 @@ import (
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
 
-	"github.com/hkust/gh-runnerd/internal/reconcile"
+	"github.com/hkust/tentacles/internal/reconcile"
 )
 
 // Config carries the GitHub App credentials and scale-set settings. The
@@ -43,7 +43,7 @@ type Config struct {
 	MinRunners     int
 	MaxRunners     int
 	DisableUpdate  bool   // disable runner self-update at scale-set creation
-	SystemVersion  string // gh-runnerd version reported to the upstream API
+	SystemVersion  string // tentacles version reported to the upstream API
 	SessionOwner   string // owner name on the message session (e.g. hostname)
 }
 
@@ -61,7 +61,7 @@ type Events struct {
 	// JobEnd is called when a job finishes on a runner.
 	JobEnd func(runnerName, result string)
 	// MessageID is called with the ID of every message fetched from the
-	// scale-set queue (the gh_runnerd_last_message_id metric, plan §14).
+	// scale-set queue (the tentacles_last_message_id metric, plan §14).
 	MessageID func(id int64)
 	// Session is called on every listener/session stop with the reason
 	// (nil on graceful context cancellation).
@@ -101,7 +101,7 @@ func New(cfg Config, ev Events, log *slog.Logger) (*Adapter, error) {
 			PrivateKey:     cfg.PrivateKeyPEM,
 		},
 		SystemInfo: scaleset.SystemInfo{
-			System:  "gh-runnerd",
+			System:  "tentacles",
 			Version: cfg.SystemVersion,
 		},
 	})
@@ -160,7 +160,7 @@ func (a *Adapter) EnsureScaleSet(ctx context.Context) error {
 	a.mu.Lock()
 	a.scaleSetID = ss.ID
 	a.client.SetSystemInfo(scaleset.SystemInfo{
-		System:     "gh-runnerd",
+		System:     "tentacles",
 		Version:    a.cfg.SystemVersion,
 		ScaleSetID: ss.ID,
 	})

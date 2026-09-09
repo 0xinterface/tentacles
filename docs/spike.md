@@ -14,7 +14,7 @@ c, err := scaleset.NewClientWithGitHubApp(scaleset.ClientWithGitHubAppConfig{
         InstallationID: 12345678,   // int64, must be non-zero
         PrivateKey:     pemContent, // PEM *content*, NOT a path — daemon must os.ReadFile the configured path
     },
-    SystemInfo: scaleset.SystemInfo{System: "gh-runnerd", Version: ..., ScaleSetID: id},
+    SystemInfo: scaleset.SystemInfo{System: "tentacles", Version: ..., ScaleSetID: id},
 })
 ```
 
@@ -92,7 +92,7 @@ plumbing that still ends up as argv).
 value never sits in a long-lived argv:
 
 ```sh
-exec ./run.sh --jitconfig "$(cat /run/gh-runnerd/0001.jit)"
+exec ./run.sh --jitconfig "$(cat /run/tentacles/0001.jit)"
 ```
 
 JIT file is `0600` on tmpfs, written by the daemon, read by the shell at
@@ -107,9 +107,9 @@ hardening props) then comes from config as `-p` properties — no root-owned
 drop-in files to render, no dbus/cgo dependency, compiles and unit-tests
 anywhere (tests inject fake `systemd-run`/`systemctl` via `PATH`).
 
-Unit naming: `gha-slot-<id>.service` (e.g. `gha-slot-0001.service`) —
-`systemd-run --unit=gha-slot-0001`. Transient units unload when the process
-exits; boot adoption lists `gha-slot-*.service`.
+Unit naming: `tentacle-<id>.service` (e.g. `tentacle-0001.service`) —
+`systemd-run --unit=tentacle-0001`. Transient units unload when the process
+exits; boot adoption lists `tentacle-*.service`.
 
 ## Preview-API landmines
 

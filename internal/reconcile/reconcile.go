@@ -6,7 +6,7 @@ import (
 	"context"
 	"log/slog"
 
-	"github.com/hkust/gh-runnerd/internal/slot"
+	"github.com/hkust/tentacles/internal/slot"
 )
 
 // Clamp bounds v to [lo, hi]. The caller is expected to pass lo <= hi;

@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hkust/gh-runnerd/internal/runner"
+	"github.com/hkust/tentacles/internal/runner"
 )
 
 // fakeRunner is the stub agent, resolved from the package test directory.
@@ -92,7 +92,7 @@ func TestBackendStartStop(t *testing.T) {
 	spec := runner.Spec{
 		SlotDir:  slotDir,
 		JITPath:  jitPath,
-		UnitName: "gha-slot-0001.service",
+		UnitName: "tentacle-0001.service",
 	}
 	ctx := context.Background()
 
@@ -134,7 +134,7 @@ func TestBackendWaitSelfExit(t *testing.T) {
 	spec := runner.Spec{
 		SlotDir:  slotDir,
 		JITPath:  jitPath,
-		UnitName: "gha-slot-0001.service",
+		UnitName: "tentacle-0001.service",
 	}
 	ctx := context.Background()
 
@@ -161,7 +161,7 @@ func TestBackendWaitSelfExit(t *testing.T) {
 func TestUnknownUnit(t *testing.T) {
 	b := New(Options{})
 	ctx := context.Background()
-	for _, unitName := range []string{"gha-slot-9999.service", ""} {
+	for _, unitName := range []string{"tentacle-9999.service", ""} {
 		if err := b.Wait(ctx, unitName); err == nil {
 			t.Fatalf("Wait(%q): expected error, got nil", unitName)
 		} else if !strings.Contains(err.Error(), "unknown unit") {
@@ -181,7 +181,7 @@ func TestStartMissingEnvFile(t *testing.T) {
 	err := b.Start(context.Background(), runner.Spec{
 		SlotDir:  slotDir,
 		JITPath:  jitPath,
-		UnitName: "gha-slot-0001.service",
+		UnitName: "tentacle-0001.service",
 	})
 	if err == nil {
 		t.Fatal("Start: expected error for missing environment file, got nil")
@@ -200,7 +200,7 @@ func TestStartEmptyUnitName(t *testing.T) {
 func TestStartDuplicateUnit(t *testing.T) {
 	slotDir, jitPath := newSlotDir(t)
 	b := New(Options{EnvFile: writeEnvFile(t, "")})
-	spec := runner.Spec{SlotDir: slotDir, JITPath: jitPath, UnitName: "gha-slot-0001.service"}
+	spec := runner.Spec{SlotDir: slotDir, JITPath: jitPath, UnitName: "tentacle-0001.service"}
 	ctx := context.Background()
 	if err := b.Start(ctx, spec); err != nil {
 		t.Fatalf("Start: %v", err)

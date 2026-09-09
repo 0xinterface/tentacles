@@ -1,4 +1,4 @@
-// Package metrics implements the gh-runnerd Prometheus metrics registry.
+// Package metrics implements the tentacles Prometheus metrics registry.
 //
 // The exposition is hand-rolled on purpose: the daemon avoids third-party
 // metrics clients, so the registry owns a small Prometheus text-format
@@ -16,7 +16,7 @@ import (
 )
 
 // slotStartBuckets are the le (less-than-or-equal) boundaries of the
-// gh_runnerd_slot_start_seconds histogram.
+// tentacles_slot_start_seconds histogram.
 var slotStartBuckets = [...]float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60}
 
 // Registry is the daemon-wide metrics registry.
@@ -137,59 +137,59 @@ func (r *Registry) render() string {
 
 	families := []family{
 		{
-			name: "gh_runnerd_acquire_failures_total",
+			name: "tentacles_acquire_failures_total",
 			help: "Total number of times a runner failed to acquire its assigned job.",
 			typ:  "counter",
 			lines: []string{
-				"gh_runnerd_acquire_failures_total " + formatFloat(float64(r.acquireFails)),
+				"tentacles_acquire_failures_total " + formatFloat(float64(r.acquireFails)),
 			},
 		},
 		{
-			name:  "gh_runnerd_actual_runners",
+			name:  "tentacles_actual_runners",
 			help:  "Current number of runner slots by lifecycle state.",
 			typ:   "gauge",
 			lines: r.actualLines(),
 		},
 		{
-			name: "gh_runnerd_desired_runners",
+			name: "tentacles_desired_runners",
 			help: "Current desired number of runner slots.",
 			typ:  "gauge",
 			lines: []string{
-				"gh_runnerd_desired_runners " + formatFloat(float64(r.desired)),
+				"tentacles_desired_runners " + formatFloat(float64(r.desired)),
 			},
 		},
 		{
-			name:  "gh_runnerd_jobs_completed_total",
+			name:  "tentacles_jobs_completed_total",
 			help:  "Total number of completed jobs, by result.",
 			typ:   "counter",
 			lines: r.jobsCompletedLines(),
 		},
 		{
-			name: "gh_runnerd_jobs_started_total",
+			name: "tentacles_jobs_started_total",
 			help: "Total number of started jobs.",
 			typ:  "counter",
 			lines: []string{
-				"gh_runnerd_jobs_started_total " + formatFloat(float64(r.jobsStarted)),
+				"tentacles_jobs_started_total " + formatFloat(float64(r.jobsStarted)),
 			},
 		},
 		{
-			name: "gh_runnerd_last_message_id",
+			name: "tentacles_last_message_id",
 			help: "ID of the last processed scale-set message.",
 			typ:  "gauge",
 			lines: []string{
-				"gh_runnerd_last_message_id " + formatFloat(float64(r.lastMessageID)),
+				"tentacles_last_message_id " + formatFloat(float64(r.lastMessageID)),
 			},
 		},
 		{
-			name: "gh_runnerd_listener_errors_total",
+			name: "tentacles_listener_errors_total",
 			help: "Total number of scale-set listener loop errors.",
 			typ:  "counter",
 			lines: []string{
-				"gh_runnerd_listener_errors_total " + formatFloat(float64(r.listenerErrs)),
+				"tentacles_listener_errors_total " + formatFloat(float64(r.listenerErrs)),
 			},
 		},
 		{
-			name:  "gh_runnerd_slot_start_seconds",
+			name:  "tentacles_slot_start_seconds",
 			help:  "Time to start a runner slot.",
 			typ:   "histogram",
 			lines: r.slotStartLines(),
@@ -234,7 +234,7 @@ func (r *Registry) actualLines() []string {
 	sort.Strings(states)
 	lines := make([]string, 0, len(states))
 	for _, s := range states {
-		lines = append(lines, "gh_runnerd_actual_runners{state=\""+escapeLabel(s)+"\"} "+formatFloat(float64(r.actual[s])))
+		lines = append(lines, "tentacles_actual_runners{state=\""+escapeLabel(s)+"\"} "+formatFloat(float64(r.actual[s])))
 	}
 	return lines
 }
@@ -252,7 +252,7 @@ func (r *Registry) jobsCompletedLines() []string {
 	sort.Strings(results)
 	lines := make([]string, 0, len(results))
 	for _, res := range results {
-		lines = append(lines, "gh_runnerd_jobs_completed_total{result=\""+escapeLabel(res)+"\"} "+formatFloat(float64(r.jobsCompleted[res])))
+		lines = append(lines, "tentacles_jobs_completed_total{result=\""+escapeLabel(res)+"\"} "+formatFloat(float64(r.jobsCompleted[res])))
 	}
 	return lines
 }
@@ -261,11 +261,11 @@ func (r *Registry) jobsCompletedLines() []string {
 func (r *Registry) slotStartLines() []string {
 	lines := make([]string, 0, len(slotStartBuckets)+3)
 	for i, le := range slotStartBuckets {
-		lines = append(lines, "gh_runnerd_slot_start_seconds_bucket{le=\""+formatFloat(le)+"\"} "+formatFloat(float64(r.slotStartBuckets[i])))
+		lines = append(lines, "tentacles_slot_start_seconds_bucket{le=\""+formatFloat(le)+"\"} "+formatFloat(float64(r.slotStartBuckets[i])))
 	}
-	lines = append(lines, "gh_runnerd_slot_start_seconds_bucket{le=\"+Inf\"} "+formatFloat(float64(r.slotStartBuckets[len(slotStartBuckets)])))
-	lines = append(lines, "gh_runnerd_slot_start_seconds_sum "+formatFloat(r.slotStartSum))
-	lines = append(lines, "gh_runnerd_slot_start_seconds_count "+formatFloat(float64(r.slotStartCount)))
+	lines = append(lines, "tentacles_slot_start_seconds_bucket{le=\"+Inf\"} "+formatFloat(float64(r.slotStartBuckets[len(slotStartBuckets)])))
+	lines = append(lines, "tentacles_slot_start_seconds_sum "+formatFloat(r.slotStartSum))
+	lines = append(lines, "tentacles_slot_start_seconds_count "+formatFloat(float64(r.slotStartCount)))
 	return lines
 }
 

@@ -1,5 +1,5 @@
 #!/bin/sh
-# install-host-deps.sh — one-time host dependencies for gh-runnerd (Debian).
+# install-host-deps.sh — one-time host dependencies for tentacles (Debian).
 #
 # Installs the official GitHub Actions runner Linux dependencies for the
 # pinned runner line (2.328.x) on Debian-family hosts, plus the bootstrap
@@ -69,10 +69,10 @@ echo "    runner version : $RUNNER_VERSION (informational)"
 echo
 echo "    The extracted runner payload for v$RUNNER_VERSION also ships"
 echo "    bin/installdependencies.sh (run once per host/version as root,"
-echo "    e.g. sudo /var/lib/gh-runnerd/template/bin/installdependencies.sh)."
+echo "    e.g. sudo /var/lib/tentacles/template/bin/installdependencies.sh)."
 echo "    It covers the same base deps; this script is the idempotent"
 echo "    host-level alternative for the pinned 2.328 line."
 echo
-echo "    Next steps: create users gh-runnerd/gha-runner and the"
-echo "    /etc/gh-runnerd, /var/lib/gh-runnerd, /var/cache/gh-runnerd,"
-echo "    /var/log/gh-runnerd, /run/gh-runnerd directories (see README)."
+echo "    Next steps: create users tentacles/gha-runner and the"
+echo "    /etc/tentacles, /var/lib/tentacles, /var/cache/tentacles,"
+echo "    /var/log/tentacles, /run/tentacles directories (see README)."

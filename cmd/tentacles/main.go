@@ -1,4 +1,4 @@
-// Command gh-runnerd is the GitHub Actions host runner supervisor.
+// Command tentacles is the GitHub Actions host runner supervisor.
 // It owns one runner scale set and keeps ephemeral, JIT-configured
 // official runner processes alive on this host (see docs/spike.md and
 // README.md). No business logic lives here.
@@ -12,12 +12,12 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/hkust/gh-runnerd/internal/app"
-	"github.com/hkust/gh-runnerd/internal/version"
+	"github.com/hkust/tentacles/internal/app"
+	"github.com/hkust/tentacles/internal/version"
 )
 
 func main() {
-	configPath := flag.String("config", "/etc/gh-runnerd/config.yaml", "path to config.yaml")
+	configPath := flag.String("config", "/etc/tentacles/config.yaml", "path to config.yaml")
 	dryRun := flag.Bool("dry-run", false, "validate the config and exit 0")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
@@ -31,7 +31,7 @@ func main() {
 	defer stop()
 
 	if err := app.Run(ctx, app.Options{ConfigPath: *configPath, DryRun: *dryRun}); err != nil && ctx.Err() == nil {
-		fmt.Fprintf(os.Stderr, "gh-runnerd: %v\n", err)
+		fmt.Fprintf(os.Stderr, "tentacles: %v\n", err)
 		os.Exit(1)
 	}
 }

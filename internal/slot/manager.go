@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hkust/gh-runnerd/internal/cleanup"
-	"github.com/hkust/gh-runnerd/internal/runner"
+	"github.com/hkust/tentacles/internal/cleanup"
+	"github.com/hkust/tentacles/internal/runner"
 )
 
 // Default table tunables. The reconciler and app layers can override them
@@ -659,16 +659,16 @@ func (t *Table) emit(event Event, s Slot) {
 }
 
 // unitName maps a slot ID to its backend unit name, e.g. "0001" →
-// "gha-slot-0001.service".
+// "tentacle-0001.service".
 func unitName(id ID) string {
-	return "gha-slot-" + string(id) + ".service"
+	return "tentacle-" + string(id) + ".service"
 }
 
 // idFromUnit extracts the slot ID from a unit name, e.g.
-// "gha-slot-0001.service" → "0001". It returns false for names that are
+// "tentacle-0001.service" → "0001". It returns false for names that are
 // not ours.
 func idFromUnit(unit string) (ID, bool) {
-	const prefix = "gha-slot-"
+	const prefix = "tentacle-"
 	const suffix = ".service"
 	if !strings.HasPrefix(unit, prefix) || !strings.HasSuffix(unit, suffix) {
 		return "", false
