@@ -13,9 +13,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
-	"os/exec"
-	"os/user"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -23,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/0xinterface/tentacles/internal/env"
 	"github.com/0xinterface/tentacles/internal/runner"
 	"github.com/0xinterface/tentacles/internal/slot"
 )
@@ -42,13 +40,9 @@ type Options struct {
 	StopTimeout time.Duration
 }
 
-// lookupUser resolves a unix user; swapped in tests.
-var lookupUser = user.Lookup
-
 // runnerCacheSubdirs are the HOME-relative shared cache locations jobs
-// may write (plan §12: "~/.cache, mise, go/pkg/mod are allowed and
-// desirable") despite ProtectHome=read-only. Without them the runner
-// user cannot use the host toolchain (acceptance criterion 8).
+// may write despite ProtectHome=read-only. These exceptions let the runner
+// use the host's toolchains and shared caches.
 var runnerCacheSubdirs = []string{".cache", ".local/share/mise", "go/pkg/mod"}
 
 // Backend starts, stops, and waits on transient tentacle-<id>.service
@@ -77,6 +71,9 @@ func New(opts Options) *Backend {
 	if log == nil {
 		log = slog.Default()
 	}
+	if opts.StopTimeout <= 0 {
+		opts.StopTimeout = 30 * time.Second
+	}
 	return &Backend{
 		systemdRunBin: runBin,
 		systemctlBin:  ctlBin,
@@ -89,10 +86,74 @@ func New(opts Options) *Backend {
 // Start launches run.sh in the slot described by spec as a transient unit.
 // With Type=exec, systemd-run blocks until the service has exec'd, so a
 // nil return means the runner process is running (or at least has forked).
-func (b *Backend) Start(ctx context.Context, spec runner.Spec) error {
-	args := b.startArgs(spec)
-	cmd := exec.CommandContext(ctx, b.systemdRunBin, args...)
+func (b *Backend) Start(ctx context.Context, spec runner.Spec) (retErr error) {
+	attempted := false
+	defer func() {
+		if retErr != nil && !attempted {
+			retErr = fmt.Errorf("%w: %w", runner.ErrNotStarted, retErr)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if spec.User == "" {
+		return fmt.Errorf("systemd: runner user is required")
+	}
+	identity, err := runner.ResolveIdentity(spec)
+	if err != nil {
+		return err
+	}
+	if identity.UID == 0 {
+		return fmt.Errorf("systemd: runner user must be unprivileged")
+	}
+	if !validUnit(spec.UnitName) {
+		return fmt.Errorf("systemd: invalid slot unit %q", spec.UnitName)
+	}
+	if !filepath.IsAbs(spec.SlotDir) || !filepath.IsAbs(spec.JITPath) {
+		return fmt.Errorf("systemd: slot and JIT paths must be absolute")
+	}
+	vars := map[string]string{}
+	if spec.EnvFile != "" {
+		if !filepath.IsAbs(spec.EnvFile) {
+			return fmt.Errorf("systemd: environment file must be absolute")
+		}
+		vars, err = env.ParseFile(spec.EnvFile)
+		if err != nil {
+			return fmt.Errorf("systemd: parse environment file: %w", err)
+		}
+	}
+	if _, err := runner.ReadJIT(spec.JITPath); err != nil {
+		return fmt.Errorf("systemd: JIT source: %w", err)
+	}
+	home := identity.Home
+	if value, ok := vars["HOME"]; ok {
+		home = value
+	}
+	if !filepath.IsAbs(home) {
+		return fmt.Errorf("systemd: runner HOME must be absolute")
+	}
+	caches := cachePaths(home)
+	// Create caches as the job identity: no privileged traversal or chown of
+	// directories a previous job can replace with symlinks.
+	mkdirArgs := append([]string{"-p", "--"}, caches...)
+	mkdir := runner.CommandContext(ctx, "/bin/mkdir", mkdirArgs...)
+	mkdir.SysProcAttr.Credential = identity.Credential
+	if out, err := mkdir.CombinedOutput(); err != nil {
+		return fmt.Errorf("systemd: prepare runner caches: %w: %s", err, tail(out))
+	}
+	if err := runner.PrepareSlot(ctx, spec, identity); err != nil {
+		return err
+	}
+	args := b.startArgs(spec, caches...)
+	cmd := runner.CommandContext(ctx, b.systemdRunBin, args...)
+	attempted = true
 	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if err != nil {
 		return fmt.Errorf("systemd: start %s: %w: %s", spec.UnitName, err, tail(out))
 	}
@@ -104,11 +165,11 @@ func (b *Backend) Start(ctx context.Context, spec runner.Spec) error {
 }
 
 // startArgs builds the exact systemd-run argument vector for a slot,
-// ending in the shell that reads the JIT config from its file so the
-// secret never appears in a long-lived argv.
-func (b *Backend) startArgs(spec runner.Spec) []string {
+// ending in a static shell that reads systemd's private credential copy.
+func (b *Backend) startArgs(spec runner.Spec, caches ...string) []string {
 	args := []string{
 		"--collect",
+		"--expand-environment=no",
 		"--unit", spec.UnitName,
 		"--description", "GitHub Actions runner slot",
 		"-p", "Type=exec",
@@ -122,13 +183,17 @@ func (b *Backend) startArgs(spec runner.Spec) []string {
 	addProp("Group", spec.Group)
 	addProp("WorkingDirectory", spec.SlotDir)
 	addProp("EnvironmentFile", spec.EnvFile)
+	addProp("LoadCredential", "jit:"+spec.JITPath)
 	addProp("CPUQuota", spec.CPUQuota)
 	addProp("MemoryMax", spec.MemoryMax)
-	paths := append([]string{spec.SlotDir, "/tmp"}, b.writableCachePaths(spec)...)
+	paths := append([]string{spec.SlotDir, "/tmp"}, caches...)
+	for i, path := range paths {
+		paths[i] = quotePath(path)
+	}
 	args = append(args,
 		"-p", "Nice=5",
 		"-p", "KillMode=mixed",
-		"-p", "TimeoutStopSec="+strconv.Itoa(int(b.stopTimeout.Seconds())),
+		"-p", "TimeoutStopSec="+strconv.FormatFloat(b.stopTimeout.Seconds(), 'f', -1, 64),
 		"-p", "TasksMax=4096",
 		"-p", "PrivateTmp=yes",
 		"-p", "NoNewPrivileges=yes",
@@ -136,64 +201,58 @@ func (b *Backend) startArgs(spec runner.Spec) []string {
 		"-p", "MemoryAccounting=yes",
 		"-p", "ProtectSystem=strict",
 		"-p", "ProtectHome=read-only",
-		"-p", "ReadWritePaths="+strings.Join(paths, ":"),
+		"-p", "ReadWritePaths="+strings.Join(paths, " "),
 		"-p", "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
 		"-p", "LockPersonality=yes",
-		"/bin/sh", "-c", runner.JITScript(spec.JITPath), "--", spec.JITPath,
+		"/bin/sh", "-c", runner.CredentialScript(),
 	)
 	return args
 }
 
-// writableCachePaths returns the runner user's shared cache directories
-// (plan §12) to exempt from ProtectHome=read-only, creating them first
-// so they exist and — when the daemon runs as root — belong to the
-// runner user (systemd auto-creates missing ReadWritePaths entries as
-// root-owned, which the runner user then cannot write). Unresolvable
-// users and uncreatable paths are skipped; the host bootstrap (plan
-// §12) is the fallback.
-func (b *Backend) writableCachePaths(spec runner.Spec) []string {
-	if spec.User == "" {
-		return nil
-	}
-	u, err := lookupUser(spec.User)
-	if err != nil {
-		b.log.Debug("runner user unresolvable; shared caches not writable", "user", spec.User, "err", err)
-		return nil
-	}
-	var paths []string
+// systemd-run passes literal path values over D-Bus; systemd itself escapes
+// percent specifiers when persisting the unit. Doubling them here would change
+// the actual pathname. The list parser unquotes but does not decode C escapes.
+func quotePath(value string) string {
+	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(value) + `"`
+}
+
+func cachePaths(home string) []string {
+	paths := make([]string, 0, len(runnerCacheSubdirs))
 	for _, sub := range runnerCacheSubdirs {
-		p := filepath.Join(u.HomeDir, sub)
-		if err := os.MkdirAll(p, 0o755); err != nil {
-			b.log.Debug("runner cache dir unavailable", "path", p, "err", err)
-			continue
-		}
-		b.chownIfRoot(p, u)
-		paths = append(paths, p)
+		paths = append(paths, filepath.Join(home, sub))
 	}
 	return paths
 }
 
-// chownIfRoot hands a pre-created cache directory to the runner user.
-// Best-effort: failures are logged at debug and the path stays listed.
-func (b *Backend) chownIfRoot(path string, u *user.User) {
-	if os.Geteuid() != 0 {
-		return
+func validUnit(unit string) bool {
+	if !strings.HasPrefix(unit, "tentacle-") || !strings.HasSuffix(unit, ".service") {
+		return false
 	}
-	uid, err1 := strconv.Atoi(u.Uid)
-	gid, err2 := strconv.Atoi(u.Gid)
-	if err1 != nil || err2 != nil {
-		return
+	id := strings.TrimSuffix(strings.TrimPrefix(unit, "tentacle-"), ".service")
+	if id == "" {
+		return false
 	}
-	if err := os.Chown(path, uid, gid); err != nil {
-		b.log.Debug("cache dir chown failed", "path", path, "err", err)
+	for _, r := range id {
+		if r < '0' || r > '9' {
+			return false
+		}
 	}
+	return true
 }
 
 // Stop terminates the unit and returns once it is gone. The started set
 // is left untouched here; it is reconciled by the next Active scan.
 func (b *Backend) Stop(ctx context.Context, unit string) error {
-	cmd := exec.CommandContext(ctx, b.systemctlBin, "stop", unit)
+	ctx, cancel := context.WithTimeout(ctx, b.stopTimeout+10*time.Second)
+	defer cancel()
+	if !validUnit(unit) {
+		return fmt.Errorf("systemd: invalid slot unit %q", unit)
+	}
+	cmd := runner.CommandContext(ctx, b.systemctlBin, "stop", unit)
 	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if err != nil {
 		return fmt.Errorf("systemd: stop %s: %w: %s", unit, err, tail(out))
 	}
@@ -201,35 +260,17 @@ func (b *Backend) Stop(ctx context.Context, unit string) error {
 	return nil
 }
 
-// Wait blocks until the unit has exited. On hosts whose systemctl lacks
-// the wait verb (stderr "Unknown operation"), it falls back to polling
-// is-active every 250ms until the unit reports inactive or failed.
+// Wait confirms exit only after a successful, well-formed state query.
+// Communication errors and malformed output never establish that a job ended.
 func (b *Backend) Wait(ctx context.Context, unit string) error {
-	cmd := exec.CommandContext(ctx, b.systemctlBin, "wait", unit)
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		return nil
+	if !validUnit(unit) {
+		return fmt.Errorf("systemd: invalid slot unit %q", unit)
 	}
-	if !bytes.Contains(out, []byte("Unknown operation")) {
-		return fmt.Errorf("systemd: wait %s: %w: %s", unit, err, tail(out))
-	}
-	b.log.Debug("systemctl wait unsupported, polling is-active", "unit", unit)
-	return b.pollUntilGone(ctx, unit)
-}
-
-// pollUntilGone polls systemctl is-active until the unit is inactive or
-// failed, or the context is done.
-func (b *Backend) pollUntilGone(ctx context.Context, unit string) error {
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		state, err := b.isActive(ctx, unit)
 		if err != nil {
-			// CommandContext kills the subprocess on cancellation and
-			// reports "signal: killed"; surface the real reason.
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
 			return err
 		}
 		if state == "inactive" || state == "failed" {
@@ -243,20 +284,40 @@ func (b *Backend) pollUntilGone(ctx context.Context, unit string) error {
 	}
 }
 
-// isActive returns the current systemd unit state. is-active exits
-// non-zero for inactive/failed units but still prints the state, so the
-// output is authoritative regardless of the exit status.
 func (b *Backend) isActive(ctx context.Context, unit string) (string, error) {
-	cmd := exec.CommandContext(ctx, b.systemctlBin, "is-active", unit)
-	out, err := cmd.CombinedOutput()
-	state := strings.TrimSpace(string(out))
-	if state == "" {
-		if err != nil {
-			return "", fmt.Errorf("systemd: is-active %s: %w", unit, err)
-		}
-		return "", fmt.Errorf("systemd: is-active %s: empty output", unit)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	cmd := runner.CommandContext(ctx, b.systemctlBin, "show", unit, "--property=LoadState", "--property=ActiveState")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if ctx.Err() != nil {
+		return "", ctx.Err()
 	}
-	return state, nil
+	if err != nil {
+		return "", fmt.Errorf("systemd: observe %s: %w: %s", unit, err, tail(stderr.Bytes()))
+	}
+	values := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		_, duplicate := values[key]
+		if !ok || (key != "LoadState" && key != "ActiveState") || duplicate {
+			return "", fmt.Errorf("systemd: malformed state observation for %s", unit)
+		}
+		values[key] = value
+	}
+	switch values["LoadState"] {
+	case "loaded", "not-found", "error", "masked", "bad-setting", "merged", "stub":
+	default:
+		return "", fmt.Errorf("systemd: unknown load state for %s", unit)
+	}
+	state := values["ActiveState"]
+	switch state {
+	case "active", "reloading", "inactive", "failed", "activating", "deactivating", "maintenance", "refreshing":
+		return state, nil
+	default:
+		return "", fmt.Errorf("systemd: unknown active state for %s", unit)
+	}
 }
 
 // Active lists the running tentacle-*.service units on the host (used for
@@ -264,22 +325,32 @@ func (b *Backend) isActive(ctx context.Context, unit string) (string, error) {
 // honestly so the caller can decide how to treat them. The scan also
 // prunes the started set to units that are still around.
 func (b *Backend) Active(ctx context.Context) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 	var stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, b.systemctlBin,
-		"list-units", "tentacle-*.service", "--no-legend", "--plain", "--no-pager")
+	cmd := runner.CommandContext(ctx, b.systemctlBin,
+		"list-units", "tentacle-*.service", "--no-legend", "--plain", "--no-pager", "--full", "--all")
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("systemd: list-units: %w: %s", err, tail(stderr.Bytes()))
 	}
-	var units []string
+	units := []string{}
 	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) == 0 {
 			continue
 		}
-		if name := fields[0]; strings.HasSuffix(name, ".service") {
-			units = append(units, name)
+		if len(fields) < 4 || !validUnit(fields[0]) {
+			return nil, fmt.Errorf("systemd: malformed list-units output")
+		}
+		switch fields[2] {
+		case "active", "activating", "deactivating", "reloading", "maintenance", "refreshing", "inactive", "failed":
+			// Include inactive/failed units as well: adoption must clean their slot
+			// directories through the same confirmed-exit path as running units.
+			units = append(units, fields[0])
+		default:
+			return nil, fmt.Errorf("systemd: unknown list-units state %q", fields[2])
 		}
 	}
 	b.mu.Lock()
@@ -300,8 +371,8 @@ func (b *Backend) Active(ctx context.Context) ([]string, error) {
 func (b *Backend) Usage(unit string) (slot.Usage, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, b.systemctlBin, "show", unit,
-		"--property=CPUUsageNSec", "--property=MemoryPeak")
+	cmd := runner.CommandContext(ctx, b.systemctlBin, "show", unit,
+		"--property=CPUUsageNSec", "--property=MemoryPeak", "--property=MemoryCurrent")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return slot.Usage{}, fmt.Errorf("systemd: show %s: %w: %s", unit, err, tail(out))
@@ -317,6 +388,10 @@ func (b *Backend) Usage(unit string) (slot.Usage, error) {
 			ns, err := strconv.ParseInt(value, 10, 64)
 			if err == nil && ns > 0 {
 				u.CPUSeconds = float64(ns) / 1e9
+			}
+		case "MemoryCurrent":
+			if bytes, err := strconv.ParseUint(value, 10, 64); err == nil {
+				u.CurrentMemBytes = bytes
 			}
 		case "MemoryPeak":
 			if bytes, err := strconv.ParseUint(value, 10, 64); err == nil {

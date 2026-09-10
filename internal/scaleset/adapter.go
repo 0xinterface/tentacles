@@ -53,13 +53,12 @@ type Config struct {
 type Events struct {
 	// SessionStarted is called once per successfully created message
 	// session, before the listener loop takes over. The daemon gates
-	// sd_notify READY on it (plan §11).
+	// sd_notify READY on it.
 	SessionStarted func()
 	// Desired is called with the clamped desired runner count.
 	Desired func(n int)
 	// JobStart is called when a runner claims a job, with the job's
-	// identity and GitHub-reported timeline (plan §8: correlate
-	// runnerName with a slot).
+	// identity and GitHub-reported timeline, correlating runnerName with a slot.
 	JobStart func(Job)
 	// JobEnd is called when a job finishes on a runner.
 	JobEnd func(Job)
@@ -68,7 +67,7 @@ type Events struct {
 	// can truncate, so absence of a ref does not mean the job is gone.
 	Queued func(refs []string)
 	// MessageID is called with the ID of every message fetched from the
-	// scale-set queue (the tentacles_last_message_id metric, plan §14).
+	// scale-set queue for the tentacles_last_message_id metric.
 	MessageID func(id int64)
 	// Session is called on every listener/session stop with the reason
 	// (nil on graceful context cancellation).
@@ -234,7 +233,9 @@ func (a *Adapter) Run(ctx context.Context) error {
 			// Graceful shutdown: delete the session best-effort and
 			// never block shutdown on a dead network.
 			if c, ok := sessionClient.(interface{ Close(context.Context) error }); ok {
-				if err := c.Close(context.WithoutCancel(ctx)); err != nil {
+				closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				defer cancel()
+				if err := c.Close(closeCtx); err != nil {
 					a.logger().Warn("scaleset: close message session", "err", err)
 				}
 			}
@@ -310,7 +311,7 @@ func (a *Adapter) HandleDesiredRunnerCount(ctx context.Context, count int) (int,
 
 // HandleJobStarted implements listener.Scaler. It forwards the job's
 // identity and timeline so the daemon can attribute resource usage to a
-// workflow (plan §8: use lifecycle messages to correlate runnerName).
+// workflow by correlating runnerName with a slot.
 func (a *Adapter) HandleJobStarted(ctx context.Context, jobInfo *scaleset.JobStarted) error {
 	if jobInfo == nil {
 		return errors.New("scaleset: nil JobStarted message")

@@ -1,4 +1,4 @@
-# Phase 0 spike — actions/scaleset v0.4.0
+# Integration notes — actions/scaleset v0.4.0
 
 Findings from reading `github.com/actions/scaleset@v0.4.0` source
 (`client.go`, `types.go`, `listener/listener.go`, `session_client.go`,
@@ -35,8 +35,8 @@ token plumbing on our side.
 
 ## Listener / message loop
 
-The upstream `listener` package already implements the whole loop the plan
-describes — use it, do not hand-roll `GetMessage`:
+The upstream `listener` package provides the message loop, including job
+acquisition and acknowledgments:
 
 ```go
 sessionClient, err := c.MessageSessionClient(ctx, scaleSetID, owner) // owner = hostname
@@ -88,16 +88,16 @@ value as argv. There is no `--jitconfig-file` flag and no env-var input on
 the official runner (ARC's `RUNNER_JIT_CONFIG` env var is entrypoint.sh
 plumbing that still ends up as argv).
 
-**Decision (plan §11 fallback 3, accepted):** launch through a shell so the
-value never sits in a long-lived argv:
+**Correction from the production review (2026-09-10):** the shell
+wrapper does not limit argv exposure to milliseconds. `run.sh` remains
+alive with the supplied arguments and forwards them to the runner helper.
+Treat the JIT value as visible to root and the runner UID for the process
+lifetime. Production now uses systemd `LoadCredential` for private
+source-to-unit delivery; the final runner interface still requires argv.
+The process backend uses a separate private runner-owned copy inside the
+slot. Both source and copy are unlinked during the appropriate teardown.
 
-```sh
-exec ./run.sh --jitconfig "$(cat /run/tentacles/0001.jit)"
-```
-
-JIT file is `0600` on tmpfs, written by the daemon, read by the shell at
-start, unlinked when the slot is wiped. Residual `ps` exposure window is
-milliseconds on a trusted host.
+Source: [official run.sh](https://github.com/actions/runner/blob/v2.337.0/src/Misc/layoutroot/run.sh).
 
 ## systemd API choice
 
@@ -114,7 +114,7 @@ exits; boot adoption lists `tentacle-*.service`.
 ## Preview-API landmines
 
 - `listener.Config.Validate()` requires `MaxRunners >= 0`; `ScaleSetID != 0`.
-- `slog.DiscardHandler` in listener defaults requires Go ≥ 1.24 — we require 1.25.
+- `slog.DiscardHandler` in listener defaults requires Go ≥ 1.24 — we require Go 1.26.8 or a newer supported patch release.
 - `CreateRunnerScaleSet` 409s on duplicate names — always Get-then-Create.
 - Everything above is behind `internal/scaleset`; upstream types must not
   leak past that package.

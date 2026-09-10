@@ -167,10 +167,8 @@ func TestUnknownUnit(t *testing.T) {
 		} else if !strings.Contains(err.Error(), "unknown unit") {
 			t.Fatalf("Wait(%q) error = %q, want 'unknown unit'", unitName, err)
 		}
-		if err := b.Stop(ctx, unitName); err == nil {
-			t.Fatalf("Stop(%q): expected error, got nil", unitName)
-		} else if !strings.Contains(err.Error(), "unknown unit") {
-			t.Fatalf("Stop(%q) error = %q, want 'unknown unit'", unitName, err)
+		if err := b.Stop(ctx, unitName); err != nil {
+			t.Fatalf("Stop(%q): absent process should be confirmed stopped: %v", unitName, err)
 		}
 	}
 }

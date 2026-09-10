@@ -2,7 +2,14 @@
 // JIT config material and the provisioning backend contract.
 package runner
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrNotStarted proves this attempt did not start a live runner.
+// Other Start errors are uncertain: a runner may already have claimed a job.
+var ErrNotStarted = errors.New("runner was not started")
 
 // JIT is a minted just-in-time runner configuration. Encoded is a secret:
 // never log it, never write it anywhere but a 0600 file on tmpfs.
@@ -21,7 +28,7 @@ type Spec struct {
 	JITPath   string // 0600 file holding the encoded JIT config
 	EnvFile   string // systemd EnvironmentFile with PATH/HOME/mise
 	User      string // unix user for the runner process
-	Group     string // unix group ("" = same as user)
+	Group     string // unix group ("" = account primary group)
 	CPUQuota  string // e.g. "400%" (systemd CPUQuota syntax)
 	MemoryMax string // e.g. "8G" (systemd MemoryMax syntax)
 	UnitName  string // e.g. "tentacle-0001.service"
@@ -33,11 +40,13 @@ type Spec struct {
 type Backend interface {
 	// Start launches run.sh in the slot described by spec. It returns
 	// once the process/unit has been forked (Type=exec semantics: at
-	// least exec'd), not when the runner is idle.
+	// least exec'd), not when the runner is idle. Errors wrapping
+	// ErrNotStarted prove no runner was started; other errors require observation.
 	Start(ctx context.Context, spec Spec) error
 	// Stop terminates the unit/process and returns after it is gone.
 	Stop(ctx context.Context, unit string) error
-	// Wait blocks until the unit/process has exited.
+	// Wait returns nil only for confirmed exit. Any error is an observation
+	// failure; callers must retain the slot and retry before cleanup.
 	Wait(ctx context.Context, unit string) error
 	// Active lists currently-running unit names owned by this backend
 	// (e.g. tentacle-0001.service). Used for boot adoption.

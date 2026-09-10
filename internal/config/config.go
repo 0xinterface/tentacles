@@ -1,6 +1,6 @@
 // Package config loads, validates, and exposes the tentacles YAML
-// configuration. The YAML layout is fixed by the implementation plan §6;
-// do not add fields without updating the example config.
+// configuration. Keep fields and defaults documented in README.md and
+// configs/config.example.yaml when changing the YAML layout.
 package config
 
 import (
@@ -27,17 +27,19 @@ const AllowUnverifiedPayloadEnv = "TENTACLES_ALLOW_UNVERIFIED_PAYLOAD"
 
 // Default directories and values applied by Load when the YAML omits them.
 const (
-	DefaultGitHubURL   = "https://github.com"
-	DefaultRunnerGroup = "Default"
-	DefaultWorkDir     = "_work"
-	DefaultRunnerUser  = "gha-runner"
-	DefaultStateDir    = "/var/lib/tentacles"
-	DefaultCacheDir    = "/var/cache/tentacles"
-	DefaultLogDir      = "/var/log/tentacles"
-	DefaultJitDir      = "/run/tentacles"
-	DefaultBackend     = "systemd"
-	DefaultListen      = "127.0.0.1:9090"
-	DefaultLogLevel    = "info"
+	DefaultGitHubURL          = "https://github.com"
+	DefaultRunnerGroup        = "Default"
+	DefaultWorkDir            = "_work"
+	DefaultRunnerUser         = "gha-runner"
+	DefaultStateDir           = "/var/lib/tentacles"
+	DefaultCacheDir           = "/var/cache/tentacles"
+	DefaultLogDir             = "/var/log/tentacles"
+	DefaultJitDir             = "/run/tentacles"
+	DefaultBackend            = "systemd"
+	DefaultListen             = "127.0.0.1:9090"
+	DefaultLogLevel           = "info"
+	DefaultDiagMaxAge         = 7 * 24 * time.Hour
+	DefaultDiagMaxBytes int64 = 1 << 30
 )
 
 // Backend names for runtime.backend.
@@ -46,7 +48,7 @@ const (
 	BackendProcess = "process"
 )
 
-// Default timeouts per implementation plan §6.
+// Default slot lifecycle timeouts.
 const (
 	DefaultSlotStartTimeout = 90 * time.Second
 	DefaultSlotStopTimeout  = 30 * time.Second
@@ -71,7 +73,7 @@ type Config struct {
 	Observability Observability `yaml:"observability"`
 }
 
-// Admission-gate defaults (plan §9/§13).
+// Admission-gate defaults.
 const (
 	DefaultCPUTargetPercent    = 90
 	DefaultMemoryMarginPercent = 20
@@ -144,9 +146,9 @@ type Runtime struct {
 	JitDir           string        `yaml:"jit_dir"`
 }
 
-// Scaling tunes the history-based admission gate (plan §9/§13). When
+// Scaling tunes the history-based admission gate. When
 // admission_control is on, a new slot is held back whenever the
-// predicted resource usage of all busy slots plus the incoming job
+// predicted resource usage of all live slots plus the incoming job
 // would exceed the host budget derived from these targets.
 type Scaling struct {
 	AdmissionControl    bool          `yaml:"admission_control"`
@@ -157,9 +159,11 @@ type Scaling struct {
 
 // Observability configures the metrics endpoint and logging.
 type Observability struct {
-	Listen   string `yaml:"listen"`
-	LogLevel string `yaml:"log_level"`
-	ShipDiag bool   `yaml:"ship_diag"`
+	Listen       string        `yaml:"listen"`
+	LogLevel     string        `yaml:"log_level"`
+	ShipDiag     bool          `yaml:"ship_diag"`
+	DiagMaxAge   time.Duration `yaml:"diag_max_age"`
+	DiagMaxBytes int64         `yaml:"diag_max_bytes"`
 }
 
 var (
@@ -176,8 +180,8 @@ var (
 // available on this host. Overridden in tests.
 var systemdRuntimeDir = "/run/systemd/system"
 
-// Validate checks every fail-closed rule from implementation plan §6 and
-// returns a joined error listing ALL failures, never just the first one.
+// Validate checks configuration constraints and returns a joined error
+// listing all detected failures. Runtime preflight happens during startup.
 func (c *Config) Validate() error {
 	var errs []error
 	fail := func(format string, args ...any) {
@@ -235,7 +239,7 @@ func (c *Config) Validate() error {
 
 	// Runner payload. An unset version means "track the latest
 	// release": the daemon resolves the version and its asset digest
-	// from the GitHub releases API at startup (plan §10). A pinned
+	// from the GitHub releases API at startup. A pinned
 	// sha256 requires a pinned version — a digest cannot constrain a
 	// version that moves with every release.
 	dynamicVersion := c.Runner.Version == ""
@@ -312,6 +316,12 @@ func (c *Config) Validate() error {
 	}
 
 	// Observability.
+	if c.Observability.DiagMaxAge < 0 {
+		fail("observability.diag_max_age must be positive")
+	}
+	if c.Observability.DiagMaxBytes < 0 {
+		fail("observability.diag_max_bytes must be positive")
+	}
 	if _, _, err := net.SplitHostPort(c.Observability.Listen); err != nil {
 		fail("observability.listen %q is not a valid host:port: %v", c.Observability.Listen, err)
 	}
@@ -326,9 +336,9 @@ func (c *Config) Validate() error {
 
 // EnsureDirs creates the daemon's directory tree: state, cache, logs,
 // the slot and template subdirectories, and the runtime JIT dir (tmpfs
-// in production). All directories are created 0755 with MkdirAll and
-// then probed for writability (plan §6: "state/cache directories
-// writable" — MkdirAll alone succeeds on existing read-only dirs).
+// in production). Directories are created 0755 (JIT: 0700) with MkdirAll and
+// then probed for writability: MkdirAll alone succeeds on existing
+// read-only directories.
 func (c *Config) EnsureDirs() error {
 	dirs := []string{
 		c.Paths.StateDir,
@@ -344,6 +354,18 @@ func (c *Config) EnsureDirs() error {
 		}
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return fmt.Errorf("create directory %s: %w", d, err)
+		}
+		if d == c.Runtime.JitDir {
+			info, err := os.Lstat(d)
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() {
+				return fmt.Errorf("JIT directory must be a real directory: %s", d)
+			}
+			if err := os.Chmod(d, 0700); err != nil {
+				return err
+			}
 		}
 		if err := probeWritable(d); err != nil {
 			return fmt.Errorf("directory %s is not writable: %w", d, err)

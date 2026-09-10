@@ -1,4 +1,4 @@
-# CI for tentacles itself (plan §16 phase 6: pin GitHub Actions).
+# CI for tentacles itself.
 # Actions are pinned to full commit SHAs; bump deliberately.
 name: ci
 
@@ -29,3 +29,17 @@ jobs:
       - run: go test -race ./...
       - name: dry-run example config
         run: go run ./cmd/tentacles --config configs/config.example.yaml --dry-run
+
+      - name: vulnerability scan
+        if: runner.os == 'Linux'
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+      - name: privileged identity and systemd integration
+        if: runner.os == 'Linux'
+        run: |
+          go test -c -o "$RUNNER_TEMP/process.test" ./internal/process
+          sudo "$RUNNER_TEMP/process.test" -test.run '^TestDistinctUIDCanWriteSlotAndReadCredential$' -test.v
+          go test -c -o "$RUNNER_TEMP/systemd.test" ./internal/systemd
+          sudo env TENTACLES_SYSTEMD_SMOKE=1 "$RUNNER_TEMP/systemd.test" -test.run '^TestRealSystemdSmoke$' -test.v -test.timeout=90s
+          go build -o "$RUNNER_TEMP/tentacles" ./cmd/tentacles
+          sudo install -m 0755 "$RUNNER_TEMP/tentacles" /usr/local/sbin/tentacles
+          systemd-analyze verify configs/systemd/tentacles.service configs/systemd/tentacle@.service

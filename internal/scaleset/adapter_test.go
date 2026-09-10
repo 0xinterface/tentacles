@@ -399,7 +399,7 @@ func TestRunSessionCreateError(t *testing.T) {
 }
 
 // TestRunEmitsSessionStarted: the adapter reports session establishment
-// (plan §11 gates sd_notify READY on the listener session being started).
+// so the daemon can gate sd_notify READY on the listener session.
 func TestRunEmitsSessionStarted(t *testing.T) {
 	fake := &fakeSessionClient{totalAssigned: 1}
 	a := &Adapter{
@@ -450,7 +450,7 @@ func TestRunSessionCreateErrorDoesNotEmitSessionStarted(t *testing.T) {
 
 // TestRunReportsMessageIDs: the adapter wraps the session client so
 // every fetched message ID reaches ev.MessageID (the
-// tentacles_last_message_id metric, plan §14).
+// tentacles_last_message_id metric).
 func TestRunReportsMessageIDs(t *testing.T) {
 	fake := &fakeSessionClient{
 		totalAssigned: 1,

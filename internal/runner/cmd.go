@@ -1,22 +1,45 @@
 package runner
 
 import (
+	"context"
+	"errors"
+	"os"
 	"os/exec"
+	"syscall"
+	"time"
 )
 
-// JITScript returns the shell command that starts the official runner with
-// the JIT config read from jitPath. The shell expands "$(cat ...)" at exec
-// time, so the encoded value never sits in a long-lived argv. The path is
-// single-quoted so daemon-controlled tmpfs paths with spaces still work.
-func JITScript(jitPath string) string {
-	return "exec ./run.sh --jitconfig \"$(cat '" + jitPath + "')\""
+// JITScript reads the credential from the first positional argument. The
+// official runner still receives the value in argv for its process lifetime.
+func JITScript() string {
+	return `jit=$(cat -- "$1") || exit; exec ./run.sh --jitconfig "$jit"`
 }
 
-// BuildCommand returns the exec.Cmd for spec: a POSIX shell that execs
-// ./run.sh in the slot directory with the JIT config read from the JIT
-// file. The process runs in its own process group; see process.Backend.
+// CredentialScript reads systemd's private, per-unit credential copy.
+func CredentialScript() string {
+	return `jit=$(cat "$CREDENTIALS_DIRECTORY/jit") || exit; exec ./run.sh --jitconfig "$jit"`
+}
+
+// BuildCommand keeps paths out of shell source and secrets out of the
+// supervisor's command line. The runner itself requires --jitconfig on argv.
 func BuildCommand(spec Spec) *exec.Cmd {
-	cmd := exec.Command("/bin/sh", "-c", JITScript(spec.JITPath))
+	cmd := exec.Command("/bin/sh", "-c", JITScript(), "--", spec.JITPath)
 	cmd.Dir = spec.SlotDir
+	return cmd
+}
+
+// CommandContext bounds command cancellation even if a subprocess inherits
+// its parent's output pipes. Each command owns a separate process group.
+func CommandContext(ctx context.Context, name string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	cmd.WaitDelay = time.Second
 	return cmd
 }

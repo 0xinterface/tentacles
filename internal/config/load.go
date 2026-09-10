@@ -59,7 +59,7 @@ func Load(path string) (*Config, error) {
 	return &c, nil
 }
 
-// applyDefaults fills every omitted field with its plan-§6 default.
+// applyDefaults fills omitted fields with the documented defaults.
 // disableUpdateSet and shipDiagSet report whether the operator wrote the
 // key explicitly (so an explicit false survives).
 func applyDefaults(c *Config, disableUpdateSet, shipDiagSet, admissionSet, marginSet bool) {
@@ -121,6 +121,13 @@ func applyDefaults(c *Config, disableUpdateSet, shipDiagSet, admissionSet, margi
 	}
 	if !shipDiagSet {
 		c.Observability.ShipDiag = true
+	}
+
+	if c.Observability.DiagMaxAge == 0 {
+		c.Observability.DiagMaxAge = DefaultDiagMaxAge
+	}
+	if c.Observability.DiagMaxBytes == 0 {
+		c.Observability.DiagMaxBytes = DefaultDiagMaxBytes
 	}
 
 	// Scaling defaults.

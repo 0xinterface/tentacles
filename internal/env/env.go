@@ -56,7 +56,7 @@ func unquote(s string) string {
 
 // Validate reports an error naming every required variable that is
 // missing or empty. PATH and HOME are mandatory for the runner agent
-// (the mise/PATH failure mode, plan §6).
+// to locate the host toolchain and its caches.
 func Validate(vars map[string]string) error {
 	var missing []string
 	for _, k := range []string{"PATH", "HOME"} {

@@ -41,7 +41,7 @@ const (
 	// EventStopped fires when the Table stops a surplus slot.
 	EventStopped Event = "stopped"
 	// EventAcquireFailure fires when a slot start fails, or a runner
-	// exits before claiming a job within the acquire grace (plan §13).
+	// exits before claiming a job within the acquire grace.
 	EventAcquireFailure Event = "acquire_failure"
 	// EventAdmissionHold fires when the admission gate declines a new
 	// slot because predicted usage exceeds the host budget. It is
@@ -51,8 +51,9 @@ const (
 
 // Usage is one sample of a slot unit's resource accounting.
 type Usage struct {
-	CPUSeconds   float64 // cumulative CPU time since unit start
-	PeakMemBytes uint64  // peak memory of the unit
+	CPUSeconds      float64 // cumulative CPU time since unit start
+	PeakMemBytes    uint64  // peak memory of the unit
+	CurrentMemBytes uint64  // current memory, used to avoid double-counting MemAvailable
 }
 
 // ClaimJob is the workflow identity of the job a runner just claimed
@@ -84,15 +85,18 @@ type Completion struct {
 
 // Slot is one runner position on the host.
 type Slot struct {
-	ID          ID
-	Dir         string
-	Unit        string // backend unit/process name, e.g. tentacle-0001.service
-	RunnerName  string // name registered with GitHub (JIT runner name)
-	WorkflowRef string // workflow the current job belongs to, set on claim
-	RunID       int64
-	State       State
-	StartedAt   time.Time
-	JITPath     string
+	ID               ID
+	Dir              string
+	Unit             string // backend unit/process name, e.g. tentacle-0001.service
+	RunnerName       string // name registered with GitHub (JIT runner name)
+	WorkflowRef      string // workflow the current job belongs to, set on claim
+	RunID            int64
+	State            State
+	StartedAt        time.Time
+	JITPath          string
+	CurrentMemBytes  uint64
+	ReservedCores    float64
+	ReservedMemBytes uint64
 }
 
 // Manager owns the slot table. The reconciler is the only writer; the
