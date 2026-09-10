@@ -23,10 +23,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hkust/tentacles/internal/config"
-	"github.com/hkust/tentacles/internal/history"
-	"github.com/hkust/tentacles/internal/scaleset"
-	"github.com/hkust/tentacles/internal/slot"
+	"github.com/0xinterface/tentacles/internal/config"
+	"github.com/0xinterface/tentacles/internal/history"
+	"github.com/0xinterface/tentacles/internal/scaleset"
+	"github.com/0xinterface/tentacles/internal/slot"
 )
 
 // fakeScaleSet drives the daemon through the same surface as the real

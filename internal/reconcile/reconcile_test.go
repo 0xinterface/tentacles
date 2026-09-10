@@ -5,7 +5,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/hkust/tentacles/internal/slot"
+	"github.com/0xinterface/tentacles/internal/slot"
 )
 
 // fakeManager records SetDesired/Ensure calls for Reconcile tests.

@@ -12,7 +12,7 @@ import (
 	"regexp"
 	"time"
 
-	"github.com/hkust/tentacles/internal/env"
+	"github.com/0xinterface/tentacles/internal/env"
 )
 
 // HardCapMaxRunners is the compiled ceiling for capacity.max_runners.

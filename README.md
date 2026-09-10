@@ -128,7 +128,7 @@ Then, per plan §18:
 Go 1.26+ (see `go.mod`):
 
 ```sh
-go build -ldflags "-X github.com/hkust/tentacles/internal/version.Version=v1.0.0" \
+go build -ldflags "-X github.com/0xinterface/tentacles/internal/version.Version=v1.0.0" \
     -o tentacles ./cmd/tentacles
 sudo install -m 0755 tentacles /usr/local/sbin/tentacles
 sudo install -m 0600 app.pem /etc/tentacles/app.pem

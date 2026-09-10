@@ -25,7 +25,7 @@ import (
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
 
-	"github.com/hkust/tentacles/internal/reconcile"
+	"github.com/0xinterface/tentacles/internal/reconcile"
 )
 
 // Config carries the GitHub App credentials and scale-set settings. The

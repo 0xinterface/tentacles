@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hkust/tentacles/internal/cleanup"
-	"github.com/hkust/tentacles/internal/runner"
+	"github.com/0xinterface/tentacles/internal/cleanup"
+	"github.com/0xinterface/tentacles/internal/runner"
 )
 
 // Default table tunables. The reconciler and app layers can override them

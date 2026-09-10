@@ -4,7 +4,7 @@ package version
 
 // Version is the build version of tentacles. Override at build time:
 //
-//	go build -ldflags "-X github.com/hkust/tentacles/internal/version.Version=v0.1.0"
+//	go build -ldflags "-X github.com/0xinterface/tentacles/internal/version.Version=v0.1.0"
 var Version = "dev"
 
 // String returns the build version as a plain string.

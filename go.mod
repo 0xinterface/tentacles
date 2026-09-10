@@ -1,4 +1,4 @@
-module github.com/hkust/tentacles
+module github.com/0xinterface/tentacles
 
 go 1.26.5
 

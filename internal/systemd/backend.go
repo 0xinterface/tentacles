@@ -23,8 +23,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hkust/tentacles/internal/runner"
-	"github.com/hkust/tentacles/internal/slot"
+	"github.com/0xinterface/tentacles/internal/runner"
+	"github.com/0xinterface/tentacles/internal/slot"
 )
 
 // Options configures the systemd backend.

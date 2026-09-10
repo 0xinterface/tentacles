@@ -12,7 +12,7 @@ import (
 
 	"os/user"
 
-	"github.com/hkust/tentacles/internal/runner"
+	"github.com/0xinterface/tentacles/internal/runner"
 )
 
 // sampleSpec is the canonical slot configuration used by the golden

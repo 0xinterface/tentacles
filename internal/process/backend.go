@@ -19,8 +19,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hkust/tentacles/internal/env"
-	"github.com/hkust/tentacles/internal/runner"
+	"github.com/0xinterface/tentacles/internal/env"
+	"github.com/0xinterface/tentacles/internal/runner"
 )
 
 // defaultStopTimeout is how long Stop waits after SIGTERM before escalating

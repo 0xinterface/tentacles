@@ -12,8 +12,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/hkust/tentacles/internal/app"
-	"github.com/hkust/tentacles/internal/version"
+	"github.com/0xinterface/tentacles/internal/app"
+	"github.com/0xinterface/tentacles/internal/version"
 )
 
 func main() {

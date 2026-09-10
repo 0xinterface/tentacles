@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hkust/tentacles/internal/runner"
+	"github.com/0xinterface/tentacles/internal/runner"
 )
 
 // fakeBackend is a runner.Backend for tests. Start registers a per-unit

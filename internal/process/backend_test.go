@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hkust/tentacles/internal/runner"
+	"github.com/0xinterface/tentacles/internal/runner"
 )
 
 // fakeRunner is the stub agent, resolved from the package test directory.
