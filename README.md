@@ -42,24 +42,47 @@ container- or VM-isolated runners instead.
 
 ## How it works
 
+The production backend separates the root supervisor from the unprivileged
+runner units. GitHub supplies demand and assigns jobs; the daemon manages
+local capacity and each runner's lifetime.
+
+```mermaid
+flowchart TD
+    accTitle: Tentacles production architecture
+    accDescr: GitHub sends scale-set demand to the root supervisor, which provisions unprivileged systemd runners from a payload template. Runners execute jobs directly from GitHub and share host toolchains and caches.
+
+    github["GitHub Actions<br/>One runner scale set"]
+
+    subgraph host["Single Linux host"]
+        subgraph daemon["tentacles.service — root supervisor"]
+            listener["Scale-set adapter and listener<br/>GitHub App authentication"]
+            reconcile["Reconciler<br/>Clamp assigned jobs to min / max"]
+            slots["Slot manager and exit watchers<br/>Admission, retries, provisioning, cleanup"]
+            template[("Payload template<br/>Writable only by the supervisor")]
+
+            listener -->|TotalAssignedJobs| reconcile
+            listener -->|Job claims and queue hints| slots
+            reconcile -->|Target live count| slots
+            template -->|Fresh copy per slot| slots
+        end
+
+        systemd["systemd<br/>Credentials, resource limits, unit state"]
+        runners["Ephemeral runner units<br/>gha-runner · one job per slot"]
+        shared[("Host toolchains and shared caches<br/>Persist across jobs")]
+
+        slots -->|Start units / stop eligible surplus| systemd
+        systemd -->|Launch with private JIT credentials| runners
+        systemd -->|Observed unit state| slots
+        runners -->|Use| shared
+    end
+
+    github <-->|Message session and JIT requests| listener
+    github <-->|Job assignment and results| runners
 ```
-                    GitHub Actions service
-                  (scale set + job assignment)
-                              ^
-                              | App JWT / installation token
-                              | session + long poll + JIT config
-                              v
-                     tentacles.service
-                  (always on, runs no job code)
-                              |
-              +---------------+----------------+
-              |  slot table | payload | systemd |
-              +---------------+----------------+
-                              |
-        tentacle-0001       tentacle-0002      tentacle-000N
-        run.sh --jitconfig   (one job each, ephemeral)
-        User=gha-runner
-```
+
+The runner units remain independent of `tentacles.service`, so a supervisor
+restart can adopt surviving jobs. Each slot gets its own work directory;
+jobs still share the runner UID, host toolchains, and caches.
 
 - The scale-set listener (the upstream `listener` package) long-polls the
   message API. `statistics.TotalAssignedJobs` supplies the desired count.
@@ -406,7 +429,47 @@ Then, in both modes:
    `template.previous-*` backup for operator inspection.
 5. Never run `config.sh` on the template.
 
-Per slot:
+The sequence below shows a typical successful job. Admission or acquisition
+backoff can defer provisioning before any new runner starts; GitHub
+notifications and process-exit observations arrive asynchronously.
+
+```mermaid
+sequenceDiagram
+    accTitle: One ephemeral runner from demand to cleanup
+    accDescr: The daemon checks capacity, copies the payload, obtains JIT configuration, and launches a systemd runner. GitHub assigns one job. The daemon removes its files and releases its slot only after confirmed exit and successful cleanup.
+    autonumber
+    participant GitHub as GitHub Actions
+    participant Daemon as tentacles
+    participant Systemd as systemd
+    participant Runner as Runner slot
+
+    GitHub-->>Daemon: Assigned-job statistics
+    Daemon->>Daemon: Clamp target<br/>Check admission and backoff
+    Daemon->>Daemon: Reserve slot directory<br/>Copy template
+    Daemon->>GitHub: Request JIT configuration<br/>for this slot
+    GitHub-->>Daemon: Encoded JIT configuration
+    Daemon->>Systemd: Start unit with private<br/>credential and limits
+    Systemd->>Runner: Launch run.sh as gha-runner
+    Runner->>GitHub: Register and wait for work
+    GitHub-->>Runner: Assign one job
+    GitHub-->>Daemon: JobStarted, mark slot busy
+    Runner->>GitHub: Report job result
+    Runner-->>Systemd: Process exits
+    Daemon->>Systemd: Observe unit state
+    Systemd-->>Daemon: Exit confirmed
+    Daemon->>Daemon: Record available usage<br/>when history is enabled
+    Daemon->>Daemon: Ship diagnostics if enabled<br/>Remove JIT and slot directory
+    Daemon->>Daemon: Release slot ID<br/>Reconcile remaining demand
+
+    Note over Daemon,Systemd: An uncertain launch or exit keeps the slot live.<br/>Failed cleanup reserves the ID for retry.
+```
+
+The exit watcher observes units throughout their lifetime. A `JobCompleted`
+message alone never permits deleting a slot; cleanup requires confirmed
+process exit. Resource history uses periodic samples, as described in
+[Scaling semantics](#scaling-semantics).
+
+The filesystem operations for each slot are:
 
 1. Exclusively create `paths.state_dir/slots/<id>` and copy the template's
    files, modes, and symlinks into it. Pre-existing slot directories are
