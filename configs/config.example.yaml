@@ -3,7 +3,8 @@
 # Paths are repo-relative so `tentacles --config configs/config.example.yaml
 # --dry-run` works on a dev box (backend=process, throwaway key). For
 # production, copy to /etc/tentacles/config.yaml, point the paths at the
-# plan §4 locations, set backend=systemd, and fill in a real sha256.
+# production locations listed in README.md, set backend=systemd, and keep
+# the version and verified sha256 together.
 
 github:
   url: https://github.com
@@ -28,10 +29,10 @@ capacity:
   job_memory_max: 8G
 
 runner:
-  version: 2.328.0              # pin in production; omit to track the latest release
+  version: 2.337.0              # pin in production; omit to track the latest release
                                 # (version and sha256 resolved from the releases API)
   download_url: ""              # optional override; default GitHub release
-  sha256: 01066fad3a2893e63e6ca880ae3a1fad5bf9329d60e77ee15f2b97c148c3cd4e  # actions-runner-linux-x64-2.328.0.tar.gz
+  sha256: 70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613  # actions-runner-linux-x64-2.337.0.tar.gz
   work_directory: _work
   disable_update: true
   user: gha-runner
@@ -45,7 +46,7 @@ paths:
 
 scaling:
   admission_control: true       # hold new slots when predicted usage exceeds budget
-  cpu_target_percent: 90        # share of host cores busy jobs may use
+  cpu_target_percent: 90        # share of host cores reserved by live runners
   memory_margin_percent: 20     # share of MemAvailable kept free
   sample_interval: 30s          # usage sampling period
 
@@ -60,3 +61,5 @@ observability:
   listen: 127.0.0.1:9090
   log_level: info
   ship_diag: true
+  diag_max_age: 168h            # remove completed archives older than 7 days
+  diag_max_bytes: 1073741824    # keep at most 1 GiB of completed diagnostics

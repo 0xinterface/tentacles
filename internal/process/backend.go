@@ -10,8 +10,6 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"os/user"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -62,8 +60,9 @@ type Backend struct {
 	log     *slog.Logger
 	stop    time.Duration
 
-	mu    sync.Mutex
-	units map[string]*unit
+	mu       sync.Mutex
+	units    map[string]*unit
+	starting chan struct{}
 }
 
 // New creates a backend. The environment file, if any, is parsed once here;
@@ -78,9 +77,10 @@ func New(opts Options, extra ...Option) *Backend {
 		log = slog.New(slog.DiscardHandler)
 	}
 	b := &Backend{
-		log:   log,
-		stop:  o.stopTimeout,
-		units: make(map[string]*unit),
+		log:      log,
+		stop:     o.stopTimeout,
+		units:    make(map[string]*unit),
+		starting: make(chan struct{}, 1),
 	}
 	if opts.EnvFile != "" {
 		b.envVars, b.envErr = env.ParseFile(opts.EnvFile)
@@ -91,45 +91,103 @@ func New(opts Options, extra ...Option) *Backend {
 // Start forks run.sh for spec in a new process group and registers it under
 // spec.UnitName. It returns once the process has been exec'd, not when the
 // runner is idle.
-func (b *Backend) Start(ctx context.Context, spec runner.Spec) error {
+func (b *Backend) Start(ctx context.Context, spec runner.Spec) (retErr error) {
+	attempted := false
+	defer func() {
+		if retErr != nil && !attempted {
+			retErr = fmt.Errorf("%w: %w", runner.ErrNotStarted, retErr)
+		}
+	}()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if strings.TrimSpace(spec.UnitName) == "" {
 		return errors.New("process: unit name must not be empty")
 	}
 	if b.envErr != nil {
 		return fmt.Errorf("process: parse environment file: %w", b.envErr)
 	}
-
+	envVars := b.envVars
+	if spec.EnvFile != "" {
+		var err error
+		envVars, err = env.ParseFile(spec.EnvFile)
+		if err != nil {
+			return fmt.Errorf("process: parse environment file: %w", err)
+		}
+	}
+	identity, err := runner.ResolveIdentity(spec)
+	if err != nil {
+		return err
+	}
+	select {
+	case b.starting <- struct{}{}:
+		defer func() { <-b.starting }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	b.mu.Lock()
 	if old, ok := b.units[spec.UnitName]; ok {
 		select {
 		case <-old.exited:
-			// previous incarnation finished; the name may be reused
 		default:
 			b.mu.Unlock()
 			return fmt.Errorf("process: unit %q already running", spec.UnitName)
 		}
 	}
 	b.mu.Unlock()
-
-	cmd := runner.BuildCommand(spec)
-	cmd.Env = env.Apply(os.Environ(), b.envVars)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if runtime.GOOS == "linux" {
-		if err := applyCredential(cmd, spec); err != nil {
-			return fmt.Errorf("process: resolve credentials: %w", err)
+	// Keep the source private to the supervisor. The process backend has no
+	// systemd credential store, so prepare a separate 0600 runner-owned copy.
+	data, err := runner.ReadJIT(spec.JITPath)
+	if err != nil {
+		return fmt.Errorf("process: read JIT source: %w", err)
+	}
+	credential, err := os.CreateTemp(spec.SlotDir, ".jit-*")
+	if err != nil {
+		return err
+	}
+	credentialPath := credential.Name()
+	started := false
+	defer func() {
+		if !started {
+			_ = os.Remove(credentialPath)
 		}
+	}()
+	if _, err := credential.Write(data); err != nil {
+		_ = credential.Close()
+		return err
 	}
+	if err := credential.Close(); err != nil {
+		return err
+	}
+	if err := runner.PrepareSlot(ctx, spec, identity); err != nil {
+		return err
+	}
+	spec.JITPath = credentialPath
+	cmd := runner.BuildCommand(spec)
+	cmd.Env = env.Apply(os.Environ(), envVars)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Credential: identity.Credential}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	attempted = true
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("process: start unit %q: %w", spec.UnitName, err)
+		return fmt.Errorf("%w: process start unit %q: %w", runner.ErrNotStarted, spec.UnitName, err)
 	}
-
 	u := &unit{cmd: cmd, exited: make(chan struct{})}
 	b.mu.Lock()
 	b.units[spec.UnitName] = u
 	b.mu.Unlock()
-
+	started = true
 	go func() {
 		_ = cmd.Wait()
+		// A wrapper exiting does not imply its children exited. End any remaining
+		// group members before confirming the unit is gone to the slot table.
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		// SIGKILL delivery can precede actual exit (for example during disk I/O).
+		// Retain the unit until every group member has stopped executing.
+		b.waitForGroupExit(cmd.Process.Pid)
+		_ = os.Remove(credentialPath)
 		close(u.exited)
 	}()
 	b.log.Info("runner process started", "unit", spec.UnitName, "pid", cmd.Process.Pid, "slot_dir", spec.SlotDir)
@@ -138,6 +196,9 @@ func (b *Backend) Start(ctx context.Context, spec runner.Spec) error {
 
 // Active lists the unit names whose processes have not exited yet.
 func (b *Backend) Active(ctx context.Context) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	names := make([]string, 0, len(b.units))
@@ -172,9 +233,20 @@ func (b *Backend) Wait(ctx context.Context, unitName string) error {
 // after the stop timeout, waiting for exit between and after. It returns
 // once the process group is gone.
 func (b *Backend) Stop(ctx context.Context, unitName string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// A missing registry entry proves no process was launched only after
+	// any concurrent Start has finished registering its process.
+	select {
+	case b.starting <- struct{}{}:
+		defer func() { <-b.starting }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	u, err := b.lookup(unitName)
 	if err != nil {
-		return err
+		return nil
 	}
 	select {
 	case <-u.exited:
@@ -193,6 +265,9 @@ func (b *Backend) Stop(ctx context.Context, unitName string) error {
 	case <-u.exited:
 		return nil
 	case <-timer.C:
+	case <-ctx.Done():
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		return ctx.Err()
 	}
 
 	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
@@ -216,47 +291,38 @@ func (b *Backend) lookup(unitName string) (*unit, error) {
 	return u, nil
 }
 
-// applyCredential drops privileges for the child when the daemon runs as
-// root and spec asks for a different unix user. Only meaningful on linux;
-// the caller guards on runtime.GOOS.
-func applyCredential(cmd *exec.Cmd, spec runner.Spec) error {
-	if os.Getuid() != 0 || spec.User == "" {
-		return nil
+// waitForGroupExit ignores zombies, which cannot touch slot files and may
+// remain under a container init that does not reap adopted descendants.
+func (b *Backend) waitForGroupExit(pgid int) {
+	for {
+		if err := syscall.Kill(-pgid, 0); errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		cmd := runner.CommandContext(ctx, "/bin/ps", "-axo", "pgid=,stat=")
+		out, err := cmd.Output()
+		cancel()
+		if err == nil {
+			alive, valid := false, true
+			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+				fields := strings.Fields(line)
+				if len(fields) != 2 {
+					valid = false
+					break
+				}
+				group, parseErr := strconv.Atoi(fields[0])
+				if parseErr != nil {
+					valid = false
+					break
+				}
+				if group == pgid && !strings.HasPrefix(fields[1], "Z") {
+					alive = true
+				}
+			}
+			if valid && !alive {
+				return
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	u, err := user.Lookup(spec.User)
-	if err != nil {
-		return fmt.Errorf("lookup user %q: %w", spec.User, err)
-	}
-	uid, err := strconv.ParseUint(u.Uid, 10, 32)
-	if err != nil {
-		return fmt.Errorf("parse uid %q for user %q: %w", u.Uid, spec.User, err)
-	}
-	gid, err := resolveGID(spec.Group, u)
-	if err != nil {
-		return err
-	}
-	cmd.SysProcAttr.Credential = &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}
-	return nil
-}
-
-func resolveGID(group string, u *user.User) (uint32, error) {
-	if group == "" {
-		return parseGID(u.Gid) // primary group of the resolved user
-	}
-	if gid, err := strconv.ParseUint(group, 10, 32); err == nil {
-		return uint32(gid), nil
-	}
-	g, err := user.LookupGroup(group)
-	if err != nil {
-		return 0, fmt.Errorf("lookup group %q: %w", group, err)
-	}
-	return parseGID(g.Gid)
-}
-
-func parseGID(s string) (uint32, error) {
-	gid, err := strconv.ParseUint(s, 10, 32)
-	if err != nil {
-		return 0, fmt.Errorf("parse gid %q: %w", s, err)
-	}
-	return uint32(gid), nil
 }

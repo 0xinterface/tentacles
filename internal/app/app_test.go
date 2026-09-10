@@ -354,8 +354,8 @@ func poll(t *testing.T, timeout time.Duration, cond func() bool) bool {
 	return cond()
 }
 
-// TestDaemonScaleUpDownEphemeral is the plan's phase 3+4 exit criterion
-// in miniature, fully offline: a queued "job" (desired=1) materializes a
+// TestDaemonScaleUpDownEphemeral exercises the daemon fully offline:
+// a queued "job" (desired=1) materializes a
 // slot from a verified payload, starts the fake runner with a JIT, ships
 // its _diag, and — once desired drops to 0 — wipes the slot entirely.
 func TestDaemonScaleUpDownEphemeral(t *testing.T) {
@@ -456,7 +456,7 @@ func TestDaemonScaleUpDownEphemeral(t *testing.T) {
 		t.Fatalf("daemon did not shut down")
 	}
 
-	// Scale to zero means zero slot directories (plan §19.5).
+	// Scale to zero means zero slot directories.
 	if entries := ls(t, slotsDir); len(entries) != 0 {
 		t.Errorf("slot dirs leaked after shutdown: %v", entries)
 	}
@@ -516,7 +516,7 @@ func TestDaemonMinRunnersWarmPool(t *testing.T) {
 	}
 }
 
-// TestDryRunValidatesConfig is the plan's phase 1 exit criterion.
+// TestDryRunValidatesConfig checks the CLI's configuration validation path.
 func TestDryRunValidatesConfig(t *testing.T) {
 	tarBytes, sha := fixtureRunnerTar(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -556,10 +556,9 @@ func ls(t *testing.T, dir string) []string {
 	return names
 }
 
-// TestDaemonReplenishesWarmPoolAfterExit: plan §9 — "a local watcher
-// pushes process exits" into reconcile. A warm-pool runner that dies is
-// replaced without waiting for the next statistics push (the periodic
-// tick from plan §13 is the backstop; the exit nudge is the fast path).
+// TestDaemonReplenishesWarmPoolAfterExit checks that a local exit watcher
+// triggers replacement of a warm-pool runner without waiting for the next
+// statistics push. The periodic tick is the backstop.
 func TestDaemonReplenishesWarmPoolAfterExit(t *testing.T) {
 	if testing.Short() {
 		t.Skip("end-to-end test")
@@ -601,10 +600,10 @@ func TestDaemonReplenishesWarmPoolAfterExit(t *testing.T) {
 	}
 }
 
-// TestDaemonReadinessGatedOnSessionStart: plan §11 — sd_notify READY=1
+// TestDaemonReadinessGatedOnSessionStart checks sd_notify READY=1 occurs
 // only after the listener session started, never when the daemon shuts
 // down before a session came up. Also proves the last_message_id metric
-// is wired end to end (plan §14).
+// is wired end to end.
 func TestDaemonReadinessGatedOnSessionStart(t *testing.T) {
 	if testing.Short() {
 		t.Skip("end-to-end test")

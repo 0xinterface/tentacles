@@ -19,7 +19,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -111,7 +110,7 @@ func ResolveLatest(ctx context.Context, apiURL string) (string, string, error) {
 // Ensure is safe for concurrent use; CopySlot may run while a different
 // version is being swapped in and copies one complete template.
 type Manager struct {
-	mu          sync.Mutex
+	mu          chan struct{}
 	cacheDir    string
 	templateDir string
 	log         *slog.Logger
@@ -125,6 +124,7 @@ func New(cacheDir, templateDir string, log *slog.Logger) *Manager {
 		log = slog.New(slog.DiscardHandler)
 	}
 	return &Manager{
+		mu:          make(chan struct{}, 1),
 		cacheDir:    filepath.Clean(cacheDir),
 		templateDir: filepath.Clean(templateDir),
 		log:         log,
@@ -143,8 +143,18 @@ func DownloadURL(version string) string {
 // version+sha256, download and extraction are skipped entirely. An empty
 // sha256 is an error unless AllowUnverifiedEnv is set.
 func (m *Manager) Ensure(ctx context.Context, version, sha256, downloadURL string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case m.mu <- struct{}{}:
+		defer func() { <-m.mu }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	if !safeComponent(version) {
 		return fmt.Errorf("payload: invalid version %q", version)
@@ -164,8 +174,11 @@ func (m *Manager) Ensure(ctx context.Context, version, sha256, downloadURL strin
 		}
 	}
 	for attempt := range 2 {
-		ok, err := m.verify(cachePath, sha256)
+		ok, err := m.verify(ctx, cachePath, sha256)
 		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if ok {
@@ -184,7 +197,7 @@ func (m *Manager) Ensure(ctx context.Context, version, sha256, downloadURL strin
 			return err
 		}
 	}
-	return m.extract(cachePath, version, sha256)
+	return m.extract(ctx, cachePath, version, sha256)
 }
 
 // CopySlot copies the template directory into dst (like cp -a), preserving
@@ -212,6 +225,29 @@ func (m *Manager) CopySlot(dst string) error {
 	}
 	m.log.Info("slot materialized", "dir", dst)
 	return nil
+}
+
+// CopySlotIntoContext fills an empty directory exclusively reserved by the
+// table. It never accepts a symlink or a previously populated directory.
+func (m *Manager) CopySlotIntoContext(ctx context.Context, dst string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	info, err := os.Lstat(dst)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("payload: reserved slot is not a directory: %s", dst)
+	}
+	entries, err := os.ReadDir(dst)
+	if err != nil {
+		return err
+	}
+	if len(entries) != 0 {
+		return fmt.Errorf("payload: reserved slot is not empty: %s", dst)
+	}
+	return copyTreeContext(ctx, m.templateDir, dst)
 }
 
 // cachePath returns the cache file path for a runner version.
@@ -266,7 +302,7 @@ func (m *Manager) download(ctx context.Context, url, dst, version string) error 
 			_ = os.Remove(tmpName)
 		}
 	}()
-	n, err := io.Copy(tmp, io.LimitReader(resp.Body, maxDownloadSize+1))
+	n, err := io.Copy(tmp, io.LimitReader(contextReader{ctx: ctx, r: resp.Body}, maxDownloadSize+1))
 	if err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("payload: read body from %s: %w", url, err)
@@ -278,6 +314,9 @@ func (m *Manager) download(ctx context.Context, url, dst, version string) error 
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("payload: close temp file %s: %w", tmpName, err)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := os.Rename(tmpName, dst); err != nil {
 		return fmt.Errorf("payload: move %s to %s: %w", tmpName, dst, err)
 	}
@@ -288,7 +327,10 @@ func (m *Manager) download(ctx context.Context, url, dst, version string) error 
 
 // verify reports whether the file at path hashes to want. A non-empty want
 // is guaranteed by Ensure to be valid hex.
-func (m *Manager) verify(path, want string) (bool, error) {
+func (m *Manager) verify(ctx context.Context, path, want string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if want == "" { // allowUnverified guaranteed by Ensure
 		return true, nil
 	}
@@ -297,11 +339,10 @@ func (m *Manager) verify(path, want string) (bool, error) {
 		return false, fmt.Errorf("payload: open %s for verification: %w", path, err)
 	}
 	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	got, err := hashContext(ctx, f)
+	if err != nil {
 		return false, fmt.Errorf("payload: hash %s: %w", path, err)
 	}
-	got := hex.EncodeToString(h.Sum(nil))
 	if !strings.EqualFold(got, want) {
 		m.log.Warn("payload checksum mismatch", "path", path, "expected", want, "got", got)
 		return false, nil
@@ -310,10 +351,21 @@ func (m *Manager) verify(path, want string) (bool, error) {
 	return true, nil
 }
 
+func hashContext(ctx context.Context, input io.Reader) (string, error) {
+	h := sha256.New()
+	if _, err := io.Copy(h, contextReader{ctx: ctx, r: input}); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 // extract unpacks the cached tarball into a fresh staging directory
 // <templateDir>.tmp, writes the marker file, and atomically promotes the
 // staging directory to templateDir.
-func (m *Manager) extract(cachePath, version, sha256 string) (err error) {
+func (m *Manager) extract(ctx context.Context, cachePath, version, sha256 string) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	tmp := m.templateDir + ".tmp"
 	if err := os.RemoveAll(tmp); err != nil {
 		return fmt.Errorf("payload: clear staging dir %s: %w", tmp, err)
@@ -334,13 +386,16 @@ func (m *Manager) extract(cachePath, version, sha256 string) (err error) {
 		return fmt.Errorf("payload: open %s: %w", cachePath, err)
 	}
 	defer f.Close()
-	gz, err := gzip.NewReader(f)
+	gz, err := gzip.NewReader(contextReader{ctx: ctx, r: f})
 	if err != nil {
 		return fmt.Errorf("payload: gzip %s: %w", cachePath, err)
 	}
 	defer gz.Close()
-	tr := tar.NewReader(gz)
+	tr := tar.NewReader(contextReader{ctx: ctx, r: gz})
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		hdr, err := tr.Next()
 		if err == io.EOF {
 			break
@@ -348,35 +403,89 @@ func (m *Manager) extract(cachePath, version, sha256 string) (err error) {
 		if err != nil {
 			return fmt.Errorf("payload: read tar from %s: %w", cachePath, err)
 		}
-		if err := m.extractEntry(tr, hdr, tmp); err != nil {
+		if err := m.extractEntry(ctx, tr, hdr, tmp); err != nil {
 			return err
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if err := writeMarker(filepath.Join(tmp, markerName), version, sha256); err != nil {
 		return fmt.Errorf("payload: write template marker: %w", err)
 	}
-	// fsync the staging directory (plan §10: "extract to template.tmp,
-	// fsync, rename") so the rename cannot outrun the metadata. Best
-	// effort: some filesystems do not support directory fsync.
+	// fsync the staging directory before promotion so the rename cannot
+	// outrun the metadata. This is best-effort because some filesystems
+	// do not support directory fsync.
 	if d, err := os.Open(tmp); err == nil {
 		_ = d.Sync()
 		_ = d.Close()
 	}
 	m.log.Info("payload extracted", "version", version, "template", tmp)
-	if err := os.RemoveAll(m.templateDir); err != nil {
-		return fmt.Errorf("payload: remove old template %s: %w", m.templateDir, err)
-	}
-	if err := os.Rename(tmp, m.templateDir); err != nil {
-		return fmt.Errorf("payload: promote %s to %s: %w", tmp, m.templateDir, err)
+	if err := m.promote(ctx, tmp); err != nil {
+		return err
 	}
 	m.log.Info("payload template ready", "version", version, "template", m.templateDir)
+	return nil
+}
+
+// promote preserves the installed tree until the new staging tree is ready.
+// If cancellation arrives between the two renames, roll back the old tree.
+// After the staging rename commits, remove the backup synchronously.
+func (m *Manager) promote(ctx context.Context, staging string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	backup, err := os.MkdirTemp(filepath.Dir(m.templateDir), filepath.Base(m.templateDir)+".previous-*")
+	if err != nil {
+		return fmt.Errorf("payload: reserve template backup: %w", err)
+	}
+	if err := os.Remove(backup); err != nil {
+		return err
+	}
+	movedOld := false
+	defer func() {
+		if !movedOld {
+			_ = os.RemoveAll(backup)
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.Rename(m.templateDir, backup); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("payload: preserve old template: %w", err)
+	} else if err == nil {
+		movedOld = true
+	}
+	rollback := func(cause error) error {
+		if movedOld {
+			if err := os.Rename(backup, m.templateDir); err != nil {
+				return fmt.Errorf("%w; restoring template from %s: %v", cause, backup, err)
+			}
+			movedOld = false
+		}
+		return cause
+	}
+	if err := ctx.Err(); err != nil {
+		return rollback(err)
+	}
+	if err := os.Rename(staging, m.templateDir); err != nil {
+		return rollback(fmt.Errorf("payload: promote template: %w", err))
+	}
+	if movedOld {
+		if err := os.RemoveAll(backup); err != nil {
+			m.log.Warn("failed to remove previous template", "path", backup, "error", err)
+		}
+	}
 	return nil
 }
 
 // extractEntry writes one tar entry under base. Absolute paths and ".."
 // traversal are rejected. Symlinks pointing outside base are skipped; hard
 // links are skipped; regular files and directories keep their header modes.
-func (m *Manager) extractEntry(tr *tar.Reader, hdr *tar.Header, base string) error {
+func (m *Manager) extractEntry(ctx context.Context, tr *tar.Reader, hdr *tar.Header, base string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	name := hdr.Name
 	if !safeTarPath(name) {
 		return fmt.Errorf("payload: rejecting unsafe tar entry %q", name)
@@ -399,11 +508,15 @@ func (m *Manager) extractEntry(tr *tar.Reader, hdr *tar.Header, base string) err
 		if err != nil {
 			return fmt.Errorf("payload: create %s: %w", target, err)
 		}
-		if _, err := io.Copy(out, tr); err != nil {
+		if _, err := io.Copy(out, contextReader{ctx: ctx, r: tr}); err != nil {
 			_ = out.Close()
 			return fmt.Errorf("payload: write %s: %w", target, err)
 		}
-		// fsync before rename (plan §10) so a crash cannot promote a
+		if err := ctx.Err(); err != nil {
+			_ = out.Close()
+			return err
+		}
+		// fsync before rename so a crash cannot promote a
 		// template with zero-length files.
 		if err := out.Sync(); err != nil {
 			_ = out.Close()
@@ -547,8 +660,13 @@ func readMarker(path string) (version, sha256 string, ok bool, err error) {
 // copyTree copies src to dst recursively, preserving modes and recreating
 // symlinks as symlinks. WalkDir does not follow symlinks, so nothing can
 // escape src.
-func copyTree(src, dst string) error {
+func copyTree(src, dst string) error { return copyTreeContext(context.Background(), src, dst) }
+
+func copyTreeContext(ctx context.Context, src, dst string) error {
 	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if err != nil {
 			return err
 		}
@@ -569,7 +687,7 @@ func copyTree(src, dst string) error {
 			}
 			return os.Chmod(target, mode)
 		case mode.IsRegular():
-			return copyFileMode(path, target, mode)
+			return copyFileModeContext(ctx, path, target, mode)
 		case mode&fs.ModeSymlink != 0:
 			link, err := os.Readlink(path)
 			if err != nil {
@@ -588,6 +706,13 @@ func copyTree(src, dst string) error {
 // copyFileMode copies one regular file and applies mode exactly (immune to
 // umask).
 func copyFileMode(srcPath, dstPath string, mode os.FileMode) error {
+	return copyFileModeContext(context.Background(), srcPath, dstPath, mode)
+}
+
+func copyFileModeContext(ctx context.Context, srcPath, dstPath string, mode os.FileMode) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	in, err := os.Open(srcPath)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", srcPath, err)
@@ -597,7 +722,7 @@ func copyFileMode(srcPath, dstPath string, mode os.FileMode) error {
 	if err != nil {
 		return fmt.Errorf("create %s: %w", dstPath, err)
 	}
-	if _, err := io.Copy(out, in); err != nil {
+	if _, err := io.Copy(out, contextReader{ctx: ctx, r: in}); err != nil {
 		_ = out.Close()
 		return fmt.Errorf("copy %s: %w", srcPath, err)
 	}
@@ -608,4 +733,25 @@ func copyFileMode(srcPath, dstPath string, mode os.FileMode) error {
 		return fmt.Errorf("chmod %s: %w", dstPath, err)
 	}
 	return nil
+}
+
+// contextReader checks cancellation between bounded copy chunks.
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	// Restrict each read even if a consumer supplies a much larger buffer.
+	if len(p) > 32*1024 {
+		p = p[:32*1024]
+	}
+	n, err := r.r.Read(p)
+	if ctxErr := r.ctx.Err(); ctxErr != nil {
+		return n, ctxErr
+	}
+	return n, err
 }

@@ -30,6 +30,9 @@ func (f *fakeBackend) Start(_ context.Context, spec runner.Spec) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.startErr != nil {
+		if f.stopErr == nil {
+			return fmt.Errorf("%w: %w", runner.ErrNotStarted, f.startErr)
+		}
 		return f.startErr
 	}
 	f.started = append(f.started, spec)
@@ -134,8 +137,8 @@ func markerMaterialize(dst string) error {
 	return os.WriteFile(filepath.Join(dst, "run.sh"), []byte("#!/bin/sh\nexit 0\n"), 0o755)
 }
 
-// fakeJIT mints a deterministic JIT whose runner name follows the plan's
-// convention "debian-host-<id>-<rand>".
+// fakeJIT mints a deterministic JIT using the runner-name convention
+// "debian-host-<id>-<rand>".
 func fakeJIT(_ context.Context, id ID) (runner.JIT, error) {
 	return runner.JIT{
 		Encoded:    "jit:" + string(id),
@@ -440,9 +443,9 @@ func TestTableObserveExitWipesEvenWhenDiagHookFails(t *testing.T) {
 }
 
 // TestTableWarmIdleSlotSurvivesAcquireGrace: an idle slot is the warm
-// pool (plan §9: "min_runners: 1 keeps one run.sh registered and idle").
+// pool when no jobs are running.
 // Idleness is never an acquire failure; only a start failure or a quick
-// never-busy exit is (plan §13).
+// never-busy exit is.
 func TestTableWarmIdleSlotSurvivesAcquireGrace(t *testing.T) {
 	backend := &fakeBackend{}
 	tab, rec, _ := newTestTable(t, backend, WithAcquireGrace(30*time.Millisecond))
@@ -859,9 +862,8 @@ func TestTableStartFailureLeavesNoPartialDir(t *testing.T) {
 	}
 }
 
-// TestTableExitBeforeGraceCountsAcquireFailure: plan §13 — run.sh exits
-// before JobStarted and before acquire_grace → wipe, count as acquire
-// failure.
+// TestTableExitBeforeGraceCountsAcquireFailure checks that an exit before
+// JobStarted and acquire_grace schedules cleanup and counts an acquire failure.
 func TestTableExitBeforeGraceCountsAcquireFailure(t *testing.T) {
 	backend := &fakeBackend{}
 	tab, rec, _ := newTestTable(t, backend, WithAcquireGrace(time.Hour))
@@ -990,7 +992,7 @@ func TestTableAdoptReadsRunnerName(t *testing.T) {
 	}
 }
 
-// TestStopSurplusStartingPastGraceOnly: plan §9 — surplus stops hit idle
+// TestStopSurplusStartingPastGraceOnly checks that surplus stops hit idle
 // slots and starting slots only once they are past the acquire grace.
 func TestStopSurplusStartingPastGraceOnly(t *testing.T) {
 	backend := &fakeBackend{}

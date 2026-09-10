@@ -1,15 +1,7 @@
-# tentacles.service — GitHub Actions host runner supervisor (daemon unit).
-#
-# The daemon must be able to start/stop transient slot units
-# (tentacle-<id>.service) as an unprivileged user. That requires a narrow
-# polkit rule allowing `tentacles` to manage only `tentacle-*.service`
-# (or a systemd user transient scope). See the "systemd integration"
-# section of the README.
-#
-# If polkit/dbus is too heavy for v1, the daemon may run as root with the
-# hardening below (NoNewPrivileges=yes, ProtectSystem=strict) — documented
-# technical debt; confine it further when you can.
-
+# Production supervisor: root manages system units and transfers fresh slots
+# to the configured unprivileged runner account. Keep config, template, cache,
+# and JIT source files owned by root; never grant runners writes to them.
+# Job services are independent transient units and survive supervisor restart.
 [Unit]
 Description=GitHub Actions host runner supervisor
 After=network-online.target
@@ -17,13 +9,39 @@ Wants=network-online.target
 
 [Service]
 Type=notify
-User=tentacles
+User=root
+Group=root
 ExecStart=/usr/local/sbin/tentacles --config /etc/tentacles/config.yaml
 Restart=on-failure
 RestartSec=5
+# Initial verified payload download and boot adoption precede readiness.
+TimeoutStartSec=15min
+TimeoutStopSec=2min
+UMask=0022
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/tentacles /var/log/tentacles /run/tentacles
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+StateDirectory=tentacles
+StateDirectoryMode=0755
+CacheDirectory=tentacles
+CacheDirectoryMode=0755
+LogsDirectory=tentacles
+LogsDirectoryMode=0750
+RuntimeDirectory=tentacles
+RuntimeDirectoryMode=0700
+# Preserve JIT sources if an in-flight runner must be adopted after restart.
+RuntimeDirectoryPreserve=yes
+# The runner account creates its own caches via a credential-dropped mkdir.
+# Provision these locations before boot; adapt to your runner HOME setting.
+ReadWritePaths=-/home/gha-runner/.cache -/home/gha-runner/.local/share/mise -/home/gha-runner/go/pkg/mod
 
 [Install]
 WantedBy=multi-user.target

@@ -215,7 +215,7 @@ runner:
 		t.Error("Runner.DisableUpdate = false, want default true")
 	}
 	if c.Paths.StateDir != "/var/lib/tentacles" || c.Paths.CacheDir != "/var/cache/tentacles" || c.Paths.LogDir != "/var/log/tentacles" {
-		t.Errorf("Paths = %+v, want plan §4 defaults", c.Paths)
+		t.Errorf("Paths = %+v, want production directory defaults", c.Paths)
 	}
 	if c.Runtime.Backend != "systemd" {
 		t.Errorf("Runtime.Backend = %q, want default systemd", c.Runtime.Backend)
@@ -421,9 +421,7 @@ func TestEnsureDirsEmptyPath(t *testing.T) {
 
 // TestExampleConfigRoundTrips guarantees the shipped example config
 // Loads and passes Validate from the repo root — the exact path --dry-run
-// walks. The example leaves sha256 empty (plan §6 shape), so the
-// unverified-payload escape must be set; the app's --dry-run should do
-// the same or the operator fills in the digest.
+// walks. The example pins the runner version and its verified digest.
 func TestExampleConfigRoundTrips(t *testing.T) {
 	root, err := filepath.Abs("../..")
 	if err != nil {
@@ -482,9 +480,8 @@ func TestValidateShaWithoutVersionRejected(t *testing.T) {
 	}
 }
 
-// TestEnsureDirsRejectsUnwritableDir: plan §6 — "state/cache directories
-// writable" fails closed; an existing read-only directory must not pass
-// (MkdirAll alone would succeed on it).
+// TestEnsureDirsRejectsUnwritableDir checks that an existing read-only
+// directory fails the writability probe even though MkdirAll succeeds.
 func TestEnsureDirsRejectsUnwritableDir(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("permission-based failure does not apply to root")
@@ -505,9 +502,8 @@ func TestEnsureDirsRejectsUnwritableDir(t *testing.T) {
 	}
 }
 
-// TestValidateRejectsEnvFileMissingRequiredVars: plan §6 — the
-// environment file must carry PATH and HOME, or the "systemd does not
-// see mise/node" failure mode comes back.
+// TestValidateRejectsEnvFileMissingRequiredVars checks that the environment
+// file carries PATH and HOME so runners can find the host toolchain.
 func TestValidateRejectsEnvFileMissingRequiredVars(t *testing.T) {
 	c := baseValid(t)
 	envFile := filepath.Join(t.TempDir(), "runner.env")
@@ -608,5 +604,20 @@ scaling:
 	}
 	if c2.Scaling.AdmissionControl {
 		t.Error("explicit admission_control: false was overridden by the default")
+	}
+}
+
+func TestEnsureDirsProtectsJITDirectory(t *testing.T) {
+	root := t.TempDir()
+	c := Config{Paths: Paths{StateDir: filepath.Join(root, "state"), CacheDir: filepath.Join(root, "cache"), LogDir: filepath.Join(root, "logs")}, Runtime: Runtime{JitDir: filepath.Join(root, "jit")}}
+	if err := c.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(c.Runtime.JitDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0700 {
+		t.Fatalf("JIT directory mode %o, want 700", got)
 	}
 }

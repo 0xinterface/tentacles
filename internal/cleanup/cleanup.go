@@ -1,6 +1,5 @@
-// Package cleanup shreds the credential material a runner slot may
-// leave behind (plan §10: "shred/unlink any leftover JIT or credential
-// files"). The slot-directory teardown itself lives in internal/slot.
+// Package cleanup removes credential names left by a runner slot.
+// Unlinking does not guarantee secure erasure of the underlying storage.
 package cleanup
 
 import (
@@ -8,39 +7,30 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"golang.org/x/sys/unix"
 )
 
-// credentialFiles are the files the official agent drops into a slot
-// directory when it registers: the runner identity and the credentials
-// used to talk to the service.
 var credentialFiles = [...]string{".runner", ".credentials", ".credentials_rsaparams"}
 
-// ShredCredentials truncates then removes the credential files in
-// slotDir, so key material does not survive in unallocated blocks.
-// A missing file is fine; other failures are joined into the returned
-// error. Shredding is best-effort by design — the caller logs and
-// proceeds with the wipe.
+// ShredCredentials is retained for compatibility. It unlinks credential names
+// without opening or truncating their targets. Missing slots/files are harmless;
+// other errors are joined so every credential name gets a removal attempt.
 func ShredCredentials(slotDir string) error {
-	var errs []error
+	fd, err := unix.Open(filepath.Clean(slotDir), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("cleanup: open slot: %w", err)
+	}
+	defer unix.Close(fd)
+
+	errs := []error{}
 	for _, name := range credentialFiles {
-		if err := shredFile(filepath.Join(slotDir, name)); err != nil {
-			errs = append(errs, err)
+		if err := unix.Unlinkat(fd, name, 0); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("cleanup: unlink %s: %w", name, err))
 		}
 	}
 	return errors.Join(errs...)
-}
-
-// shredFile truncates a file to zero length and removes it, so sensitive
-// contents do not survive in unallocated blocks. A missing file is fine.
-func shredFile(path string) error {
-	if err := os.Truncate(path, 0); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return fmt.Errorf("cleanup: truncate %s: %w", path, err)
-	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("cleanup: remove %s: %w", path, err)
-	}
-	return nil
 }

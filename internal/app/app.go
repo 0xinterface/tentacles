@@ -81,7 +81,7 @@ func Run(ctx context.Context, opts Options) error {
 		"scale_set", cfg.ScaleSet.Name,
 		"backend", cfg.Runtime.Backend,
 	)
-	d, err := newDaemon(cfg, log, opts)
+	d, err := newDaemonContext(ctx, cfg, log, opts)
 	if err != nil {
 		return err
 	}
@@ -111,16 +111,16 @@ type desiredCell struct {
 func (c *desiredCell) Store(n int) { c.mu.Lock(); c.n = n; c.mu.Unlock() }
 func (c *desiredCell) Load() int   { c.mu.Lock(); defer c.mu.Unlock(); return c.n }
 
-// defaultReconcileInterval is the safety-net reconcile tick (plan §13
-// "retry next tick"): events nudge reconcile immediately; the tick
-// retries failed starts and replenishes the warm pool even if an event
-// is lost.
+// defaultReconcileInterval is the safety-net reconcile tick. Events nudge
+// reconcile immediately; the tick retries failed starts and replenishes
+// the warm pool even if an event is lost.
 const defaultReconcileInterval = 30 * time.Second
 
 // sd_notify seam; swapped in tests to observe readiness signalling.
 var sdNotify = systemd.SdNotify
 
 type daemon struct {
+	diagSem           chan struct{}
 	cfg               *config.Config
 	log               *slog.Logger
 	met               *metrics.Registry
@@ -137,14 +137,39 @@ type daemon struct {
 
 	hist         *history.Store
 	queuedRefs   map[string]int
+	queuedAt     map[string]time.Time
+	retryMu      sync.Mutex
+	retryAfter   time.Time
+	retryDelay   time.Duration
 	queuedMu     sync.Mutex
 	numCPU       func() int
 	memAvailable func() (uint64, error)
 }
 
 func newDaemon(cfg *config.Config, log *slog.Logger, opts Options) (*daemon, error) {
+	return newDaemonContext(context.Background(), cfg, log, opts)
+}
+
+func newDaemonContext(ctx context.Context, cfg *config.Config, log *slog.Logger, opts Options) (*daemon, error) {
+	identity, err := runner.ResolveIdentity(runner.Spec{User: cfg.Runner.User, Group: cfg.Runner.Group})
+	if err != nil {
+		return nil, fmt.Errorf("runner identity: %w", err)
+	}
+	if cfg.Runtime.Backend == config.BackendSystemd && identity.UID == 0 {
+		return nil, errors.New("systemd jobs require a non-root runner user")
+	}
+
+	if cfg.Runtime.Backend == config.BackendSystemd && os.Geteuid() != 0 {
+		return nil, errors.New("systemd backend requires the privileged supervisor service")
+	}
+	if cfg.Runtime.Backend == config.BackendSystemd {
+		if err := systemd.CheckSupport(ctx); err != nil {
+			return nil, err
+		}
+	}
 	d := &daemon{
 		cfg:               cfg,
+		diagSem:           make(chan struct{}, 1),
 		log:               log,
 		met:               metrics.NewRegistry(),
 		desired:           &desiredCell{},
@@ -156,10 +181,17 @@ func newDaemon(cfg *config.Config, log *slog.Logger, opts Options) (*daemon, err
 		memAvailable:      procMemAvailable,
 	}
 
+	if opts.numCPU != nil {
+		d.numCPU = opts.numCPU
+	}
+	if opts.memAvailable != nil {
+		d.memAvailable = opts.memAvailable
+	}
+
 	// Runner payload: download + verify + extract template. An unset
 	// runner.version tracks the latest release: resolve the version and
-	// its asset digest from the releases API (plan §10).
-	pctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	// its asset digest from the releases API.
+	pctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 	runnerVersion, sha := cfg.Runner.Version, cfg.Runner.SHA256
 	if runnerVersion == "" {
@@ -262,18 +294,19 @@ func newDaemon(cfg *config.Config, log *slog.Logger, opts Options) (*daemon, err
 
 	// Slot table.
 	group := cfg.Runner.Group
-	if group == "" {
-		group = cfg.Runner.User
-	}
 	tableOpts := []slot.TableOption{
 		slot.WithAcquireGrace(cfg.Runtime.AcquireGrace),
+		slot.WithStartAllowed(func() bool { return d.acquireRetryWait() == 0 }),
 		slot.WithStopTimeout(cfg.Runtime.SlotStopTimeout),
 		slot.WithCleanupTimeout(cfg.Runtime.CleanupTimeout),
 		slot.WithStartTimeout(cfg.Runtime.SlotStartTimeout),
 		slot.WithWorkDir(cfg.Runner.WorkDirectory),
 		slot.WithStartObserver(func(dur time.Duration) { d.met.ObserveSlotStart(dur.Seconds()) }),
 		slot.WithLimits(fmt.Sprintf("%d%%", cfg.Capacity.JobCPUQuotaPercent), cfg.Capacity.JobMemoryMax),
-		slot.WithDiagHook(d.shipDiag),
+		slot.WithDiagContext(d.shipDiagContext),
+		slot.WithRunUser(cfg.Runner.User, group),
+		slot.WithEnvFile(cfg.Runner.EnvironmentFile),
+		slot.WithMaterializer(d.materializeSlotContext(pm)),
 		slot.WithEventHook(d.onSlotEvent),
 		slot.WithSampleInterval(cfg.Scaling.SampleInterval),
 	}
@@ -283,7 +316,7 @@ func newDaemon(cfg *config.Config, log *slog.Logger, opts Options) (*daemon, err
 		tableOpts = append(tableOpts, slot.WithUsageSampler(u.Usage))
 	}
 	if cfg.Scaling.AdmissionControl && d.hist != nil {
-		tableOpts = append(tableOpts, slot.WithGate(d.admissionGate))
+		tableOpts = append(tableOpts, slot.WithGate(d.admissionGate), slot.WithReservation(d.candidateEstimate))
 		tableOpts = append(tableOpts, slot.WithCompletionHook(func(c slot.Completion) {
 			err := d.hist.Append(history.Record{
 				Slot:             string(c.ID),
@@ -327,12 +360,12 @@ func newDaemon(cfg *config.Config, log *slog.Logger, opts Options) (*daemon, err
 }
 
 // buildEvents translates scale-set events into reconciler nudges, busy
-// marks, and metrics. Scaling is statistics-driven only (plan §8).
+// marks, and metrics. Scaling is statistics-driven only.
 func (d *daemon) buildEvents(requestReconcile func()) scaleset.Events {
 	return scaleset.Events{
 		SessionStarted: func() {
-			// Gate sd_notify READY on the first established session
-			// (plan §11); later reconnects do not re-signal.
+			// Gate sd_notify READY on the first established session;
+			// later reconnects do not re-signal.
 			d.sessionOnce.Do(func() { close(d.sessionUp) })
 		},
 		Desired: func(n int) {
@@ -389,79 +422,108 @@ func queueWait(job scaleset.Job) float64 {
 
 // noteQueued records workflow refs seen waiting in the scale-set queue
 // (JobAvailable messages). Best-effort hints for the admission gate.
+const maxQueuedRefs = 1024
+const queuedHintTTL = 10 * time.Minute
+
 func (d *daemon) noteQueued(refs []string) {
 	d.queuedMu.Lock()
-	for _, r := range refs {
-		if r != "" {
-			d.queuedRefs[r]++
-		}
-	}
-	d.queuedMu.Unlock()
-}
-
-// consumeQueuedRef removes one queued occurrence once a runner claims it.
-func (d *daemon) consumeQueuedRef(ref string) {
-	if ref == "" {
-		return
-	}
-	d.queuedMu.Lock()
-	if d.queuedRefs[ref] > 0 {
-		d.queuedRefs[ref]--
-	}
-	d.queuedMu.Unlock()
-}
-
-// candidateRef returns a workflow ref still waiting in the queue, for
-// per-ref admission estimates; "" when nothing is queued.
-func (d *daemon) candidateRef() string {
-	d.queuedMu.Lock()
 	defer d.queuedMu.Unlock()
-	for ref, n := range d.queuedRefs {
-		if n > 0 {
-			return ref
-		}
+	if d.queuedRefs == nil {
+		d.queuedRefs = make(map[string]int)
 	}
-	return ""
-}
-
-// admissionGate decides whether the host can take one more job. It
-// compares the predicted CPU rate (cores) and peak memory of all busy
-// slots plus the incoming job against the host budget from the scaling
-// config. Without history the gate stays inert, and an idle host always
-// admits its first job: holding starts with no workload data would
-// starve the warm pool forever.
-func (d *daemon) admissionGate(live []slot.Slot) bool {
-	if d.hist == nil {
-		return true
+	if d.queuedAt == nil {
+		d.queuedAt = make(map[string]time.Time)
 	}
-	budgetCores := float64(d.numCPU()) * float64(d.cfg.Scaling.CPUTargetPercent) / 100
-	var usedCores float64
-	var usedMem uint64
-	busy := 0
-	for _, s := range live {
-		if s.State != slot.StateBusy {
+	now := time.Now()
+	d.expireQueuedLocked(now)
+	for _, ref := range refs {
+		if ref == "" {
 			continue
 		}
-		busy++
-		if cores, ok := d.hist.PredictCores(s.WorkflowRef); ok {
-			usedCores += cores
+		if _, ok := d.queuedRefs[ref]; !ok && len(d.queuedRefs) >= maxQueuedRefs {
+			continue
 		}
-		if mem, ok := d.hist.PredictMem(s.WorkflowRef); ok {
-			usedMem += mem
+		d.queuedRefs[ref] = min(d.queuedRefs[ref]+1, 9999)
+		d.queuedAt[ref] = now
+	}
+}
+
+func (d *daemon) expireQueuedLocked(now time.Time) {
+	for ref, n := range d.queuedRefs {
+		at := d.queuedAt[ref]
+		if n <= 0 || (!at.IsZero() && now.Sub(at) > queuedHintTTL) {
+			delete(d.queuedRefs, ref)
+			delete(d.queuedAt, ref)
 		}
 	}
-	candidateRef := d.candidateRef()
-	candidateCores, okCores := d.hist.PredictCores(candidateRef)
-	candidateMem, okMem := d.hist.PredictMem(candidateRef)
-	if !okCores || !okMem {
+}
+
+func (d *daemon) consumeQueuedRef(ref string) {
+	d.queuedMu.Lock()
+	defer d.queuedMu.Unlock()
+	if d.queuedRefs[ref] <= 1 {
+		delete(d.queuedRefs, ref)
+		delete(d.queuedAt, ref)
+	} else {
+		d.queuedRefs[ref]--
+	}
+}
+
+// GitHub selects the job after launch. Reserve the largest queued estimate
+// in each dimension, falling back to history's global estimate when empty.
+func (d *daemon) candidateEstimate() (float64, uint64) {
+	if d.hist == nil {
+		return 0, 0
+	}
+	d.queuedMu.Lock()
+	d.expireQueuedLocked(time.Now())
+	refs := make([]string, 0, len(d.queuedRefs))
+	for ref := range d.queuedRefs {
+		refs = append(refs, ref)
+	}
+	d.queuedMu.Unlock()
+	if len(refs) == 0 {
+		refs = append(refs, "")
+	}
+	var cores float64
+	var mem uint64
+	for _, ref := range refs {
+		c, _ := d.hist.PredictCores(ref)
+		m, _ := d.hist.PredictMem(ref)
+		cores = max(cores, c)
+		mem = max(mem, m)
+	}
+	return cores, mem
+}
+
+// Every live runner reserves capacity, including those still registering
+// or waiting for assignment. MemAvailable already excludes resident memory;
+// charge only each runner's predicted remaining growth against it.
+func (d *daemon) admissionGate(live []slot.Slot) bool {
+	if d.hist == nil || len(live) == 0 {
 		return true
 	}
-	if busy == 0 {
-		return true
+	candidateCores, candidateMem := d.candidateEstimate()
+	usedCores, usedMem := candidateCores, candidateMem
+	for _, s := range live {
+		if !s.State.Live() {
+			continue
+		}
+		cores, mem := s.ReservedCores, s.ReservedMemBytes
+		if s.State == slot.StateBusy {
+			cores, _ = d.hist.PredictCores(s.WorkflowRef)
+			mem, _ = d.hist.PredictMem(s.WorkflowRef)
+		} else {
+			// New queue hints may be heavier than the estimate at provisioning.
+			cores = max(cores, candidateCores)
+			mem = max(mem, candidateMem)
+		}
+		usedCores += cores
+		if mem > s.CurrentMemBytes {
+			usedMem += mem - s.CurrentMemBytes
+		}
 	}
-	usedCores += candidateCores
-	usedMem += candidateMem
-	if usedCores > budgetCores {
+	if usedCores > float64(d.numCPU())*float64(d.cfg.Scaling.CPUTargetPercent)/100 {
 		return false
 	}
 	if avail, err := d.memAvailable(); err == nil {
@@ -498,18 +560,21 @@ func procMemAvailable() (uint64, error) {
 }
 
 // materializeSlot copies the payload template into a fresh slot dir. It
-// refuses to materialize when the state filesystem is nearly full (plan
-// §16); the slot_start histogram itself is timed by the Table around
-// the whole start, once per slot.
+// refuses to materialize when the state filesystem is nearly full.
+// The Table times the whole successful start for the slot_start histogram.
 func (d *daemon) materializeSlot(pm *payload.Manager) func(dst string) error {
-	return func(dst string) error {
-		// Disk watermark (plan §16): refuse new slots under 10% free on
-		// the state filesystem; the listener stays up so capacity can drop.
+	return func(dst string) error { return d.materializeSlotContext(pm)(context.Background(), dst) }
+}
+
+func (d *daemon) materializeSlotContext(pm *payload.Manager) func(context.Context, string) error {
+	return func(ctx context.Context, dst string) error {
+		// Refuse new slots under 10% free on the state filesystem.
+		// The listener stays up while local provisioning is held.
 		free, total, err := diskUsage(d.cfg.Paths.StateDir)
 		if err == nil && total > 0 && free*10 < total {
 			return fmt.Errorf("disk watermark: only %.1f%% free on %s", 100*float64(free)/float64(total), d.cfg.Paths.StateDir)
 		}
-		return pm.CopySlot(dst)
+		return pm.CopySlotIntoContext(ctx, dst)
 	}
 }
 
@@ -529,18 +594,36 @@ func (d *daemon) mintJIT(ctx context.Context, id slot.ID) (runner.JIT, error) {
 	return runner.JIT{Encoded: encoded, RunnerName: name}, nil
 }
 
-func (d *daemon) shipDiag(s slot.Slot) error {
+func (d *daemon) shipDiag(s slot.Slot) error { return d.shipDiagContext(context.Background(), s) }
+
+func (d *daemon) shipDiagContext(ctx context.Context, s slot.Slot) error {
 	if !d.cfg.Observability.ShipDiag {
 		return nil
 	}
-	dest, err := logship.ShipDiag(s.Dir, d.cfg.Paths.LogDir, s.RunnerName)
+	select {
+	case d.diagSem <- struct{}{}:
+		defer func() { <-d.diagSem }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	maxAge, maxBytes := d.cfg.Observability.DiagMaxAge, d.cfg.Observability.DiagMaxBytes
+	if maxAge == 0 {
+		maxAge = config.DefaultDiagMaxAge
+	}
+	if maxBytes == 0 {
+		maxBytes = config.DefaultDiagMaxBytes
+	}
+	if err := logship.Prune(ctx, d.cfg.Paths.LogDir, maxAge, maxBytes); err != nil {
+		return err
+	}
+	dest, err := logship.ShipDiagContext(ctx, s.Dir, d.cfg.Paths.LogDir, s.RunnerName)
 	if err != nil {
 		return err
 	}
 	if dest != "" {
 		d.log.Info("shipped runner diagnostics", "slot", s.ID, "dest", dest)
 	}
-	return nil
+	return logship.Prune(ctx, d.cfg.Paths.LogDir, maxAge, maxBytes)
 }
 
 func (d *daemon) onSlotEvent(event slot.Event, s slot.Slot) {
@@ -548,7 +631,9 @@ func (d *daemon) onSlotEvent(event slot.Event, s slot.Slot) {
 	case slot.EventAcquireFailure:
 		d.met.IncAcquireFailures()
 		d.log.Warn("slot acquire failure", "slot", s.ID, "runner_name", s.RunnerName)
-		d.requestReconcile()
+		d.recordAcquireFailure()
+	case slot.EventAdmissionHold:
+		d.met.IncAdmissionHolds()
 	case slot.EventStarted:
 		d.log.Info("slot started", "slot", s.ID, "runner_name", s.RunnerName, "unit", s.Unit)
 	case slot.EventExited:
@@ -575,7 +660,13 @@ func (d *daemon) run(ctx context.Context) error {
 			d.log.Error("metrics server failed", "err", err)
 		}
 	}()
-	defer d.httpSrv.Shutdown(context.WithoutCancel(ctx))
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := d.httpSrv.Shutdown(shutdownCtx); err != nil {
+			_ = d.httpSrv.Close()
+		}
+	}()
 
 	// Scale set must exist before we can listen or mint JITs.
 	if err := d.ss.EnsureScaleSet(ctx); err != nil {
@@ -583,14 +674,16 @@ func (d *daemon) run(ctx context.Context) error {
 	}
 	d.log.Info("scale set ready", "scale_set", d.cfg.ScaleSet.Name, "scale_set_id", d.ss.ScaleSetID())
 
-	// Boot adoption: reconcile leftover units and slot dirs (plan §13).
-	if units, err := d.backend.Active(ctx); err != nil {
-		d.log.Warn("cannot list active units; skipping boot adoption", "err", err)
-	} else if err := d.table.Adopt(ctx, units); err != nil {
-		d.log.Error("boot adoption failed", "err", err)
+	// Boot adoption: reconcile leftover units and slot dirs.
+	adoptCtx, adoptCancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer adoptCancel()
+	if units, err := d.backend.Active(adoptCtx); err != nil {
+		return fmt.Errorf("boot adoption: list active units: %w", err)
+	} else if err := d.table.Adopt(adoptCtx, units); err != nil {
+		return fmt.Errorf("boot adoption: %w", err)
 	}
 
-	// Listener supervisor with backoff (plan §8: 1s, 2s, 5s, 15s, 30s cap).
+	// Listener supervisor with backoff: 1s, 2s, 5s, 15s, 30s cap.
 	// Run blocks; it returns on error or ctx cancel and never deletes the
 	// scale set. Session close on graceful exit is the adapter's defer.
 	backoff := []time.Duration{time.Second, 2 * time.Second, 5 * time.Second, 15 * time.Second, 30 * time.Second}
@@ -616,8 +709,8 @@ func (d *daemon) run(ctx context.Context) error {
 		}
 	}()
 
-	// Type=notify readiness (plan §11): config validated, payload
-	// verified/extracted, scale set ensured, boot adoption done, AND the
+	// Type=notify readiness: config validated, payload prepared,
+	// scale set ensured, boot adoption done, AND the
 	// listener session started. No-op without NOTIFY_SOCKET; never
 	// signalled when the daemon shuts down before a session came up.
 	go func() {
@@ -655,13 +748,17 @@ func (d *daemon) run(ctx context.Context) error {
 	}()
 
 	// Reconcile loop; also drives the warm pool at boot (min_runners).
-	// The listener's desired pushes, slot exits (plan §9's local
-	// watcher), and the safety-net tick (plan §13's "retry next tick")
-	// all funnel through here. desired was seeded with min_runners in
-	// newDaemon, so the boot nudge starts the warm pool without racing
-	// the listener's first push.
+	// Desired pushes, local exit watchers, acquisition retry timers, and
+	// the safety-net tick all funnel through here. newDaemon seeded desired
+	// with min_runners, so the boot nudge starts the warm pool without
+	// racing the listener's first push.
 	d.requestReconcile()
 	tick := time.NewTicker(d.reconcileInterval)
+	retryTimer := time.NewTimer(time.Hour)
+	if !retryTimer.Stop() {
+		<-retryTimer.C
+	}
+	defer retryTimer.Stop()
 	defer tick.Stop()
 	for {
 		select {
@@ -673,6 +770,11 @@ func (d *daemon) run(ctx context.Context) error {
 			return nil
 		case <-d.reconCh:
 		case <-tick.C:
+		case <-retryTimer.C:
+		}
+		if delay := d.acquireRetryWait(); delay > 0 {
+			retryTimer.Reset(delay)
+			continue
 		}
 		n := d.desired.Load()
 		rctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
@@ -680,7 +782,29 @@ func (d *daemon) run(ctx context.Context) error {
 			d.log.Error("reconcile failed", "desired", n, "err", err)
 		}
 		cancel()
+		if delay := d.acquireRetryWait(); delay > 0 {
+			retryTimer.Reset(delay)
+		}
 	}
+}
+
+// Persistent failures back off from one second to thirty seconds. A
+// successful launch alone does not reset the delay: rapid unclaimed exits
+// are still acquisition failures. A sustained healthy interval resets it.
+func (d *daemon) recordAcquireFailure() {
+	d.retryMu.Lock()
+	defer d.retryMu.Unlock()
+	if d.retryDelay == 0 || time.Since(d.retryAfter) > 3*time.Minute {
+		d.retryDelay = time.Second
+	} else {
+		d.retryDelay = min(d.retryDelay*2, 30*time.Second)
+	}
+	d.retryAfter = time.Now().Add(d.retryDelay)
+}
+func (d *daemon) acquireRetryWait() time.Duration {
+	d.retryMu.Lock()
+	defer d.retryMu.Unlock()
+	return max(0, time.Until(d.retryAfter))
 }
 
 func (d *daemon) requestReconcile() {

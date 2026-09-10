@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"os/user"
+	"strconv"
 
 	"github.com/0xinterface/tentacles/internal/runner"
 )
@@ -56,9 +57,23 @@ for arg in "$@"; do
 	printf '%s\n' "$arg" >> "$FAKE_SYSTEMCTL_LOG"
 done
 case "$1" in
-	show)
-		printf 'CPUUsageNSec=%s\n' "${FAKE_SYSTEMCTL_CPU_NSEC:-0}"
+ show)
+  case "$*" in
+   *LoadState*)
+    if [ -n "$FAKE_SYSTEMCTL_COUNT_FILE" ]; then
+     n=0
+     [ -f "$FAKE_SYSTEMCTL_COUNT_FILE" ] && n=$(cat "$FAKE_SYSTEMCTL_COUNT_FILE")
+     n=$((n + 1)); printf '%s\n' "$n" > "$FAKE_SYSTEMCTL_COUNT_FILE"
+     if [ "$n" -lt "${FAKE_SYSTEMCTL_FLIP_AT:-2}" ]; then
+      printf 'LoadState=loaded\nActiveState=active\n'; exit 0
+     fi
+    fi
+    printf 'LoadState=loaded\nActiveState=%s\n' "${FAKE_SYSTEMCTL_STATE:-inactive}"
+    exit "${FAKE_SYSTEMCTL_EXIT:-0}";;
+  esac
+  printf 'CPUUsageNSec=%s\n' "${FAKE_SYSTEMCTL_CPU_NSEC:-0}"
 		printf 'MemoryPeak=%s\n' "${FAKE_SYSTEMCTL_MEM_PEAK:-0}"
+  printf 'MemoryCurrent=%s\n' "${FAKE_SYSTEMCTL_MEM_CURRENT:-0}"
 		exit "${FAKE_SYSTEMCTL_EXIT:-0}"
 		;;
 	wait)
@@ -125,15 +140,11 @@ func readLog(t *testing.T, path string) string {
 }
 
 func TestStartGoldenArgVector(t *testing.T) {
-	b, runLog, _ := newTestBackend(t)
+	b, _, _ := newTestBackend(t)
 	spec := sampleSpec()
-
-	if err := b.Start(context.Background(), spec); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-
 	want := []string{
 		"--collect",
+		"--expand-environment=no",
 		"--unit", "tentacle-0001.service",
 		"--description", "GitHub Actions runner slot",
 		"-p", "Type=exec",
@@ -141,6 +152,7 @@ func TestStartGoldenArgVector(t *testing.T) {
 		"-p", "Group=gha-runner",
 		"-p", "WorkingDirectory=/var/lib/tentacles/slots/0001",
 		"-p", "EnvironmentFile=/etc/tentacles/runner.env",
+		"-p", "LoadCredential=jit:/run/tentacles/0001.jit",
 		"-p", "CPUQuota=400%",
 		"-p", "MemoryMax=8G",
 		"-p", "Nice=5",
@@ -153,59 +165,86 @@ func TestStartGoldenArgVector(t *testing.T) {
 		"-p", "MemoryAccounting=yes",
 		"-p", "ProtectSystem=strict",
 		"-p", "ProtectHome=read-only",
-		"-p", "ReadWritePaths=/var/lib/tentacles/slots/0001:/tmp",
+		"-p", `ReadWritePaths="/var/lib/tentacles/slots/0001" "/tmp"`,
 		"-p", "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
 		"-p", "LockPersonality=yes",
-		"/bin/sh", "-c", runner.JITScript(spec.JITPath), "--", spec.JITPath,
+		"/bin/sh", "-c", `jit=$(cat "$CREDENTIALS_DIRECTORY/jit") || exit; exec ./run.sh --jitconfig "$jit"`,
 	}
 
-	if got := readLog(t, runLog); got != strings.Join(want, "\n")+"\n" {
+	if got := strings.Join(b.startArgs(spec), "\n") + "\n"; got != strings.Join(want, "\n")+"\n" {
 		t.Fatalf("Start argv mismatch\n--- got ---\n%s\n--- want ---\n%s", got, strings.Join(want, "\n"))
 	}
 }
 
-// TestStartAddsRunnerCacheDirs: plan §12 — shared caches (~/.cache,
-// mise, go/pkg/mod) must stay writable despite ProtectHome=read-only,
-// or jobs cannot use the host toolchain (acceptance criterion 8). The
-// cache dirs are created up front so they cannot appear as root-owned
-// systemd auto-creates.
+// testStartSpec provides a fresh slot and a private JIT file using the
+// current user's identity and an isolated HOME for cache creation.
+func testStartSpec(t *testing.T) runner.Spec {
+	t.Helper()
+	account, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account.Uid == "0" {
+		t.Skip("this recording test uses current nonroot identity; distinct-UID test covers root")
+	}
+	spec := sampleSpec()
+	spec.User = account.Username
+	spec.Group = strconv.Itoa(os.Getegid())
+	spec.SlotDir = t.TempDir()
+	spec.JITPath = filepath.Join(t.TempDir(), "source.jit")
+	if err := runner.WriteJIT(spec.JITPath, "secret"); err != nil {
+		t.Fatal(err)
+	}
+	spec.EnvFile = filepath.Join(t.TempDir(), "runner.env")
+	if err := os.WriteFile(spec.EnvFile, []byte("HOME="+t.TempDir()+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return spec
+}
+
 func TestStartAddsRunnerCacheDirs(t *testing.T) {
 	b, runLog, _ := newTestBackend(t)
+	spec := testStartSpec(t)
 	home := t.TempDir()
-	orig := lookupUser
-	lookupUser = func(string) (*user.User, error) {
-		return &user.User{Username: "gha-runner", HomeDir: home, Uid: "1234", Gid: "1234"}, nil
+	if err := os.WriteFile(spec.EnvFile, []byte("HOME="+home+"\n"), 0600); err != nil {
+		t.Fatal(err)
 	}
-	defer func() { lookupUser = orig }()
-
-	if err := b.Start(context.Background(), sampleSpec()); err != nil {
-		t.Fatalf("Start: %v", err)
+	if err := b.Start(context.Background(), spec); err != nil {
+		t.Fatal(err)
 	}
 	log := readLog(t, runLog)
-	want := "ReadWritePaths=/var/lib/tentacles/slots/0001:/tmp:" +
-		filepath.Join(home, ".cache") + ":" +
-		filepath.Join(home, ".local/share/mise") + ":" +
-		filepath.Join(home, "go/pkg/mod")
-	if !strings.Contains(log, want) {
-		t.Fatalf("argv missing %q\ngot:\n%s", want, log)
-	}
 	for _, sub := range runnerCacheSubdirs {
-		if fi, err := os.Stat(filepath.Join(home, sub)); err != nil || !fi.IsDir() {
-			t.Errorf("cache dir %s not created (stat err: %v)", sub, err)
+		path := filepath.Join(home, sub)
+		if !strings.Contains(log, strconv.Quote(path)) {
+			t.Errorf("cache path %q missing from args", path)
 		}
+		if fi, err := os.Stat(path); err != nil || !fi.IsDir() {
+			t.Errorf("cache dir %s not created: %v", sub, err)
+		}
+	}
+	source, err := os.Stat(spec.JITPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source.Mode().Perm() != 0600 {
+		t.Fatal("JIT source mode changed")
 	}
 }
 
 // TestUsageReadsAccounting: the usage sampler reads cumulative CPU time
 // and peak memory via systemctl show, feeding the per-workflow usage
-// history (plan §14 job accounting).
+// history.
 func TestUsageReadsAccounting(t *testing.T) {
 	b, _, _ := newTestBackend(t)
 	t.Setenv("FAKE_SYSTEMCTL_CPU_NSEC", "25000000000") // 25s
 	t.Setenv("FAKE_SYSTEMCTL_MEM_PEAK", "536870912")
+	t.Setenv("FAKE_SYSTEMCTL_MEM_CURRENT", "268435456")
 	u, err := b.Usage("tentacle-0001.service")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if u.CurrentMemBytes != 268435456 {
+		t.Fatalf("current mem = %v", u.CurrentMemBytes)
 	}
 	if u.CPUSeconds != 25 {
 		t.Fatalf("cpu seconds = %v, want 25", u.CPUSeconds)
@@ -226,28 +265,13 @@ func TestUsageErrorPropagates(t *testing.T) {
 	}
 }
 
-func TestStartSkipsEmptyProperties(t *testing.T) {
-	b, runLog, _ := newTestBackend(t)
-	spec := runner.Spec{
-		SlotDir:  "/var/lib/tentacles/slots/0002",
-		JITPath:  "/run/tentacles/0002.jit",
-		UnitName: "tentacle-0002.service",
-		// User, Group, EnvFile, CPUQuota, MemoryMax intentionally empty
-	}
-
-	if err := b.Start(context.Background(), spec); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-
-	log := readLog(t, runLog)
-	for _, absent := range []string{"User=", "Group=", "EnvironmentFile=", "CPUQuota=", "MemoryMax="} {
-		if strings.Contains(log, absent) {
-			t.Errorf("log contains %q, expected skipped", absent)
-		}
-	}
-	for _, present := range []string{"WorkingDirectory=/var/lib/tentacles/slots/0002", "TimeoutStopSec=30", "Type=exec"} {
-		if !strings.Contains(log, present) {
-			t.Errorf("log missing %q", present)
+func TestStartRequiresRunnerIdentity(t *testing.T) {
+	b, _, _ := newTestBackend(t)
+	for _, name := range []string{"", "root", "tentacles-user-does-not-exist"} {
+		spec := sampleSpec()
+		spec.User = name
+		if err := b.Start(context.Background(), spec); err == nil {
+			t.Errorf("accepted runner user %q", name)
 		}
 	}
 }
@@ -257,7 +281,7 @@ func TestStartErrorIncludesStderrTail(t *testing.T) {
 	t.Setenv("FAKE_SYSTEMD_RUN_EXIT", "1")
 	t.Setenv("FAKE_SYSTEMD_RUN_STDERR", "Failed to start transient service unit: Operation refused")
 
-	err := b.Start(context.Background(), sampleSpec())
+	err := b.Start(context.Background(), testStartSpec(t))
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -296,12 +320,12 @@ func TestWaitHappyPath(t *testing.T) {
 	if err := b.Wait(context.Background(), "tentacle-0001.service"); err != nil {
 		t.Fatalf("Wait: %v", err)
 	}
-	if want := "wait\ntentacle-0001.service\n"; readLog(t, ctlLog) != want {
+	if want := "show\ntentacle-0001.service\n--property=LoadState\n--property=ActiveState\n"; readLog(t, ctlLog) != want {
 		t.Fatalf("Wait argv = %q, want %q", readLog(t, ctlLog), want)
 	}
 }
 
-func TestWaitFallbackOnUnknownOperation(t *testing.T) {
+func TestWaitUsesStateObservation(t *testing.T) {
 	b, _, ctlLog := newTestBackend(t)
 	t.Setenv("FAKE_SYSTEMCTL_WAIT_FAIL", "1")
 	t.Setenv("FAKE_SYSTEMCTL_STATE", "inactive")
@@ -313,13 +337,13 @@ func TestWaitFallbackOnUnknownOperation(t *testing.T) {
 	}
 
 	log := readLog(t, ctlLog)
-	want := "wait\ntentacle-0001.service\nis-active\ntentacle-0001.service\n"
+	want := "show\ntentacle-0001.service\n--property=LoadState\n--property=ActiveState\n"
 	if log != want {
 		t.Fatalf("Wait fallback argv = %q, want %q", log, want)
 	}
 }
 
-func TestWaitFallbackPollingUntilGone(t *testing.T) {
+func TestWaitPollsUntilGone(t *testing.T) {
 	b, _, ctlLog := newTestBackend(t)
 	t.Setenv("FAKE_SYSTEMCTL_WAIT_FAIL", "1")
 	// First is-active poll reports active, the second flips to inactive:
@@ -334,12 +358,12 @@ func TestWaitFallbackPollingUntilGone(t *testing.T) {
 		t.Fatalf("Wait fallback: %v", err)
 	}
 	log := readLog(t, ctlLog)
-	if got, want := strings.Count(log, "is-active"), 2; got != want {
+	if got, want := strings.Count(log, "--property=ActiveState"), 2; got != want {
 		t.Fatalf("expected %d is-active polls, got %d:\n%s", want, got, log)
 	}
 }
 
-func TestWaitFallbackContextCancellation(t *testing.T) {
+func TestWaitContextCancellation(t *testing.T) {
 	b, _, _ := newTestBackend(t)
 	t.Setenv("FAKE_SYSTEMCTL_WAIT_FAIL", "1")
 	t.Setenv("FAKE_SYSTEMCTL_STATE", "active") // never goes inactive
@@ -356,8 +380,7 @@ func TestActiveParsesLegendOutput(t *testing.T) {
 	b, _, _ := newTestBackend(t)
 	t.Setenv("FAKE_SYSTEMCTL_LIST",
 		"tentacle-0001.service loaded active running GitHub Actions runner slot\n"+
-			"tentacle-0002.service loaded active running GitHub Actions runner slot\n"+
-			"not-a-slot loaded active running something else\n")
+			"tentacle-0002.service loaded active running GitHub Actions runner slot\n")
 
 	got, err := b.Active(context.Background())
 	if err != nil {

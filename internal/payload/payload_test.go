@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -488,5 +489,21 @@ func TestCopySlot(t *testing.T) {
 	}
 	if err := emptyEnv.m.CopySlot(emptySlot); err == nil {
 		t.Fatal("CopySlot without template: expected error, got nil")
+	}
+}
+
+func TestCopyTreeCancellation(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "slot")
+	if err := os.WriteFile(filepath.Join(src, "payload"), []byte("payload"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := copyTreeContext(ctx, src, dst); !errors.Is(err, context.Canceled) {
+		t.Fatalf("want cancellation, got %v", err)
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatalf("cancelled copy created destination: %v", err)
 	}
 }

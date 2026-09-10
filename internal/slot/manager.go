@@ -3,13 +3,16 @@ package slot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/0xinterface/tentacles/internal/cleanup"
@@ -30,23 +33,47 @@ const (
 
 // tableOptions holds the tunables for a Table.
 type tableOptions struct {
-	acquireGrace   time.Duration
-	stopTimeout    time.Duration
-	cleanupTimeout time.Duration
-	startTimeout   time.Duration
-	startObserver  func(time.Duration)
-	diagHook       func(Slot) error
-	eventHook      func(Event, Slot)
-	envFile        string
-	user           string
-	group          string
-	cpuQuota       string
-	memoryMax      string
-	workDir        string
-	usageSampler   func(unit string) (Usage, error)
-	sampleInterval time.Duration
-	gate           func(live []Slot) bool
-	completionHook func(Completion)
+	startAllowed       func() bool
+	reservation        func() (float64, uint64)
+	acquireGrace       time.Duration
+	stopTimeout        time.Duration
+	cleanupTimeout     time.Duration
+	startTimeout       time.Duration
+	startObserver      func(time.Duration)
+	diagHook           func(Slot) error
+	eventHook          func(Event, Slot)
+	envFile            string
+	user               string
+	group              string
+	cpuQuota           string
+	memoryMax          string
+	workDir            string
+	usageSampler       func(unit string) (Usage, error)
+	sampleInterval     time.Duration
+	gate               func(live []Slot) bool
+	completionHook     func(Completion)
+	materializeContext func(context.Context, string) error
+	diagContext        func(context.Context, Slot) error
+}
+
+// WithStartAllowed checks an acquisition pause before every new launch.
+func WithStartAllowed(fn func() bool) TableOption {
+	return func(o *tableOptions) { o.startAllowed = fn }
+}
+
+// WithReservation captures resource estimates before an unclaimed runner starts.
+func WithReservation(fn func() (float64, uint64)) TableOption {
+	return func(o *tableOptions) { o.reservation = fn }
+}
+
+// WithMaterializer supplies a cancellable copy into a directory reserved by the table.
+func WithMaterializer(fn func(context.Context, string) error) TableOption {
+	return func(o *tableOptions) { o.materializeContext = fn }
+}
+
+// WithDiagContext supplies a cancellable diagnostic hook for the complete cleanup deadline.
+func WithDiagContext(fn func(context.Context, Slot) error) TableOption {
+	return func(o *tableOptions) { o.diagContext = fn }
 }
 
 // defaultSampleInterval is how often live slot units are polled for
@@ -59,8 +86,8 @@ type TableOption func(*tableOptions)
 
 // WithAcquireGrace sets the window a freshly started runner has to claim
 // its first job. A process exit before the window closes without a job
-// is classified as an acquire failure (plan §13), and a slot still in
-// "starting" past the window may be stopped as surplus (plan §9). Idle
+// is classified as an acquire failure, and a slot still in
+// "starting" past the window may be stopped as surplus. Idle
 // slots are never reaped — idleness is the warm pool. Non-positive
 // values disable both uses. Default 3m.
 func WithAcquireGrace(d time.Duration) TableOption {
@@ -162,14 +189,19 @@ func WithCompletionHook(fn func(Completion)) TableOption {
 // usage attribution.
 type slotRec struct {
 	Slot
-	busySince    time.Time // set when the runner first claims a job; zero = never busy
-	provStart    time.Time // when provisioning began; drives starting-past-grace stops
-	claimed      bool      // a JobStarted was seen for this slot
-	queueWait    float64   // GitHub-reported queue wait at claim
-	claimAt      time.Time // local time of the claim
-	usageAtClaim Usage     // sampler reading at claim time
-	lastUsage    Usage     // most recent sampler reading
-	sampledOK    bool      // at least one sampler reading succeeded
+	busySince      time.Time // set when the runner first claims a job; zero = never busy
+	provStart      time.Time // when provisioning began; drives starting-past-grace stops
+	claimed        bool      // a JobStarted was seen for this slot
+	queueWait      float64   // GitHub-reported queue wait at claim
+	claimAt        time.Time // local time of the claim
+	usageAtClaim   Usage     // sampler reading at claim time
+	lastUsage      Usage     // most recent sampler reading
+	sampledOK      bool      // at least one sampler reading succeeded
+	cleaning       bool
+	cleanupPending bool
+	exitEvent      Event
+	completionSent bool
+	cleanDone      chan struct{}
 }
 
 // Table is the concrete Manager: it allocates slot IDs, materializes and
@@ -192,6 +224,7 @@ type Table struct {
 	slots   map[ID]*slotRec
 	desired int
 	closed  bool
+	ops     chan struct{}
 }
 
 // NewTable builds a slot table rooted at root (the directory that holds
@@ -231,6 +264,7 @@ func NewTable(root string, backend runner.Backend, materialize func(dst string) 
 		ctx:         ctx,
 		cancel:      cancel,
 		slots:       make(map[ID]*slotRec),
+		ops:         make(chan struct{}, 1),
 	}
 	if o.usageSampler != nil {
 		go t.sampleLoop()
@@ -269,8 +303,11 @@ func (t *Table) sampleLoop() {
 				continue // unit may have just exited; the last sample stands
 			}
 			t.mu.Lock()
-			tg.rec.lastUsage = u
-			tg.rec.sampledOK = true
+			if cur := t.slots[tg.rec.ID]; cur == tg.rec && !cur.cleaning && !cur.cleanupPending {
+				cur.lastUsage = u
+				cur.sampledOK = true
+				cur.CurrentMemBytes = u.CurrentMemBytes
+			}
 			t.mu.Unlock()
 		}
 	}
@@ -293,7 +330,7 @@ func (t *Table) SetDesired(n int) {
 }
 
 // WorkDir returns the absolute work-directory path for a slot ID (the
-// JIT work folder, plan §8). It is the single source of truth for the
+// JIT work folder). It is the single source of truth for the
 // configured work-directory name.
 func (t *Table) WorkDir(id ID) string {
 	return filepath.Join(t.root, string(id), t.opts.workDir)
@@ -332,6 +369,13 @@ func (t *Table) snapshotLocked(keep func(State) bool) []Slot {
 // no-op. Busy slots are never stopped. A failed start leaves desired
 // unsatisfied and is retried on the next tick.
 func (t *Table) Ensure(ctx context.Context, desired int) error {
+	select {
+	case t.ops <- struct{}{}:
+		defer func() { <-t.ops }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	t.retryCleanup(ctx)
 	for {
 		t.mu.Lock()
 		live := t.countLiveLocked()
@@ -348,8 +392,8 @@ func (t *Table) Ensure(ctx context.Context, desired int) error {
 			break
 		}
 	}
-	t.stopSurplus(desired)
-	return nil
+	t.stopSurplusContext(ctx, desired)
+	return ctx.Err()
 }
 
 func (t *Table) countLiveLocked() int {
@@ -366,6 +410,15 @@ func (t *Table) countLiveLocked() int {
 // ID, or "" if the start failed (already logged and emitted as an
 // "acquire_failure" event).
 func (t *Table) startOne(ctx context.Context) ID {
+	if t.opts.startAllowed != nil && !t.opts.startAllowed() {
+		return ""
+	}
+	// Gate before reserving the candidate: existing starting and idle slots
+	// are reservations too, but the candidate must only be charged once.
+	if t.opts.gate != nil && !t.opts.gate(t.Active()) {
+		t.emit(EventAdmissionHold, Slot{State: StateStarting})
+		return ""
+	}
 	t.mu.Lock()
 	if t.closed {
 		t.mu.Unlock()
@@ -378,87 +431,84 @@ func (t *Table) startOne(ctx context.Context) ID {
 		return ""
 	}
 	t0 := time.Now()
-	rec := &slotRec{Slot: Slot{
-		ID:    id,
-		Dir:   filepath.Join(t.root, string(id)),
-		Unit:  unitName(id),
-		State: StateStarting,
-	}, provStart: t0}
+	rec := &slotRec{Slot: Slot{ID: id, Dir: filepath.Join(t.root, string(id)), Unit: unitName(id), State: StateStarting}, provStart: t0}
+	if t.opts.reservation != nil {
+		rec.ReservedCores, rec.ReservedMemBytes = t.opts.reservation()
+	}
 	t.slots[id] = rec
 	t.mu.Unlock()
 
-	// Admission gate (backpressure, not failure): the host budget says
-	// this slot would overshoot predicted usage. Free the reserved ID
-	// and stop; Ensure breaks and the next reconcile tick retries.
-	if t.opts.gate != nil && !t.opts.gate(t.Active()) {
-		t.log.Info("slot start held by admission gate", "slot", id)
+	// Only a successful exclusive mkdir grants this attempt ownership of a
+	// directory. In particular, a surviving job's directory is never erased.
+	if err := os.Mkdir(rec.Dir, 0o755); err != nil {
 		t.mu.Lock()
 		delete(t.slots, id)
-		rec.State = StateFailed
 		snap := rec.Slot
 		t.mu.Unlock()
-		t.emit(EventAdmissionHold, snap)
+		t.log.Error("reserve slot directory", "slot", id, "err", err)
+		t.emit(EventAcquireFailure, snap)
 		return ""
 	}
-
-	// fail records the failure, frees the ID for retry, removes anything
-	// the failed attempt left behind (a partial materialization would
-	// wedge the ID: payload.CopySlot refuses an existing destination),
-	// and emits the acquire_failure event with a failed-state snapshot.
 	fail := func(err error) {
 		t.log.Warn("slot start failed", "slot", id, "err", err)
 		t.mu.Lock()
-		delete(t.slots, id)
-		rec.State = StateFailed
+		rec.State = StateStopping
 		snap := rec.Slot
 		t.mu.Unlock()
-		_ = os.RemoveAll(rec.Dir)
-		if rec.JITPath != "" {
-			_ = os.Remove(rec.JITPath)
-		}
 		t.emit(EventAcquireFailure, snap)
+		t.clean(ctx, rec)
 	}
-
-	if err := t.materialize(rec.Dir); err != nil {
+	startCtx, cancel := context.WithTimeout(ctx, t.opts.startTimeout)
+	defer cancel()
+	var err error
+	if t.opts.materializeContext != nil {
+		err = t.opts.materializeContext(startCtx, rec.Dir)
+	} else {
+		err = t.materialize(rec.Dir)
+	}
+	if err != nil {
 		fail(fmt.Errorf("materialize slot: %w", err))
 		return ""
 	}
-	jit, err := t.jit(ctx, id)
+	jit, err := t.jit(startCtx, id)
 	if err != nil {
 		fail(fmt.Errorf("mint JIT: %w", err))
 		return ""
 	}
+	t.mu.Lock()
 	rec.RunnerName = jit.RunnerName
 	rec.JITPath = filepath.Join(t.jitDir, string(id)+".jit")
-	if err := runner.WriteJIT(rec.JITPath, jit.Encoded); err != nil {
+	spec := runner.Spec{SlotDir: rec.Dir, JITPath: rec.JITPath, EnvFile: t.opts.envFile, User: t.opts.user, Group: t.opts.group, CPUQuota: t.opts.cpuQuota, MemoryMax: t.opts.memoryMax, UnitName: rec.Unit}
+	t.mu.Unlock()
+	if err := runner.WriteJIT(spec.JITPath, jit.Encoded); err != nil {
 		fail(fmt.Errorf("write JIT: %w", err))
 		return ""
 	}
-	spec := runner.Spec{
-		SlotDir:   rec.Dir,
-		JITPath:   rec.JITPath,
-		EnvFile:   t.opts.envFile,
-		User:      t.opts.user,
-		Group:     t.opts.group,
-		CPUQuota:  t.opts.cpuQuota,
-		MemoryMax: t.opts.memoryMax,
-		UnitName:  rec.Unit,
-	}
-	startCtx, cancel := context.WithTimeout(ctx, t.opts.startTimeout)
-	defer cancel()
 	if err := t.backend.Start(startCtx, spec); err != nil {
-		fail(fmt.Errorf("backend start: %w", err))
-		// The backend may have partially forked the process; stop it.
-		if serr := t.backend.Stop(context.Background(), rec.Unit); serr != nil {
-			t.log.Debug("best-effort stop after failed start", "slot", id, "err", serr)
+		if errors.Is(err, runner.ErrNotStarted) {
+			fail(err)
+			return ""
 		}
+		// A lost launch reply can race with a claim arriving at any time.
+		// Never compensate by stopping a runner whose execution is uncertain.
+		t.mu.Lock()
+		rec.State = StateBusy
+		snap := rec.Slot
+		t.mu.Unlock()
+		t.log.Warn("launch uncertain; retaining slot until confirmed exit", "slot", id, "err", err)
+		t.emit(EventAcquireFailure, snap)
+		go t.watch(rec)
 		return ""
 	}
 
+	t.mu.Lock()
 	rec.StartedAt = time.Now()
-	rec.State = StateIdle
+	if rec.State == StateStarting {
+		rec.State = StateIdle
+	}
 	snap := rec.Slot
-	t.log.Info("slot started", "slot", id, "unit", rec.Unit, "runner_name", rec.RunnerName)
+	t.mu.Unlock()
+	t.log.Info("slot started", "slot", id, "unit", spec.UnitName, "runner_name", snap.RunnerName)
 	t.emit(EventStarted, snap)
 	if t.opts.startObserver != nil {
 		t.opts.startObserver(time.Since(t0))
@@ -480,7 +530,9 @@ func (t *Table) nextIDLocked() (ID, bool) {
 
 // stopSurplus stops the oldest surplus slots, never busy ones. If the
 // only live slots are busy, nothing is stopped.
-func (t *Table) stopSurplus(desired int) {
+func (t *Table) stopSurplus(desired int) { t.stopSurplusContext(t.ctx, desired) }
+
+func (t *Table) stopSurplusContext(ctx context.Context, desired int) {
 	type candidate struct {
 		rec  *slotRec
 		snap Slot
@@ -495,7 +547,7 @@ func (t *Table) stopSurplus(desired int) {
 			case StateIdle:
 				// Eligible immediately.
 			case StateStarting:
-				// Plan §9: stop only slots "in idle or starting-past-grace".
+				// Starting slots become eligible only after acquire grace.
 				if t.opts.acquireGrace > 0 && time.Since(rec.provStart) <= t.opts.acquireGrace {
 					continue
 				}
@@ -522,19 +574,21 @@ func (t *Table) stopSurplus(desired int) {
 
 	for _, c := range candidates {
 		t.log.Info("stopping surplus slot", "slot", c.rec.ID)
-		stopCtx, cancel := context.WithTimeout(context.Background(), t.opts.stopTimeout)
+		stopCtx, cancel := context.WithTimeout(ctx, t.opts.stopTimeout)
 		err := t.backend.Stop(stopCtx, c.rec.Unit)
 		cancel()
 		if err != nil {
 			t.log.Warn("stop surplus slot failed", "slot", c.rec.ID, "err", err)
 			t.mu.Lock()
-			if cur, ok := t.slots[c.rec.ID]; ok && cur == c.rec && c.rec.State == StateStopping {
-				c.rec.State = StateIdle
+			if cur, ok := t.slots[c.rec.ID]; ok && cur == c.rec && c.rec.State == StateStopping && !cur.cleanupPending && !cur.cleaning {
+				c.rec.State = c.snap.State
 			}
 			t.mu.Unlock()
 			continue
 		}
 		t.emit(EventStopped, c.snap)
+		t.observeExitContext(ctx, c.rec.ID, c.rec, nil)
+		t.waitCleanup(ctx, c.rec)
 	}
 }
 
@@ -542,11 +596,28 @@ func (t *Table) stopSurplus(desired int) {
 // to ObserveExit for cleanup. On Table.Close the backend wait is
 // cancelled and the slot is left in place for boot adoption.
 func (t *Table) watch(rec *slotRec) {
-	err := t.backend.Wait(t.ctx, rec.Unit)
-	if t.ctx.Err() != nil {
-		return // Table closed; leave unit and dir for boot adoption.
+	delay := 100 * time.Millisecond
+	for {
+		err := t.backend.Wait(t.ctx, rec.Unit)
+		if t.ctx.Err() != nil {
+			return
+		}
+		if err == nil {
+			t.observeExit(rec.ID, rec, nil)
+			return
+		}
+		t.log.Warn("runner exit observation failed; retaining slot", "slot", rec.ID, "err", err)
+		timer := time.NewTimer(delay)
+		select {
+		case <-t.ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		if delay < 5*time.Second {
+			delay = min(delay*2, 5*time.Second)
+		}
 	}
-	t.ObserveExit(rec.ID, err)
 }
 
 // MarkBusy flags the slot as busy so scale-down will not stop it. Only
@@ -573,7 +644,7 @@ func (t *Table) Claim(job ClaimJob) bool {
 		if rec.RunnerName != job.RunnerName {
 			continue
 		}
-		if rec.State == StateStarting || rec.State == StateIdle {
+		if rec.State == StateStarting || rec.State == StateIdle || (rec.State == StateBusy && !rec.claimed) {
 			rec.State = StateBusy
 			rec.busySince = time.Now()
 			rec.WorkflowRef = job.WorkflowRef
@@ -591,10 +662,18 @@ func (t *Table) Claim(job ClaimJob) bool {
 // ObserveExit records a runner process exit and releases the slot: the
 // diag hook runs (best-effort), the JIT file and slot directory are
 // wiped, and the ID is freed for reuse.
-func (t *Table) ObserveExit(id ID, err error) {
+func (t *Table) ObserveExit(id ID, err error) { t.observeExit(id, nil, err) }
+
+func (t *Table) observeExit(id ID, expected *slotRec, err error) {
+	t.observeExitContext(t.ctx, id, expected, err)
+}
+
+func (t *Table) observeExitContext(ctx context.Context, id ID, expected *slotRec, err error) {
+	// This entry point is for confirmed process exits (including nonzero
+	// exit status). Transport errors are retried by watch, never sent here.
 	t.mu.Lock()
 	rec, ok := t.slots[id]
-	if !ok {
+	if !ok || (expected != nil && rec != expected) || rec.cleaning || rec.cleanupPending {
 		t.mu.Unlock()
 		return
 	}
@@ -604,56 +683,135 @@ func (t *Table) ObserveExit(id ID, err error) {
 		return
 	}
 	rec.State = StateStopping
+	rec.cleanupPending = true
+	rec.cleanDone = make(chan struct{})
+	if prev != StateStopping {
+		rec.exitEvent = EventExited
+		if t.quickNeverBusyExit(rec, prev) {
+			rec.exitEvent = EventAcquireFailure
+		}
+	}
+	// Acquisition failures start backoff immediately, even when cleanup
+	// fails or stalls. Clearing exitEvent prevents a second report on retry.
+	var acquisitionFailure *Slot
+	if rec.exitEvent == EventAcquireFailure {
+		snap := rec.Slot
+		acquisitionFailure = &snap
+		rec.exitEvent = ""
+	}
+	var completion *Completion
+	if rec.claimed && !rec.completionSent && t.opts.completionHook != nil {
+		rec.completionSent = true
+		c := Completion{ID: id, RunnerName: rec.RunnerName, WorkflowRef: rec.WorkflowRef, RunID: rec.RunID,
+			CPUSeconds: max(0, rec.lastUsage.CPUSeconds-rec.usageAtClaim.CPUSeconds), PeakMemBytes: rec.lastUsage.PeakMemBytes,
+			QueueWaitSeconds: rec.queueWait, Sampled: rec.sampledOK}
+		if !rec.claimAt.IsZero() {
+			c.WallSeconds = time.Since(rec.claimAt).Seconds()
+		}
+		completion = &c
+	}
+	t.mu.Unlock()
+	if acquisitionFailure != nil {
+		t.emit(EventAcquireFailure, *acquisitionFailure)
+	}
+	t.log.Info("slot exited", "slot", id, "prev_state", prev, "err", err)
+	if completion != nil {
+		t.opts.completionHook(*completion)
+	}
+	t.clean(ctx, rec)
+}
+
+// clean bounds caller latency without abandoning ownership of the path.
+// A timed-out worker continues to reserve its ID until all filesystem
+// operations have actually ended. Failures remain reserved for a later tick.
+func (t *Table) clean(parent context.Context, rec *slotRec) {
+	t.mu.Lock()
+	if t.slots[rec.ID] != rec || rec.cleaning {
+		t.mu.Unlock()
+		return
+	}
+	rec.cleaning = true
+	if rec.cleanDone == nil {
+		rec.cleanDone = make(chan struct{})
+	} else {
+		select {
+		case <-rec.cleanDone:
+			rec.cleanDone = make(chan struct{})
+		default:
+		}
+	}
+	rec.cleanupPending = true
 	snap := rec.Slot
 	t.mu.Unlock()
-
-	t.log.Info("slot exited", "slot", id, "prev_state", prev, "err", err)
-
-	// Per-job usage record for claimed slots: the input to the workflow
-	// usage history. CPU is the delta since the claim (the agent's
-	// registration cost is not the job's); peak memory is the unit peak.
-	if rec.claimed && t.opts.completionHook != nil {
-		cpu := rec.lastUsage.CPUSeconds - rec.usageAtClaim.CPUSeconds
-		if cpu < 0 {
-			cpu = 0
+	ctx, cancel := context.WithTimeout(parent, t.opts.cleanupTimeout)
+	done := rec.cleanDone
+	go func() {
+		defer func() { t.mu.Lock(); close(done); rec.cleaning = false; t.mu.Unlock() }()
+		defer cancel()
+		err := t.wipe(ctx, snap)
+		t.mu.Lock()
+		event := rec.exitEvent
+		if err == nil && t.slots[rec.ID] == rec {
+			delete(t.slots, rec.ID)
 		}
-		var wallSeconds float64
-		if !rec.claimAt.IsZero() {
-			wallSeconds = time.Since(rec.claimAt).Seconds()
+		t.mu.Unlock()
+		if err != nil {
+			t.log.Warn("slot cleanup retained for retry", "slot", snap.ID, "err", err)
+			return
 		}
-		t.opts.completionHook(Completion{
-			ID:               id,
-			RunnerName:       rec.RunnerName,
-			WorkflowRef:      rec.WorkflowRef,
-			RunID:            rec.RunID,
-			CPUSeconds:       cpu,
-			PeakMemBytes:     rec.lastUsage.PeakMemBytes,
-			WallSeconds:      wallSeconds,
-			QueueWaitSeconds: rec.queueWait,
-			Sampled:          rec.sampledOK,
-		})
+		if event != "" {
+			t.emit(event, snap)
+		}
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		select {
+		case <-done:
+			return
+		default:
+		}
+		t.log.Warn("slot cleanup deadline reached; retaining ID", "slot", snap.ID)
 	}
+}
 
-	t.wipe(id, rec.Dir)
-
+func (t *Table) waitCleanup(ctx context.Context, rec *slotRec) {
 	t.mu.Lock()
-	delete(t.slots, id)
+	done := rec.cleanDone
 	t.mu.Unlock()
+	if done == nil {
+		return
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, t.opts.cleanupTimeout)
+	defer cancel()
+	select {
+	case <-done:
+	case <-waitCtx.Done():
+	}
+}
 
-	// Teardowns we initiated are already reported as "stopped" or
-	// "acquire_failure". Natural exits are "exited", except a quick
-	// never-busy exit, which is an acquire failure (plan §13).
-	if prev != StateStopping {
-		if t.quickNeverBusyExit(rec, prev) {
-			t.emit(EventAcquireFailure, snap)
-		} else {
-			t.emit(EventExited, snap)
+func (t *Table) retryCleanup(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+	t.mu.Lock()
+	var pending []*slotRec
+	for _, rec := range t.slots {
+		if rec.cleanupPending && !rec.cleaning {
+			pending = append(pending, rec)
 		}
+	}
+	t.mu.Unlock()
+	for _, rec := range pending {
+		if ctx.Err() != nil {
+			return
+		}
+		t.clean(ctx, rec)
 	}
 }
 
 // quickNeverBusyExit reports whether an exit counts as an acquire
-// failure per plan §13: the process exited before any JobStarted and
+// failure: the process exited before any JobStarted and
 // before the acquire grace elapsed. Adopted slots that were running a
 // job count as busy (boot adoption is conservative).
 func (t *Table) quickNeverBusyExit(rec *slotRec, prev State) bool {
@@ -672,26 +830,36 @@ func (t *Table) quickNeverBusyExit(rec *slotRec, prev State) bool {
 
 // wipe runs the post-exit teardown for a slot: diag hook, JIT removal,
 // and directory removal, bounded by the cleanup timeout.
-func (t *Table) wipe(id ID, dir string) {
-	if t.opts.diagHook != nil {
-		snap := Slot{ID: id, Dir: dir, State: StateStopping}
-		if err := t.opts.diagHook(snap); err != nil {
-			t.log.Warn("slot diag hook failed", "slot", id, "err", err)
-		}
+func (t *Table) wipe(ctx context.Context, snap Slot) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	// Shred credential leftovers before the tree goes (plan §10).
-	if err := cleanup.ShredCredentials(dir); err != nil {
-		t.log.Warn("slot credential shred failed", "slot", id, "err", err)
+	var diagErr error
+	if t.opts.diagContext != nil {
+		diagErr = t.opts.diagContext(ctx, snap)
+	} else if t.opts.diagHook != nil {
+		diagErr = t.opts.diagHook(snap)
+	}
+	if diagErr != nil {
+		t.log.Warn("slot diag hook failed", "slot", snap.ID, "err", diagErr)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := cleanup.ShredCredentials(snap.Dir); err != nil {
+		t.log.Warn("credential unlink failed; removing complete slot tree", "slot", snap.ID, "err", err)
 	}
 	if t.jitDir != "" {
-		jitPath := filepath.Join(t.jitDir, string(id)+".jit")
-		if err := os.Remove(jitPath); err != nil && !os.IsNotExist(err) {
-			t.log.Warn("slot JIT removal failed", "slot", id, "err", err)
+		if err := os.Remove(filepath.Join(t.jitDir, string(snap.ID)+".jit")); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
 		}
 	}
-	if err := removeAllBounded(dir, t.opts.cleanupTimeout); err != nil {
-		t.log.Warn("slot cleanup failed", "slot", id, "err", err)
+	if err := ctx.Err(); err != nil {
+		return err
 	}
+	// RemoveAll does not follow symlinks. Even if a filesystem syscall
+	// stalls past the deadline, clean keeps this slot reserved until return.
+	return os.RemoveAll(snap.Dir)
 }
 
 // Adopt reconciles the table with pre-existing state at boot, given the
@@ -709,6 +877,9 @@ func (t *Table) Adopt(ctx context.Context, units []string) error {
 
 	running := make(map[string]bool, len(units))
 	for _, u := range units {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		running[u] = true
 	}
 
@@ -717,7 +888,13 @@ func (t *Table) Adopt(ctx context.Context, units []string) error {
 		return fmt.Errorf("adopt: list slot dirs: %w", err)
 	}
 	for _, e := range entries {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if !e.IsDir() {
+			if validID(ID(e.Name())) {
+				return fmt.Errorf("adopt: slot %s is not a directory", e.Name())
+			}
 			continue
 		}
 		id := ID(e.Name())
@@ -749,10 +926,17 @@ func (t *Table) Adopt(ctx context.Context, units []string) error {
 			continue
 		}
 		t.log.Warn("wiping orphan slot directory", "slot", id)
-		t.wipe(id, dir)
+		rec := &slotRec{Slot: Slot{ID: id, Dir: dir, Unit: unitName(id), RunnerName: readRunnerName(dir), State: StateStopping}}
+		t.mu.Lock()
+		t.slots[id] = rec
+		t.mu.Unlock()
+		t.clean(ctx, rec)
 	}
 
 	for _, u := range units {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		id, ok := idFromUnit(u)
 		if !ok {
 			continue
@@ -764,14 +948,21 @@ func (t *Table) Adopt(ctx context.Context, units []string) error {
 			continue
 		}
 		dir := filepath.Join(t.root, string(id))
-		if _, err := os.Stat(dir); os.IsNotExist(err) {
+		info, err := os.Lstat(dir)
+		if err == nil && !info.IsDir() {
+			return fmt.Errorf("adopt: unit %s has invalid slot directory", u)
+		}
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("adopt: inspect slot for %s: %w", u, err)
+		}
+		if os.IsNotExist(err) {
 			t.log.Warn("stopping unit without slot directory", "unit", u)
 			if err := t.backend.Stop(ctx, u); err != nil {
-				t.log.Warn("stop unitless slot failed", "unit", u, "err", err)
+				return fmt.Errorf("adopt: stop unit %s without slot directory: %w", u, err)
 			}
 		}
 	}
-	return nil
+	return ctx.Err()
 }
 
 // Close cancels the watcher goroutines. Running units and slot
@@ -837,7 +1028,19 @@ func validID(id ID) bool {
 // still be correlated with JobStarted messages. Any parse failure
 // yields "" (the pre-adoption behavior).
 func readRunnerName(dir string) string {
-	b, err := os.ReadFile(filepath.Join(dir, ".runner"))
+	f, err := os.OpenFile(filepath.Join(dir, ".runner"), os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 1<<20 {
+		return ""
+	}
+	if st, ok := info.Sys().(*syscall.Stat_t); !ok || st.Nlink != 1 {
+		return ""
+	}
+	b, err := io.ReadAll(io.LimitReader(f, 1<<20))
 	if err != nil {
 		return ""
 	}
@@ -848,18 +1051,4 @@ func readRunnerName(dir string) string {
 		return ""
 	}
 	return cfg.AgentName
-}
-
-// removeAllBounded removes dir, giving up after timeout. If the removal
-// hangs past the deadline the caller gets a timeout error (the runaway
-// removal goroutine is abandoned, not waited on).
-func removeAllBounded(dir string, timeout time.Duration) error {
-	done := make(chan error, 1)
-	go func() { done <- os.RemoveAll(dir) }()
-	select {
-	case err := <-done:
-		return err
-	case <-time.After(timeout):
-		return fmt.Errorf("removing %s exceeded %v", dir, timeout)
-	}
 }
