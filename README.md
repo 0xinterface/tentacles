@@ -413,7 +413,10 @@ Debugging recipes:
   archive of that run, and `journalctl -u tentacles --since -1h`.
 - Warm pool missing: check `tentacles_actual_runners{state="idle"}`,
   then the acquire-failure counter. A high failure rate usually means a
-  bad `runner.env` or a blocked egress path.
+  bad `runner.env` or a blocked egress path. If neither fires, check
+  `tentacles_admission_holds_total`: with admission control on, a busy
+  heavy job holds new starts until it exits — that is backpressure, not
+  a fault.
 - Suspected leak: `systemctl list-units 'tentacle-*'` and
   `ls /var/lib/tentacles/slots/`. Boot adoption reconciles any
   mismatch on the next restart; a running daemon reconciles via
