@@ -43,17 +43,56 @@ const (
 	// EventAcquireFailure fires when a slot start fails, or a runner
 	// exits before claiming a job within the acquire grace (plan §13).
 	EventAcquireFailure Event = "acquire_failure"
+	// EventAdmissionHold fires when the admission gate declines a new
+	// slot because predicted usage exceeds the host budget. It is
+	// backpressure, not a failure: the start is retried on a later tick.
+	EventAdmissionHold Event = "admission_hold"
 )
+
+// Usage is one sample of a slot unit's resource accounting.
+type Usage struct {
+	CPUSeconds   float64 // cumulative CPU time since unit start
+	PeakMemBytes uint64  // peak memory of the unit
+}
+
+// ClaimJob is the workflow identity of the job a runner just claimed
+// (from the JobStarted scale-set message).
+type ClaimJob struct {
+	RunnerName       string
+	WorkflowRef      string // owner/repo/.github/workflows/x.yml@ref
+	RunID            int64
+	QueueWaitSeconds float64 // GitHub-reported queue time, 0 when unknown
+}
+
+// Completion is the usage record of one finished job: the identity it
+// was claimed with plus the measured resource consumption of its slot
+// unit. It is the input to the per-workflow usage history.
+type Completion struct {
+	ID               ID
+	RunnerName       string
+	WorkflowRef      string
+	RunID            int64
+	Result           string // empty: the result may arrive after exit
+	CPUSeconds       float64
+	PeakMemBytes     uint64
+	WallSeconds      float64
+	QueueWaitSeconds float64
+	// Sampled reports whether the backend supplied resource accounting.
+	// CPU and memory are zero-values when false.
+	Sampled bool
+}
 
 // Slot is one runner position on the host.
 type Slot struct {
-	ID         ID
-	Dir        string
-	Unit       string // backend unit/process name, e.g. tentacle-0001.service
-	RunnerName string // name registered with GitHub (JIT runner name)
-	State      State
-	StartedAt  time.Time
-	JITPath    string
+	ID          ID
+	Dir         string
+	Unit        string // backend unit/process name, e.g. tentacle-0001.service
+	RunnerName  string // name registered with GitHub (JIT runner name)
+	WorkflowRef string // workflow the current job belongs to, set on claim
+	RunID       int64
+	State       State
+	StartedAt   time.Time
+	JITPath     string
 }
 
 // Manager owns the slot table. The reconciler is the only writer; the

@@ -483,7 +483,10 @@ func TestTableGraceDoesNotKillBusySlot(t *testing.T) {
 	}
 }
 
-func TestTableMarkBusyByRunner(t *testing.T) {
+// TestTableClaimStoresRef: a claimed slot (JobStarted) records the
+// workflow identity so usage at exit can be attributed, and reports
+// false for runners we do not track.
+func TestTableClaimStoresRef(t *testing.T) {
 	backend := &fakeBackend{}
 	tab, _, _ := newTestTable(t, backend)
 	ctx := context.Background()
@@ -491,24 +494,170 @@ func TestTableMarkBusyByRunner(t *testing.T) {
 	if err := tab.Ensure(ctx, 1); err != nil {
 		t.Fatal(err)
 	}
-	if !tab.MarkBusyByRunner("debian-host-0001-ab12") {
-		t.Fatal("MarkBusyByRunner did not find the slot")
+	if !tab.Claim(ClaimJob{
+		RunnerName:       "debian-host-0001-ab12",
+		WorkflowRef:      "o/r/.github/workflows/ci.yml@main",
+		RunID:            42,
+		QueueWaitSeconds: 3.5,
+	}) {
+		t.Fatal("Claim did not find the slot")
 	}
-	if tab.MarkBusyByRunner("debian-host-9999-zz99") {
-		t.Fatal("MarkBusyByRunner matched a nonexistent runner")
+	if tab.Claim(ClaimJob{RunnerName: "debian-host-9999-zz99"}) {
+		t.Fatal("Claim matched a nonexistent runner")
+	}
+	snap := tab.Snapshot()
+	if len(snap) != 1 || snap[0].WorkflowRef != "o/r/.github/workflows/ci.yml@main" || snap[0].RunID != 42 {
+		t.Fatalf("slot after claim = %+v", snap)
 	}
 	if st, ok := stateOf(tab, "0001"); !ok || st != StateBusy {
-		t.Fatalf("slot 0001 state = %q, ok=%v; want busy", st, ok)
+		t.Fatalf("slot 0001 state = %q ok=%v; want busy", st, ok)
 	}
-	if err := tab.Ensure(ctx, 0); err != nil {
+}
+
+// TestTableCompletionRecord: at exit, a claimed slot reports a
+// Completion with the workflow identity, wall time, and queue wait.
+func TestTableCompletionRecord(t *testing.T) {
+	backend := &fakeBackend{}
+	var mu sync.Mutex
+	var done []Completion
+	tab, _, _ := newTestTable(t, backend, WithCompletionHook(func(c Completion) {
+		mu.Lock()
+		done = append(done, c)
+		mu.Unlock()
+	}), WithSampleInterval(5*time.Millisecond))
+	if err := tab.Ensure(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(50 * time.Millisecond)
-	backend.mu.Lock()
-	nStopped := len(backend.stopped)
-	backend.mu.Unlock()
-	if nStopped != 0 {
-		t.Fatalf("busy slot stopped by scale-down: %v", backend.stopped)
+	if !tab.Claim(ClaimJob{
+		RunnerName:       "debian-host-0001-ab12",
+		WorkflowRef:      "o/r/w.yml@main",
+		RunID:            7,
+		QueueWaitSeconds: 2,
+	}) {
+		t.Fatal("Claim failed")
+	}
+	time.Sleep(30 * time.Millisecond)
+	backend.exit("tentacle-0001.service")
+	eventually(t, 3*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(done) == 1
+	})
+	mu.Lock()
+	c := done[0]
+	if c.ID != "0001" || c.WorkflowRef != "o/r/w.yml@main" || c.RunID != 7 {
+		t.Fatalf("completion = %+v", c)
+	}
+	if c.WallSeconds <= 0 || c.QueueWaitSeconds != 2 {
+		t.Fatalf("completion timings = %+v", c)
+	}
+	mu.Unlock()
+
+	// An unclaimed slot produces no completion record: acquire-failure
+	// accounting already covers it. The retried start reuses ID 0001.
+	if err := tab.Ensure(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	n := len(done)
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("completions = %d, want still 1", n)
+	}
+	backend.exit("tentacle-0001.service")
+	time.Sleep(100 * time.Millisecond)
+	mu.Lock()
+	n = len(done)
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("unclaimed exit produced a completion record (%d)", n)
+	}
+}
+
+// TestTableUsageDelta: the CPU seconds on a completion record are the
+// delta between exit and claim (the agent's registration CPU is not the
+// job's), sampled by the injected sampler.
+func TestTableUsageDelta(t *testing.T) {
+	backend := &fakeBackend{}
+	cpu := 10.0 // the agent already burned 10s registering (fake)
+	var mu sync.Mutex
+	sampler := func(unit string) (Usage, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return Usage{CPUSeconds: cpu, PeakMemBytes: 1 << 28}, nil
+	}
+	var done []Completion
+	var dmu sync.Mutex
+	tab, _, _ := newTestTable(t, backend,
+		WithUsageSampler(sampler),
+		WithSampleInterval(5*time.Millisecond),
+		WithCompletionHook(func(c Completion) {
+			dmu.Lock()
+			done = append(done, c)
+			dmu.Unlock()
+		}))
+	if err := tab.Ensure(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	// Let the sampler establish the pre-claim reading (the fake agent's
+	// 10s of registration CPU).
+	time.Sleep(20 * time.Millisecond)
+	if !tab.Claim(ClaimJob{RunnerName: "debian-host-0001-ab12", WorkflowRef: "o/r/w.yml@main"}) {
+		t.Fatal("Claim failed")
+	}
+	mu.Lock()
+	cpu += 25 // the job burns 25s
+	mu.Unlock()
+	time.Sleep(30 * time.Millisecond)
+	backend.exit("tentacle-0001.service")
+	eventually(t, 3*time.Second, func() bool {
+		dmu.Lock()
+		defer dmu.Unlock()
+		return len(done) == 1
+	})
+	dmu.Lock()
+	c := done[0]
+	dmu.Unlock()
+	if !c.Sampled {
+		t.Fatalf("completion not sampled: %+v", c)
+	}
+	if c.CPUSeconds < 20 || c.CPUSeconds > 26 {
+		t.Fatalf("cpu seconds = %v, want ~25 (exit minus claim)", c.CPUSeconds)
+	}
+	if c.PeakMemBytes != 1<<28 {
+		t.Fatalf("peak mem = %v", c.PeakMemBytes)
+	}
+}
+
+// TestTableGateHolds: when the gate refuses, no slot is started, the
+// refusal is not an acquire failure, and a later reconcile retries.
+func TestTableGateHolds(t *testing.T) {
+	backend := &fakeBackend{}
+	admit := false
+	rec := &eventRecorder{}
+	tab, _, _ := newTestTable(t, backend, WithGate(func([]Slot) bool {
+		return admit
+	}), WithEventHook(rec.hook))
+	if err := tab.Ensure(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(tab.Active()) != 0 {
+		t.Fatalf("gate refused but a slot started: %v", slotIDs(tab.Active()))
+	}
+	if rec.has(EventAcquireFailure) {
+		t.Fatalf("admission hold reported as acquire failure: %v", rec.events)
+	}
+	if !rec.has(EventAdmissionHold) {
+		t.Fatalf("expected admission_hold event, got %v", rec.events)
+	}
+
+	// Budget frees up: the next reconcile starts the slot.
+	admit = true
+	if err := tab.Ensure(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if got := slotIDs(tab.Active()); fmt.Sprint(got) != fmt.Sprint([]ID{"0001"}) {
+		t.Fatalf("active after gate opens = %v, want [0001]", got)
 	}
 }
 
@@ -837,7 +986,7 @@ func TestTableAdoptReadsRunnerName(t *testing.T) {
 	if len(got) != 1 || got[0].RunnerName != "debian-host-0001-ab12" {
 		t.Fatalf("adopted slot = %+v, want runner name debian-host-0001-ab12", got)
 	}
-	if !tab.MarkBusyByRunner("debian-host-0001-ab12") {
+	if !tab.Claim(ClaimJob{RunnerName: "debian-host-0001-ab12", WorkflowRef: "o/r/w.yml@main"}) {
 		t.Fatal("adopted runner name does not correlate with JobStarted")
 	}
 }

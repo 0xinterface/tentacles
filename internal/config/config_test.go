@@ -539,3 +539,74 @@ func TestValidateRejectsMalformedEnvFile(t *testing.T) {
 		t.Fatal("Validate: expected error for malformed env file")
 	}
 }
+
+// TestLoadScalingDefaults: the scaling section is optional; omitted
+// fields fall back to the admission-gate defaults and an explicit
+// admission_control: false wins over the default true.
+func TestLoadScalingDefaults(t *testing.T) {
+	t.Setenv("TENTACLES_ALLOW_UNVERIFIED_PAYLOAD", "1")
+	base := writeConfig(t, `
+github:
+  app:
+    client_id: Iv1.test
+    installation_id: 1
+    private_key_path: /nope.pem
+  scope:
+    kind: organization
+    owner: o
+scale_set:
+  name: label
+capacity:
+  max_runners: 1
+  job_cpu_quota_percent: 100
+  job_memory_max: 1G
+runner:
+  version: ""
+  environment_file: /nope.env
+`)
+	c, err := Load(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Scaling.AdmissionControl {
+		t.Error("admission_control default = false, want true")
+	}
+	if c.Scaling.CPUTargetPercent != DefaultCPUTargetPercent {
+		t.Errorf("cpu target = %d, want %d", c.Scaling.CPUTargetPercent, DefaultCPUTargetPercent)
+	}
+	if c.Scaling.MemoryMarginPercent != DefaultMemoryMarginPercent {
+		t.Errorf("memory margin = %d, want %d", c.Scaling.MemoryMarginPercent, DefaultMemoryMarginPercent)
+	}
+	if c.Scaling.SampleInterval != DefaultSampleInterval {
+		t.Errorf("sample interval = %s, want %s", c.Scaling.SampleInterval, DefaultSampleInterval)
+	}
+
+	override := writeConfig(t, `
+github:
+  app:
+    client_id: Iv1.test
+    installation_id: 1
+    private_key_path: /nope.pem
+  scope:
+    kind: organization
+    owner: o
+scale_set:
+  name: label
+capacity:
+  max_runners: 1
+  job_cpu_quota_percent: 100
+  job_memory_max: 1G
+runner:
+  version: ""
+  environment_file: /nope.env
+scaling:
+  admission_control: false
+`)
+	c2, err := Load(override)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.Scaling.AdmissionControl {
+		t.Error("explicit admission_control: false was overridden by the default")
+	}
+}

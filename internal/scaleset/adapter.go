@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
@@ -56,16 +57,36 @@ type Events struct {
 	SessionStarted func()
 	// Desired is called with the clamped desired runner count.
 	Desired func(n int)
-	// JobStart is called when a runner claims a job.
-	JobStart func(runnerName string)
+	// JobStart is called when a runner claims a job, with the job's
+	// identity and GitHub-reported timeline (plan §8: correlate
+	// runnerName with a slot).
+	JobStart func(Job)
 	// JobEnd is called when a job finishes on a runner.
-	JobEnd func(runnerName, result string)
+	JobEnd func(Job)
+	// Queued is called with the workflow refs of jobs seen waiting in
+	// the scale-set queue (JobAvailable messages). Best-effort: messages
+	// can truncate, so absence of a ref does not mean the job is gone.
+	Queued func(refs []string)
 	// MessageID is called with the ID of every message fetched from the
 	// scale-set queue (the tentacles_last_message_id metric, plan §14).
 	MessageID func(id int64)
 	// Session is called on every listener/session stop with the reason
 	// (nil on graceful context cancellation).
 	Session func(err error)
+}
+
+// Job is one workflow job as GitHub reports it in the scale-set
+// message stream. Zero timestamps mean the message carried none.
+type Job struct {
+	RunnerName       string
+	JobID            string
+	WorkflowRef      string // owner/repo/.github/workflows/x.yml@ref
+	WorkflowRunID    int64
+	EventName        string
+	QueueTime        time.Time
+	RunnerAssignTime time.Time
+	FinishTime       time.Time // completion only
+	Result           string    // completion only
 }
 
 // Adapter wraps the upstream scale-set client and listener loop. Create it
@@ -203,9 +224,9 @@ func (a *Adapter) Run(ctx context.Context) error {
 	if a.ev.SessionStarted != nil {
 		a.ev.SessionStarted()
 	}
-	// Observe fetched message IDs for the last_message_id metric without
-	// changing the official listener loop.
-	sessionClient = &watchedClient{Client: sessionClient, onMessage: a.ev.MessageID}
+	// Observe fetched messages (IDs for the metric, queued refs as
+	// admission hints) without changing the official listener loop.
+	sessionClient = &watchedClient{Client: sessionClient, onMessage: a.observeMessage}
 
 	var retErr error
 	defer func() {
@@ -287,13 +308,15 @@ func (a *Adapter) HandleDesiredRunnerCount(ctx context.Context, count int) (int,
 	return d, nil
 }
 
-// HandleJobStarted implements listener.Scaler.
+// HandleJobStarted implements listener.Scaler. It forwards the job's
+// identity and timeline so the daemon can attribute resource usage to a
+// workflow (plan §8: use lifecycle messages to correlate runnerName).
 func (a *Adapter) HandleJobStarted(ctx context.Context, jobInfo *scaleset.JobStarted) error {
 	if jobInfo == nil {
 		return errors.New("scaleset: nil JobStarted message")
 	}
 	if a.ev.JobStart != nil {
-		a.ev.JobStart(jobInfo.RunnerName)
+		a.ev.JobStart(job(jobInfo.JobMessageBase, jobInfo.RunnerName, ""))
 	}
 	return nil
 }
@@ -304,9 +327,45 @@ func (a *Adapter) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobC
 		return errors.New("scaleset: nil JobCompleted message")
 	}
 	if a.ev.JobEnd != nil {
-		a.ev.JobEnd(jobInfo.RunnerName, jobInfo.Result)
+		a.ev.JobEnd(job(jobInfo.JobMessageBase, jobInfo.RunnerName, jobInfo.Result))
 	}
 	return nil
+}
+
+// job maps an upstream job message onto the local Job view.
+func job(base scaleset.JobMessageBase, runnerName, result string) Job {
+	return Job{
+		RunnerName:       runnerName,
+		JobID:            base.JobID,
+		WorkflowRef:      base.JobWorkflowRef,
+		WorkflowRunID:    base.WorkflowRunID,
+		EventName:        base.EventName,
+		QueueTime:        base.QueueTime,
+		RunnerAssignTime: base.RunnerAssignTime,
+		FinishTime:       base.FinishTime,
+		Result:           result,
+	}
+}
+
+// observeMessage reports one fetched queue message to the event surface:
+// its ID for the metric, and the workflow refs of jobs still waiting in
+// the queue (admission hints).
+func (a *Adapter) observeMessage(msg *scaleset.RunnerScaleSetMessage) {
+	if a.ev.MessageID != nil {
+		a.ev.MessageID(int64(msg.MessageID))
+	}
+	if a.ev.Queued == nil || len(msg.JobAvailableMessages) == 0 {
+		return
+	}
+	refs := make([]string, 0, len(msg.JobAvailableMessages))
+	for _, ja := range msg.JobAvailableMessages {
+		if ja != nil && ja.JobWorkflowRef != "" {
+			refs = append(refs, ja.JobWorkflowRef)
+		}
+	}
+	if len(refs) > 0 {
+		a.ev.Queued(refs)
+	}
 }
 
 // logger returns the adapter logger, defaulting to the process logger.
@@ -323,13 +382,13 @@ func (a *Adapter) logger() *slog.Logger {
 // the underlying session delete.
 type watchedClient struct {
 	listener.Client
-	onMessage func(id int64)
+	onMessage func(*scaleset.RunnerScaleSetMessage)
 }
 
 func (w *watchedClient) GetMessage(ctx context.Context, lastMessageID, maxCapacity int) (*scaleset.RunnerScaleSetMessage, error) {
 	msg, err := w.Client.GetMessage(ctx, lastMessageID, maxCapacity)
 	if err == nil && msg != nil && w.onMessage != nil {
-		w.onMessage(int64(msg.MessageID))
+		w.onMessage(msg)
 	}
 	return msg, err
 }

@@ -50,9 +50,11 @@ func Load(path string) (*Config, error) {
 		applyDefaults(&c,
 			mappingHasPath(root.Content[0], "runner", "disable_update"),
 			mappingHasPath(root.Content[0], "observability", "ship_diag"),
+			mappingHasPath(root.Content[0], "scaling", "admission_control"),
+			mappingHasPath(root.Content[0], "scaling", "memory_margin_percent"),
 		)
 	} else {
-		applyDefaults(&c, false, false)
+		applyDefaults(&c, false, false, false, false)
 	}
 	return &c, nil
 }
@@ -60,7 +62,7 @@ func Load(path string) (*Config, error) {
 // applyDefaults fills every omitted field with its plan-§6 default.
 // disableUpdateSet and shipDiagSet report whether the operator wrote the
 // key explicitly (so an explicit false survives).
-func applyDefaults(c *Config, disableUpdateSet, shipDiagSet bool) {
+func applyDefaults(c *Config, disableUpdateSet, shipDiagSet, admissionSet, marginSet bool) {
 	if c.GitHub.URL == "" {
 		c.GitHub.URL = DefaultGitHubURL
 	}
@@ -119,6 +121,20 @@ func applyDefaults(c *Config, disableUpdateSet, shipDiagSet bool) {
 	}
 	if !shipDiagSet {
 		c.Observability.ShipDiag = true
+	}
+
+	// Scaling defaults.
+	if !admissionSet {
+		c.Scaling.AdmissionControl = true
+	}
+	if c.Scaling.CPUTargetPercent == 0 {
+		c.Scaling.CPUTargetPercent = DefaultCPUTargetPercent
+	}
+	if !marginSet {
+		c.Scaling.MemoryMarginPercent = DefaultMemoryMarginPercent
+	}
+	if c.Scaling.SampleInterval == 0 {
+		c.Scaling.SampleInterval = DefaultSampleInterval
 	}
 }
 

@@ -67,8 +67,16 @@ type Config struct {
 	Runner        Runner        `yaml:"runner"`
 	Paths         Paths         `yaml:"paths"`
 	Runtime       Runtime       `yaml:"runtime"`
+	Scaling       Scaling       `yaml:"scaling"`
 	Observability Observability `yaml:"observability"`
 }
+
+// Admission-gate defaults (plan §9/§13).
+const (
+	DefaultCPUTargetPercent    = 90
+	DefaultMemoryMarginPercent = 20
+	DefaultSampleInterval      = 30 * time.Second
+)
 
 // GitHub holds the GitHub App credentials and the target scope.
 type GitHub struct {
@@ -134,6 +142,17 @@ type Runtime struct {
 	CleanupTimeout   time.Duration `yaml:"cleanup_timeout"`
 	AcquireGrace     time.Duration `yaml:"acquire_grace"`
 	JitDir           string        `yaml:"jit_dir"`
+}
+
+// Scaling tunes the history-based admission gate (plan §9/§13). When
+// admission_control is on, a new slot is held back whenever the
+// predicted resource usage of all busy slots plus the incoming job
+// would exceed the host budget derived from these targets.
+type Scaling struct {
+	AdmissionControl    bool          `yaml:"admission_control"`
+	CPUTargetPercent    int           `yaml:"cpu_target_percent"`
+	MemoryMarginPercent int           `yaml:"memory_margin_percent"`
+	SampleInterval      time.Duration `yaml:"sample_interval"`
 }
 
 // Observability configures the metrics endpoint and logging.
@@ -275,6 +294,21 @@ func (c *Config) Validate() error {
 	}
 	if c.Runtime.AcquireGrace <= 0 {
 		fail("runtime.acquire_grace must be > 0 (got %s)", c.Runtime.AcquireGrace)
+	}
+
+	// Scaling (admission gate). Checked only when the gate is enabled:
+	// a zero Scaling struct means the caller built the config directly
+	// (tests) and Load's defaults never ran.
+	if c.Scaling.AdmissionControl {
+		if c.Scaling.CPUTargetPercent <= 0 || c.Scaling.CPUTargetPercent > 100 {
+			fail("scaling.cpu_target_percent must be in (0, 100] (got %d)", c.Scaling.CPUTargetPercent)
+		}
+		if c.Scaling.MemoryMarginPercent < 0 || c.Scaling.MemoryMarginPercent > 90 {
+			fail("scaling.memory_margin_percent must be in [0, 90] (got %d)", c.Scaling.MemoryMarginPercent)
+		}
+		if c.Scaling.SampleInterval <= 0 {
+			fail("scaling.sample_interval must be > 0 (got %s)", c.Scaling.SampleInterval)
+		}
 	}
 
 	// Observability.

@@ -20,6 +20,10 @@ func TestRenderExact(t *testing.T) {
 	r.IncAcquireFailures()
 	r.IncListenerErrors()
 	r.SetLastMessageID(42)
+	r.IncAdmissionHolds()
+	r.ObserveJobCPU(45)
+	r.ObserveJobWall(90)
+	r.SetJobPeakMem(536870912)
 	r.ObserveSlotStart(0.05)
 	r.ObserveSlotStart(2.0)
 
@@ -30,9 +34,42 @@ tentacles_acquire_failures_total 1
 # TYPE tentacles_actual_runners gauge
 tentacles_actual_runners{state="busy"} 1
 tentacles_actual_runners{state="idle"} 2
+# HELP tentacles_admission_holds_total Total number of slot starts held back by the admission gate.
+# TYPE tentacles_admission_holds_total counter
+tentacles_admission_holds_total 1
 # HELP tentacles_desired_runners Current desired number of runner slots.
 # TYPE tentacles_desired_runners gauge
 tentacles_desired_runners 3
+# HELP tentacles_job_cpu_seconds CPU seconds consumed by finished jobs.
+# TYPE tentacles_job_cpu_seconds histogram
+tentacles_job_cpu_seconds_bucket{le="1"} 0
+tentacles_job_cpu_seconds_bucket{le="5"} 0
+tentacles_job_cpu_seconds_bucket{le="10"} 0
+tentacles_job_cpu_seconds_bucket{le="30"} 0
+tentacles_job_cpu_seconds_bucket{le="60"} 1
+tentacles_job_cpu_seconds_bucket{le="120"} 1
+tentacles_job_cpu_seconds_bucket{le="300"} 1
+tentacles_job_cpu_seconds_bucket{le="600"} 1
+tentacles_job_cpu_seconds_bucket{le="1800"} 1
+tentacles_job_cpu_seconds_bucket{le="3600"} 1
+tentacles_job_cpu_seconds_bucket{le="+Inf"} 1
+tentacles_job_cpu_seconds_sum 45
+tentacles_job_cpu_seconds_count 1
+# HELP tentacles_job_wall_seconds Wall-clock seconds of finished jobs.
+# TYPE tentacles_job_wall_seconds histogram
+tentacles_job_wall_seconds_bucket{le="5"} 0
+tentacles_job_wall_seconds_bucket{le="15"} 0
+tentacles_job_wall_seconds_bucket{le="30"} 0
+tentacles_job_wall_seconds_bucket{le="60"} 0
+tentacles_job_wall_seconds_bucket{le="120"} 1
+tentacles_job_wall_seconds_bucket{le="300"} 1
+tentacles_job_wall_seconds_bucket{le="600"} 1
+tentacles_job_wall_seconds_bucket{le="1200"} 1
+tentacles_job_wall_seconds_bucket{le="1800"} 1
+tentacles_job_wall_seconds_bucket{le="3600"} 1
+tentacles_job_wall_seconds_bucket{le="+Inf"} 1
+tentacles_job_wall_seconds_sum 90
+tentacles_job_wall_seconds_count 1
 # HELP tentacles_jobs_completed_total Total number of completed jobs, by result.
 # TYPE tentacles_jobs_completed_total counter
 tentacles_jobs_completed_total{result="failure"} 1
@@ -40,6 +77,9 @@ tentacles_jobs_completed_total{result="success"} 1
 # HELP tentacles_jobs_started_total Total number of started jobs.
 # TYPE tentacles_jobs_started_total counter
 tentacles_jobs_started_total 2
+# HELP tentacles_last_job_peak_memory_bytes Peak memory of the most recent finished job.
+# TYPE tentacles_last_job_peak_memory_bytes gauge
+tentacles_last_job_peak_memory_bytes 5.36870912e+08
 # HELP tentacles_last_message_id ID of the last processed scale-set message.
 # TYPE tentacles_last_message_id gauge
 tentacles_last_message_id 42
@@ -75,12 +115,48 @@ func TestRenderEmptyRegistry(t *testing.T) {
 	want := `# HELP tentacles_acquire_failures_total Total number of times a runner failed to acquire its assigned job.
 # TYPE tentacles_acquire_failures_total counter
 tentacles_acquire_failures_total 0
+# HELP tentacles_admission_holds_total Total number of slot starts held back by the admission gate.
+# TYPE tentacles_admission_holds_total counter
+tentacles_admission_holds_total 0
 # HELP tentacles_desired_runners Current desired number of runner slots.
 # TYPE tentacles_desired_runners gauge
 tentacles_desired_runners 0
+# HELP tentacles_job_cpu_seconds CPU seconds consumed by finished jobs.
+# TYPE tentacles_job_cpu_seconds histogram
+tentacles_job_cpu_seconds_bucket{le="1"} 0
+tentacles_job_cpu_seconds_bucket{le="5"} 0
+tentacles_job_cpu_seconds_bucket{le="10"} 0
+tentacles_job_cpu_seconds_bucket{le="30"} 0
+tentacles_job_cpu_seconds_bucket{le="60"} 0
+tentacles_job_cpu_seconds_bucket{le="120"} 0
+tentacles_job_cpu_seconds_bucket{le="300"} 0
+tentacles_job_cpu_seconds_bucket{le="600"} 0
+tentacles_job_cpu_seconds_bucket{le="1800"} 0
+tentacles_job_cpu_seconds_bucket{le="3600"} 0
+tentacles_job_cpu_seconds_bucket{le="+Inf"} 0
+tentacles_job_cpu_seconds_sum 0
+tentacles_job_cpu_seconds_count 0
+# HELP tentacles_job_wall_seconds Wall-clock seconds of finished jobs.
+# TYPE tentacles_job_wall_seconds histogram
+tentacles_job_wall_seconds_bucket{le="5"} 0
+tentacles_job_wall_seconds_bucket{le="15"} 0
+tentacles_job_wall_seconds_bucket{le="30"} 0
+tentacles_job_wall_seconds_bucket{le="60"} 0
+tentacles_job_wall_seconds_bucket{le="120"} 0
+tentacles_job_wall_seconds_bucket{le="300"} 0
+tentacles_job_wall_seconds_bucket{le="600"} 0
+tentacles_job_wall_seconds_bucket{le="1200"} 0
+tentacles_job_wall_seconds_bucket{le="1800"} 0
+tentacles_job_wall_seconds_bucket{le="3600"} 0
+tentacles_job_wall_seconds_bucket{le="+Inf"} 0
+tentacles_job_wall_seconds_sum 0
+tentacles_job_wall_seconds_count 0
 # HELP tentacles_jobs_started_total Total number of started jobs.
 # TYPE tentacles_jobs_started_total counter
 tentacles_jobs_started_total 0
+# HELP tentacles_last_job_peak_memory_bytes Peak memory of the most recent finished job.
+# TYPE tentacles_last_job_peak_memory_bytes gauge
+tentacles_last_job_peak_memory_bytes 0
 # HELP tentacles_last_message_id ID of the last processed scale-set message.
 # TYPE tentacles_last_message_id gauge
 tentacles_last_message_id 0

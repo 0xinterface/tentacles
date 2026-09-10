@@ -116,6 +116,7 @@ tentacles/
     scaleset/                     # adapter over github.com/actions/scaleset
     reconcile/                    # desired vs actual
     slot/                         # allocate, occupy, release
+    history/                      # per-workflow usage stats (EWMA)
     payload/                      # download, verify, extract runner tarball
     runner/                       # write JIT, build exec spec
     systemd/                      # transient unit backend
@@ -387,6 +388,18 @@ Scale-down policy:
 
 Warm pool: `min_runners: 1` keeps one `run.sh` registered and idle. That is the latency knob. Default is `0`.
 
+Admission gate (history-based backpressure): slot units carry CPU and
+memory accounting; at exit the daemon records CPU seconds, peak memory
+and wall time keyed by the job's `jobWorkflowRef`, kept as EWMA stats in
+`internal/history` (JSON lines under the state dir). Before each start,
+the `scaling:` budget check predicts the cost of all busy slots plus the
+incoming job (per-ref history when that ref is queued, else global) and
+holds the start when it would exceed the CPU target share of host cores
+or the memory margin. The hold is backpressure, not failure: retried on
+the next tick and counted in `tentacles_admission_holds_total`. The gate
+stays inert without history and always admits the first job on an idle
+host.
+
 Startup race: a slot in `starting` counts toward `actual` so the reconciler does not overshoot `max_runners`.
 
 ---
@@ -595,6 +608,9 @@ Metrics on `127.0.0.1:9090` (plus a liveness `/healthz` on the same listener):
 - `tentacles_acquire_failures_total`
 - `tentacles_slot_start_seconds` (histogram)
 - `tentacles_listener_errors_total`
+- `tentacles_job_cpu_seconds`, `tentacles_job_wall_seconds` (histograms)
+- `tentacles_last_job_peak_memory_bytes`
+- `tentacles_admission_holds_total`
 - `tentacles_last_message_id`
 
 `_diag` copy is mandatory before production use. GitHub’s own autoscaling guidance says ephemeral runner logs must be forwarded externally or you cannot debug failed jobs.

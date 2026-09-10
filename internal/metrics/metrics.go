@@ -19,6 +19,13 @@ import (
 // tentacles_slot_start_seconds histogram.
 var slotStartBuckets = [...]float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60}
 
+// jobCPUBuckets and jobWallBuckets bound typical per-job CPU time and
+// wall-clock spans (seconds).
+var (
+	jobCPUBuckets  = []float64{1, 5, 10, 30, 60, 120, 300, 600, 1800, 3600}
+	jobWallBuckets = []float64{5, 15, 30, 60, 120, 300, 600, 1200, 1800, 3600}
+)
+
 // Registry is the daemon-wide metrics registry.
 type Registry struct {
 	mu sync.Mutex
@@ -31,11 +38,50 @@ type Registry struct {
 	listenerErrs  uint64
 	lastMessageID int64
 
+	admissionHolds uint64
+
+	jobCPU  *histogram
+	jobWall *histogram
+
 	slotStartCount uint64
 	slotStartSum   float64
 	// slotStartBuckets holds one count per slotStartBuckets entry, plus a
 	// final +Inf bucket.
 	slotStartBuckets []uint64
+	lastJobPeakMem   uint64
+}
+
+// histogram is a fixed-bucket cumulative histogram.
+type histogram struct {
+	buckets []float64
+	counts  []uint64
+	sum     float64
+	count   uint64
+}
+
+func newHistogram(buckets []float64) *histogram {
+	return &histogram{buckets: buckets, counts: make([]uint64, len(buckets))}
+}
+
+func (h *histogram) observe(v float64) {
+	h.count++
+	h.sum += v
+	for i, le := range h.buckets {
+		if v <= le {
+			h.counts[i]++
+		}
+	}
+}
+
+func (h *histogram) lines(name string) []string {
+	lines := make([]string, 0, len(h.buckets)+3)
+	for i, le := range h.buckets {
+		lines = append(lines, name+"_bucket{le=\""+formatFloat(le)+"\"} "+formatFloat(float64(h.counts[i])))
+	}
+	lines = append(lines, name+"_bucket{le=\"+Inf\"} "+formatFloat(float64(h.count)))
+	lines = append(lines, name+"_sum "+formatFloat(h.sum))
+	lines = append(lines, name+"_count "+formatFloat(float64(h.count)))
+	return lines
 }
 
 // NewRegistry returns an empty registry.
@@ -44,6 +90,8 @@ func NewRegistry() *Registry {
 		actual:           make(map[string]int),
 		jobsCompleted:    make(map[string]uint64),
 		slotStartBuckets: make([]uint64, len(slotStartBuckets)+1),
+		jobCPU:           newHistogram(jobCPUBuckets),
+		jobWall:          newHistogram(jobWallBuckets),
 	}
 }
 
@@ -110,6 +158,34 @@ func (r *Registry) ObserveSlotStart(seconds float64) {
 		}
 	}
 	r.slotStartBuckets[len(slotStartBuckets)]++ // +Inf
+}
+
+// IncAdmissionHolds counts one slot start held back by the admission gate.
+func (r *Registry) IncAdmissionHolds() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.admissionHolds++
+}
+
+// ObserveJobCPU records the measured CPU seconds of one finished job.
+func (r *Registry) ObserveJobCPU(seconds float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.jobCPU.observe(seconds)
+}
+
+// ObserveJobWall records the wall-clock seconds of one finished job.
+func (r *Registry) ObserveJobWall(seconds float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.jobWall.observe(seconds)
+}
+
+// SetJobPeakMem records the peak memory of the most recent finished job.
+func (r *Registry) SetJobPeakMem(b uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lastJobPeakMem = b
 }
 
 // Handler returns an HTTP handler serving the registry in Prometheus text
@@ -186,6 +262,34 @@ func (r *Registry) render() string {
 			typ:  "counter",
 			lines: []string{
 				"tentacles_listener_errors_total " + formatFloat(float64(r.listenerErrs)),
+			},
+		},
+		{
+			name: "tentacles_admission_holds_total",
+			help: "Total number of slot starts held back by the admission gate.",
+			typ:  "counter",
+			lines: []string{
+				"tentacles_admission_holds_total " + formatFloat(float64(r.admissionHolds)),
+			},
+		},
+		{
+			name:  "tentacles_job_cpu_seconds",
+			help:  "CPU seconds consumed by finished jobs.",
+			typ:   "histogram",
+			lines: r.jobCPU.lines("tentacles_job_cpu_seconds"),
+		},
+		{
+			name:  "tentacles_job_wall_seconds",
+			help:  "Wall-clock seconds of finished jobs.",
+			typ:   "histogram",
+			lines: r.jobWall.lines("tentacles_job_wall_seconds"),
+		},
+		{
+			name: "tentacles_last_job_peak_memory_bytes",
+			help: "Peak memory of the most recent finished job.",
+			typ:  "gauge",
+			lines: []string{
+				"tentacles_last_job_peak_memory_bytes " + formatFloat(float64(r.lastJobPeakMem)),
 			},
 		},
 		{

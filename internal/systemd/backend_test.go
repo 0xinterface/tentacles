@@ -56,6 +56,11 @@ for arg in "$@"; do
 	printf '%s\n' "$arg" >> "$FAKE_SYSTEMCTL_LOG"
 done
 case "$1" in
+	show)
+		printf 'CPUUsageNSec=%s\n' "${FAKE_SYSTEMCTL_CPU_NSEC:-0}"
+		printf 'MemoryPeak=%s\n' "${FAKE_SYSTEMCTL_MEM_PEAK:-0}"
+		exit "${FAKE_SYSTEMCTL_EXIT:-0}"
+		;;
 	wait)
 		if [ "${FAKE_SYSTEMCTL_WAIT_FAIL:-0}" = "1" ]; then
 			printf 'Unknown operation wait.\n' >&2
@@ -144,6 +149,8 @@ func TestStartGoldenArgVector(t *testing.T) {
 		"-p", "TasksMax=4096",
 		"-p", "PrivateTmp=yes",
 		"-p", "NoNewPrivileges=yes",
+		"-p", "CPUAccounting=yes",
+		"-p", "MemoryAccounting=yes",
 		"-p", "ProtectSystem=strict",
 		"-p", "ProtectHome=read-only",
 		"-p", "ReadWritePaths=/var/lib/tentacles/slots/0001:/tmp",
@@ -186,6 +193,36 @@ func TestStartAddsRunnerCacheDirs(t *testing.T) {
 		if fi, err := os.Stat(filepath.Join(home, sub)); err != nil || !fi.IsDir() {
 			t.Errorf("cache dir %s not created (stat err: %v)", sub, err)
 		}
+	}
+}
+
+// TestUsageReadsAccounting: the usage sampler reads cumulative CPU time
+// and peak memory via systemctl show, feeding the per-workflow usage
+// history (plan §14 job accounting).
+func TestUsageReadsAccounting(t *testing.T) {
+	b, _, _ := newTestBackend(t)
+	t.Setenv("FAKE_SYSTEMCTL_CPU_NSEC", "25000000000") // 25s
+	t.Setenv("FAKE_SYSTEMCTL_MEM_PEAK", "536870912")
+	u, err := b.Usage("tentacle-0001.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.CPUSeconds != 25 {
+		t.Fatalf("cpu seconds = %v, want 25", u.CPUSeconds)
+	}
+	if u.PeakMemBytes != 536870912 {
+		t.Fatalf("peak mem = %v", u.PeakMemBytes)
+	}
+}
+
+// TestUsageErrorPropagates: a failed show surfaces as an error so the
+// sampler keeps the previous reading instead of recording zeros.
+func TestUsageErrorPropagates(t *testing.T) {
+	b, _, _ := newTestBackend(t)
+	t.Setenv("FAKE_SYSTEMCTL_EXIT", "1")
+	t.Setenv("FAKE_SYSTEMCTL_STDERR", "failed to show unit")
+	if _, err := b.Usage("tentacle-0001.service"); err == nil {
+		t.Fatal("expected error from failed systemctl show")
 	}
 }
 

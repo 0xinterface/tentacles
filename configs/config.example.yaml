@@ -43,6 +43,12 @@ paths:
   cache_dir: var/cache/tentacles
   log_dir: var/log/tentacles
 
+scaling:
+  admission_control: true       # hold new slots when predicted usage exceeds budget
+  cpu_target_percent: 90        # share of host cores busy jobs may use
+  memory_margin_percent: 20     # share of MemAvailable kept free
+  sample_interval: 30s          # usage sampling period
+
 runtime:
   backend: process              # systemd | process; process for local dry-run
   slot_start_timeout: 90s

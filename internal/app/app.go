@@ -13,12 +13,15 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/hkust/tentacles/internal/config"
+	"github.com/hkust/tentacles/internal/history"
 	"github.com/hkust/tentacles/internal/logship"
 	"github.com/hkust/tentacles/internal/metrics"
 	"github.com/hkust/tentacles/internal/payload"
@@ -40,6 +43,10 @@ type Options struct {
 	// an unset runner.version; tests inject a fake server. Empty means
 	// payload.ReleasesAPIURL.
 	releasesURL string
+	// numCPU and memAvailable are the host budget probes behind the
+	// admission gate; tests inject fixed values.
+	numCPU       func() int
+	memAvailable func() (uint64, error)
 }
 
 // ScaleSet is the narrow surface app consumes from the scale-set adapter.
@@ -127,6 +134,12 @@ type daemon struct {
 	reconcileInterval time.Duration
 	sessionUp         chan struct{}
 	sessionOnce       sync.Once
+
+	hist         *history.Store
+	queuedRefs   map[string]int
+	queuedMu     sync.Mutex
+	numCPU       func() int
+	memAvailable func() (uint64, error)
 }
 
 func newDaemon(cfg *config.Config, log *slog.Logger, opts Options) (*daemon, error) {
@@ -138,6 +151,9 @@ func newDaemon(cfg *config.Config, log *slog.Logger, opts Options) (*daemon, err
 		reconCh:           make(chan struct{}, 1),
 		reconcileInterval: defaultReconcileInterval,
 		sessionUp:         make(chan struct{}),
+		queuedRefs:        make(map[string]int),
+		numCPU:            func() int { return runtime.NumCPU() },
+		memAvailable:      procMemAvailable,
 	}
 
 	// Runner payload: download + verify + extract template. An unset
@@ -235,18 +251,21 @@ func newDaemon(cfg *config.Config, log *slog.Logger, opts Options) (*daemon, err
 		})
 	}
 
+	// Per-workflow usage history (admission gate input). A store that
+	// cannot be opened only disables admission control; runs continue.
+	hist, err := history.Open(filepath.Join(cfg.Paths.StateDir, "history.jsonl"))
+	if err != nil {
+		log.Warn("usage history unavailable; admission control stays inert", "err", err)
+		hist = nil
+	}
+	d.hist = hist
+
 	// Slot table.
 	group := cfg.Runner.Group
 	if group == "" {
 		group = cfg.Runner.User
 	}
-	d.table = slot.NewTable(
-		filepath.Join(cfg.Paths.StateDir, "slots"),
-		d.backend,
-		d.materializeSlot(pm),
-		d.mintJIT,
-		cfg.Runtime.JitDir,
-		log.WithGroup("slot"),
+	tableOpts := []slot.TableOption{
 		slot.WithAcquireGrace(cfg.Runtime.AcquireGrace),
 		slot.WithStopTimeout(cfg.Runtime.SlotStopTimeout),
 		slot.WithCleanupTimeout(cfg.Runtime.CleanupTimeout),
@@ -256,8 +275,54 @@ func newDaemon(cfg *config.Config, log *slog.Logger, opts Options) (*daemon, err
 		slot.WithLimits(fmt.Sprintf("%d%%", cfg.Capacity.JobCPUQuotaPercent), cfg.Capacity.JobMemoryMax),
 		slot.WithDiagHook(d.shipDiag),
 		slot.WithEventHook(d.onSlotEvent),
+		slot.WithSampleInterval(cfg.Scaling.SampleInterval),
+	}
+	if u, ok := d.backend.(interface {
+		Usage(string) (slot.Usage, error)
+	}); ok {
+		tableOpts = append(tableOpts, slot.WithUsageSampler(u.Usage))
+	}
+	if cfg.Scaling.AdmissionControl && d.hist != nil {
+		tableOpts = append(tableOpts, slot.WithGate(d.admissionGate))
+		tableOpts = append(tableOpts, slot.WithCompletionHook(func(c slot.Completion) {
+			err := d.hist.Append(history.Record{
+				Slot:             string(c.ID),
+				WorkflowRef:      c.WorkflowRef,
+				RunID:            c.RunID,
+				CPUSeconds:       c.CPUSeconds,
+				PeakMemBytes:     c.PeakMemBytes,
+				WallSeconds:      c.WallSeconds,
+				QueueWaitSeconds: c.QueueWaitSeconds,
+				Sampled:          c.Sampled,
+				At:               time.Now(),
+			})
+			if err != nil {
+				log.Warn("usage history append failed", "err", err)
+			}
+			if c.Sampled {
+				d.met.ObserveJobCPU(c.CPUSeconds)
+			}
+			if c.PeakMemBytes > 0 {
+				d.met.SetJobPeakMem(c.PeakMemBytes)
+			}
+			d.met.ObserveJobWall(c.WallSeconds)
+		}))
+	}
+	d.table = slot.NewTable(
+		filepath.Join(cfg.Paths.StateDir, "slots"),
+		d.backend,
+		d.materializeSlot(pm),
+		d.mintJIT,
+		cfg.Runtime.JitDir,
+		log.WithGroup("slot"),
+		tableOpts...,
 	)
 	d.rec = reconcile.New(d.table, cfg.Capacity.MinRunners, cfg.Capacity.MaxRunners, log.WithGroup("reconcile"))
+	// Seed desired with the warm-pool floor BEFORE the listener can
+	// push; the listener's first Desired event overwrites it. Doing this
+	// here (not in run) removes a race where the boot seed clobbered a
+	// statistics push that had already landed.
+	d.desired.Store(cfg.Capacity.MinRunners)
 	return d, nil
 }
 
@@ -274,20 +339,29 @@ func (d *daemon) buildEvents(requestReconcile func()) scaleset.Events {
 			d.desired.Store(n)
 			requestReconcile()
 		},
-		JobStart: func(runnerName string) {
+		JobStart: func(job scaleset.Job) {
 			d.met.IncJobsStarted()
 			if d.table == nil {
 				return
 			}
-			if d.table.MarkBusyByRunner(runnerName) {
-				d.log.Info("runner busy", "runner_name", runnerName)
+			if d.table.Claim(slot.ClaimJob{
+				RunnerName:       job.RunnerName,
+				WorkflowRef:      job.WorkflowRef,
+				RunID:            job.WorkflowRunID,
+				QueueWaitSeconds: queueWait(job),
+			}) {
+				d.log.Info("runner busy", "runner_name", job.RunnerName, "workflow_ref", job.WorkflowRef)
+				d.consumeQueuedRef(job.WorkflowRef)
 			} else {
-				d.log.Warn("JobStarted for unknown runner", "runner_name", runnerName)
+				d.log.Warn("JobStarted for unknown runner", "runner_name", job.RunnerName)
 			}
 		},
-		JobEnd: func(runnerName, result string) {
-			d.met.IncJobsCompleted(result)
-			d.log.Info("job completed", "runner_name", runnerName, "result", result)
+		JobEnd: func(job scaleset.Job) {
+			d.met.IncJobsCompleted(job.Result)
+			d.log.Info("job completed", "runner_name", job.RunnerName, "result", job.Result)
+		},
+		Queued: func(refs []string) {
+			d.noteQueued(refs)
 		},
 		MessageID: func(id int64) {
 			d.met.SetLastMessageID(id)
@@ -299,6 +373,128 @@ func (d *daemon) buildEvents(requestReconcile func()) scaleset.Events {
 			}
 		},
 	}
+}
+
+// queueWait is the GitHub-reported wait from queue to runner assignment.
+func queueWait(job scaleset.Job) float64 {
+	if job.QueueTime.IsZero() || job.RunnerAssignTime.IsZero() {
+		return 0
+	}
+	w := job.RunnerAssignTime.Sub(job.QueueTime).Seconds()
+	if w < 0 {
+		return 0
+	}
+	return w
+}
+
+// noteQueued records workflow refs seen waiting in the scale-set queue
+// (JobAvailable messages). Best-effort hints for the admission gate.
+func (d *daemon) noteQueued(refs []string) {
+	d.queuedMu.Lock()
+	for _, r := range refs {
+		if r != "" {
+			d.queuedRefs[r]++
+		}
+	}
+	d.queuedMu.Unlock()
+}
+
+// consumeQueuedRef removes one queued occurrence once a runner claims it.
+func (d *daemon) consumeQueuedRef(ref string) {
+	if ref == "" {
+		return
+	}
+	d.queuedMu.Lock()
+	if d.queuedRefs[ref] > 0 {
+		d.queuedRefs[ref]--
+	}
+	d.queuedMu.Unlock()
+}
+
+// candidateRef returns a workflow ref still waiting in the queue, for
+// per-ref admission estimates; "" when nothing is queued.
+func (d *daemon) candidateRef() string {
+	d.queuedMu.Lock()
+	defer d.queuedMu.Unlock()
+	for ref, n := range d.queuedRefs {
+		if n > 0 {
+			return ref
+		}
+	}
+	return ""
+}
+
+// admissionGate decides whether the host can take one more job. It
+// compares the predicted CPU rate (cores) and peak memory of all busy
+// slots plus the incoming job against the host budget from the scaling
+// config. Without history the gate stays inert, and an idle host always
+// admits its first job: holding starts with no workload data would
+// starve the warm pool forever.
+func (d *daemon) admissionGate(live []slot.Slot) bool {
+	if d.hist == nil {
+		return true
+	}
+	budgetCores := float64(d.numCPU()) * float64(d.cfg.Scaling.CPUTargetPercent) / 100
+	var usedCores float64
+	var usedMem uint64
+	busy := 0
+	for _, s := range live {
+		if s.State != slot.StateBusy {
+			continue
+		}
+		busy++
+		if cores, ok := d.hist.PredictCores(s.WorkflowRef); ok {
+			usedCores += cores
+		}
+		if mem, ok := d.hist.PredictMem(s.WorkflowRef); ok {
+			usedMem += mem
+		}
+	}
+	candidateRef := d.candidateRef()
+	candidateCores, okCores := d.hist.PredictCores(candidateRef)
+	candidateMem, okMem := d.hist.PredictMem(candidateRef)
+	if !okCores || !okMem {
+		return true
+	}
+	if busy == 0 {
+		return true
+	}
+	usedCores += candidateCores
+	usedMem += candidateMem
+	if usedCores > budgetCores {
+		return false
+	}
+	if avail, err := d.memAvailable(); err == nil {
+		limit := uint64(float64(avail) * float64(100-d.cfg.Scaling.MemoryMarginPercent) / 100)
+		if usedMem > limit {
+			return false
+		}
+	}
+	return true
+}
+
+// procMemAvailable reads MemAvailable from /proc/meminfo. Unsupported
+// platforms return an error; the gate then skips the memory check.
+func procMemAvailable() (uint64, error) {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "MemAvailable:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			break
+		}
+		kb, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			return 0, err
+		}
+		return kb * 1024, nil
+	}
+	return 0, errors.New("meminfo: MemAvailable not found")
 }
 
 // materializeSlot copies the payload template into a fresh slot dir. It
@@ -461,8 +657,9 @@ func (d *daemon) run(ctx context.Context) error {
 	// Reconcile loop; also drives the warm pool at boot (min_runners).
 	// The listener's desired pushes, slot exits (plan §9's local
 	// watcher), and the safety-net tick (plan §13's "retry next tick")
-	// all funnel through here.
-	d.desired.Store(d.cfg.Capacity.MinRunners)
+	// all funnel through here. desired was seeded with min_runners in
+	// newDaemon, so the boot nudge starts the warm pool without racing
+	// the listener's first push.
 	d.requestReconcile()
 	tick := time.NewTicker(d.reconcileInterval)
 	defer tick.Stop()

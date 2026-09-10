@@ -43,7 +43,15 @@ type tableOptions struct {
 	cpuQuota       string
 	memoryMax      string
 	workDir        string
+	usageSampler   func(unit string) (Usage, error)
+	sampleInterval time.Duration
+	gate           func(live []Slot) bool
+	completionHook func(Completion)
 }
+
+// defaultSampleInterval is how often live slot units are polled for
+// resource accounting when a usage sampler is configured.
+const defaultSampleInterval = 30 * time.Second
 
 // TableOption configures a Table. Options are applied in order; the last
 // one wins for each field.
@@ -120,12 +128,47 @@ func WithWorkDir(rel string) TableOption {
 	return func(o *tableOptions) { o.workDir = rel }
 }
 
+// WithUsageSampler registers a callback that reads cumulative resource
+// accounting for a unit (systemd CPUUsageNSec/MemoryPeak in the
+// production backend). Non-nil enables per-job usage recording.
+func WithUsageSampler(fn func(unit string) (Usage, error)) TableOption {
+	return func(o *tableOptions) { o.usageSampler = fn }
+}
+
+// WithSampleInterval overrides the usage sampling period. Non-positive
+// values fall back to the default 30s.
+func WithSampleInterval(d time.Duration) TableOption {
+	return func(o *tableOptions) { o.sampleInterval = d }
+}
+
+// WithGate registers the admission gate. Before each slot start it
+// receives the live slots and reports whether the host budget can take
+// another job. A refusal is backpressure: the start is retried on a
+// later tick, and reported as EventAdmissionHold, not a failure. Nil
+// admits everything.
+func WithGate(fn func(live []Slot) bool) TableOption {
+	return func(o *tableOptions) { o.gate = fn }
+}
+
+// WithCompletionHook registers a sink for per-job usage records, fired
+// once per claimed slot exit. Unclaimed exits (acquire failures) are
+// not completions.
+func WithCompletionHook(fn func(Completion)) TableOption {
+	return func(o *tableOptions) { o.completionHook = fn }
+}
+
 // slotRec is the internal bookkeeping for one slot. The embedded Slot is
-// the public view; busySince and provStart drive lifecycle decisions.
+// the public view; the remaining fields drive lifecycle decisions and
+// usage attribution.
 type slotRec struct {
 	Slot
-	busySince time.Time // set when the runner first claims a job; zero = never busy
-	provStart time.Time // when provisioning began; drives starting-past-grace stops
+	busySince    time.Time // set when the runner first claims a job; zero = never busy
+	provStart    time.Time // when provisioning began; drives starting-past-grace stops
+	claimed      bool      // a JobStarted was seen for this slot
+	queueWait    float64   // GitHub-reported queue wait at claim
+	claimAt      time.Time // local time of the claim
+	usageAtClaim Usage     // sampler reading at claim time
+	lastUsage    Usage     // most recent sampler reading
 }
 
 // Table is the concrete Manager: it allocates slot IDs, materializes and
@@ -165,14 +208,18 @@ func NewTable(root string, backend runner.Backend, materialize func(dst string) 
 		cleanupTimeout: defaultCleanupTimeout,
 		startTimeout:   defaultStartTimeout,
 		workDir:        defaultWorkDir,
+		sampleInterval: defaultSampleInterval,
 	}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&o)
 		}
 	}
+	if o.sampleInterval <= 0 {
+		o.sampleInterval = defaultSampleInterval
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Table{
+	t := &Table{
 		root:        root,
 		backend:     backend,
 		materialize: materialize,
@@ -183,6 +230,47 @@ func NewTable(root string, backend runner.Backend, materialize func(dst string) 
 		ctx:         ctx,
 		cancel:      cancel,
 		slots:       make(map[ID]*slotRec),
+	}
+	if o.usageSampler != nil {
+		go t.sampleLoop()
+	}
+	return t
+}
+
+// sampleLoop polls the usage sampler for every live slot so a job's
+// resource consumption is known even though systemd garbage-collects
+// the unit right after exit. CPU seconds are cumulative; peak memory is
+// maintained by the kernel, so the latest reading is the peak so far.
+func (t *Table) sampleLoop() {
+	ticker := time.NewTicker(t.opts.sampleInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		type target struct {
+			rec  *slotRec
+			unit string
+		}
+		t.mu.Lock()
+		var targets []target
+		for _, rec := range t.slots {
+			if rec.State == StateBusy || rec.State == StateIdle {
+				targets = append(targets, target{rec: rec, unit: rec.Unit})
+			}
+		}
+		t.mu.Unlock()
+		for _, tg := range targets {
+			u, err := t.opts.usageSampler(tg.unit)
+			if err != nil {
+				continue // unit may have just exited; the last sample stands
+			}
+			t.mu.Lock()
+			tg.rec.lastUsage = u
+			t.mu.Unlock()
+		}
 	}
 }
 
@@ -296,6 +384,20 @@ func (t *Table) startOne(ctx context.Context) ID {
 	}, provStart: t0}
 	t.slots[id] = rec
 	t.mu.Unlock()
+
+	// Admission gate (backpressure, not failure): the host budget says
+	// this slot would overshoot predicted usage. Free the reserved ID
+	// and stop; Ensure breaks and the next reconcile tick retries.
+	if t.opts.gate != nil && !t.opts.gate(t.Active()) {
+		t.log.Info("slot start held by admission gate", "slot", id)
+		t.mu.Lock()
+		delete(t.slots, id)
+		rec.State = StateFailed
+		snap := rec.Slot
+		t.mu.Unlock()
+		t.emit(EventAdmissionHold, snap)
+		return ""
+	}
 
 	// fail records the failure, frees the ID for retry, removes anything
 	// the failed attempt left behind (a partial materialization would
@@ -459,20 +561,27 @@ func (t *Table) MarkBusy(id ID) {
 	}
 }
 
-// MarkBusyByRunner marks busy the slot whose runner registered the given
-// GitHub runner name (from a JobStarted message). It reports whether a
-// slot with that name was found.
-func (t *Table) MarkBusyByRunner(runnerName string) bool {
+// Claim records that a runner claimed a job (JobStarted) and marks its
+// slot busy so scale-down will not stop it. It reports whether a slot
+// with that runner name was found.
+func (t *Table) Claim(job ClaimJob) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for _, rec := range t.slots {
-		if rec.RunnerName == runnerName {
-			if rec.State == StateStarting || rec.State == StateIdle {
-				rec.State = StateBusy
-				rec.busySince = time.Now()
-			}
-			return true
+		if rec.RunnerName != job.RunnerName {
+			continue
 		}
+		if rec.State == StateStarting || rec.State == StateIdle {
+			rec.State = StateBusy
+			rec.busySince = time.Now()
+			rec.WorkflowRef = job.WorkflowRef
+			rec.RunID = job.RunID
+			rec.claimed = true
+			rec.claimAt = time.Now()
+			rec.queueWait = job.QueueWaitSeconds
+			rec.usageAtClaim = rec.lastUsage
+		}
+		return true
 	}
 	return false
 }
@@ -497,6 +606,31 @@ func (t *Table) ObserveExit(id ID, err error) {
 	t.mu.Unlock()
 
 	t.log.Info("slot exited", "slot", id, "prev_state", prev, "err", err)
+
+	// Per-job usage record for claimed slots: the input to the workflow
+	// usage history. CPU is the delta since the claim (the agent's
+	// registration cost is not the job's); peak memory is the unit peak.
+	if rec.claimed && t.opts.completionHook != nil {
+		cpu := rec.lastUsage.CPUSeconds - rec.usageAtClaim.CPUSeconds
+		if cpu < 0 {
+			cpu = 0
+		}
+		var wallSeconds float64
+		if !rec.claimAt.IsZero() {
+			wallSeconds = time.Since(rec.claimAt).Seconds()
+		}
+		t.opts.completionHook(Completion{
+			ID:               id,
+			RunnerName:       rec.RunnerName,
+			WorkflowRef:      rec.WorkflowRef,
+			RunID:            rec.RunID,
+			CPUSeconds:       cpu,
+			PeakMemBytes:     rec.lastUsage.PeakMemBytes,
+			WallSeconds:      wallSeconds,
+			QueueWaitSeconds: rec.queueWait,
+			Sampled:          t.opts.usageSampler != nil,
+		})
+	}
 
 	t.wipe(id, rec.Dir)
 

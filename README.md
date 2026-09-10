@@ -211,6 +211,10 @@ strict: an unknown key is a startup error, not a silent no-op.
 | `observability.listen` | `127.0.0.1:9090` | metrics + `/healthz` |
 | `observability.log_level` | `info` | `debug`, `warn`, `error` also accepted |
 | `observability.ship_diag` | `true` | copy `_diag` before wipe |
+| `scaling.admission_control` | `true` | history-based admission gate |
+| `scaling.cpu_target_percent` | `90` | share of host cores busy jobs may use |
+| `scaling.memory_margin_percent` | `20` | share of MemAvailable kept free |
+| `scaling.sample_interval` | `30s` | usage sampling period |
 
 Validation fails closed and reports every problem at once: `max_runners
 >= 1`, `min_runners <= max_runners`, the 32-slot hard cap, readable PEM,
@@ -254,6 +258,17 @@ only works after `eval "$(mise activate bash)"`, fix this file instead.
   listener, a slot exit (the process-exit watcher), and a 30 second
   tick. The tick is plan §13's "retry next tick": a failed JIT call or a
   disk-watermark rejection is retried without waiting for GitHub.
+- **Admission control** (on by default): every job's real usage is
+  measured from systemd accounting (CPU seconds, peak memory) at slot
+  exit, keyed by workflow ref, and kept as a per-ref moving average in
+  `state_dir/history.jsonl`. Before starting a slot the gate predicts
+  the cost of all busy jobs plus the incoming one; over budget (CPU
+  target share of host cores, memory under `MemAvailable` minus margin)
+  the start is held as backpressure and retried on the next tick. Queued
+  jobs are identified from `JobAvailable` messages, so the prediction
+  uses that workflow's own history when available. The gate stays inert
+  until history exists, always admits the first job on an idle host, and
+  does nothing without systemd accounting (process backend).
 - Exit classification (plan §13): a runner that exits before any
   JobStarted and inside the acquire grace is an acquire failure
   (metric + event, slot wiped). A runner that exits after a job is a
@@ -329,6 +344,9 @@ format plus a liveness endpoint at `/healthz`:
 | `tentacles_slot_start_seconds` | histogram of full provision time |
 | `tentacles_listener_errors_total` | listener/session failures |
 | `tentacles_last_message_id` | last scale-set message ID processed |
+| `tentacles_job_cpu_seconds` / `tentacles_job_wall_seconds` | finished-job histograms |
+| `tentacles_last_job_peak_memory_bytes` | peak memory of the last job |
+| `tentacles_admission_holds_total` | starts held by the admission gate |
 
 `_diag` shipping is on by default and should stay on: without it, a
 failed ephemeral job leaves no runner-side logs anywhere.

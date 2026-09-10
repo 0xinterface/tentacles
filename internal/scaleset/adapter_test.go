@@ -138,25 +138,71 @@ func TestHandleDesiredRunnerCountClamps(t *testing.T) {
 }
 
 func TestHandleJobMessages(t *testing.T) {
-	var started []string
-	var ended []struct{ name, result string }
+	var started, ended []Job
 	a := &Adapter{ev: Events{
-		JobStart: func(name string) { started = append(started, name) },
-		JobEnd:   func(name, result string) { ended = append(ended, struct{ name, result string }{name, result}) },
+		JobStart: func(j Job) { started = append(started, j) },
+		JobEnd:   func(j Job) { ended = append(ended, j) },
 	}}
+	const ref = "my-org/my-repo/.github/workflows/ci.yml@refs/heads/main"
+	assign := time.Now()
+	finish := assign.Add(90 * time.Second)
 
-	if err := a.HandleJobStarted(context.Background(), &scaleset.JobStarted{RunnerName: "debian-host-0001-x7f3"}); err != nil {
+	if err := a.HandleJobStarted(context.Background(), &scaleset.JobStarted{
+		RunnerName: "debian-host-0001-x7f3",
+		JobMessageBase: scaleset.JobMessageBase{
+			JobID:            "123",
+			JobWorkflowRef:   ref,
+			WorkflowRunID:    77,
+			EventName:        "push",
+			RunnerAssignTime: assign,
+		},
+	}); err != nil {
 		t.Fatalf("HandleJobStarted error: %v", err)
 	}
-	if err := a.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: "debian-host-0001-x7f3", Result: "success"}); err != nil {
+	if err := a.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{
+		RunnerName:     "debian-host-0001-x7f3",
+		Result:         "success",
+		JobMessageBase: scaleset.JobMessageBase{JobWorkflowRef: ref, FinishTime: finish},
+	}); err != nil {
 		t.Fatalf("HandleJobCompleted error: %v", err)
 	}
 
-	if len(started) != 1 || started[0] != "debian-host-0001-x7f3" {
-		t.Errorf("ev.JobStart fired with %v, want [debian-host-0001-x7f3]", started)
+	if len(started) != 1 {
+		t.Fatalf("ev.JobStart fired %d times", len(started))
 	}
-	if len(ended) != 1 || ended[0].name != "debian-host-0001-x7f3" || ended[0].result != "success" {
-		t.Errorf("ev.JobEnd fired with %v, want [{debian-host-0001-x7f3 success}]", ended)
+	s := started[0]
+	if s.RunnerName != "debian-host-0001-x7f3" || s.WorkflowRef != ref || s.WorkflowRunID != 77 ||
+		s.EventName != "push" || s.JobID != "123" || !s.RunnerAssignTime.Equal(assign) {
+		t.Errorf("JobStart payload = %+v", s)
+	}
+	if len(ended) != 1 {
+		t.Fatalf("ev.JobEnd fired %d times", len(ended))
+	}
+	e := ended[0]
+	if e.Result != "success" || e.WorkflowRef != ref || !e.FinishTime.Equal(finish) {
+		t.Errorf("JobEnd payload = %+v", e)
+	}
+}
+
+func TestQueuedRefsEmitted(t *testing.T) {
+	var seen [][]string
+	a := &Adapter{ev: Events{Queued: func(refs []string) { seen = append(seen, refs) }}}
+	msg := &scaleset.RunnerScaleSetMessage{
+		MessageID: 9,
+		JobAvailableMessages: []*scaleset.JobAvailable{
+			{JobMessageBase: scaleset.JobMessageBase{JobWorkflowRef: "o/r/.github/workflows/a.yml@main"}},
+			{JobMessageBase: scaleset.JobMessageBase{JobWorkflowRef: "o/r/.github/workflows/b.yml@main"}},
+		},
+	}
+	a.observeMessage(msg)
+	if len(seen) != 1 || len(seen[0]) != 2 || seen[0][0] != "o/r/.github/workflows/a.yml@main" {
+		t.Fatalf("Queued fired with %v", seen)
+	}
+
+	// A message with no available jobs must not fire the callback.
+	a.observeMessage(&scaleset.RunnerScaleSetMessage{MessageID: 10})
+	if len(seen) != 1 {
+		t.Fatalf("Queued fired %d times, want 1", len(seen))
 	}
 }
 

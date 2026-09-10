@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/hkust/tentacles/internal/runner"
+	"github.com/hkust/tentacles/internal/slot"
 )
 
 // Options configures the systemd backend.
@@ -131,6 +132,8 @@ func (b *Backend) startArgs(spec runner.Spec) []string {
 		"-p", "TasksMax=4096",
 		"-p", "PrivateTmp=yes",
 		"-p", "NoNewPrivileges=yes",
+		"-p", "CPUAccounting=yes",
+		"-p", "MemoryAccounting=yes",
 		"-p", "ProtectSystem=strict",
 		"-p", "ProtectHome=read-only",
 		"-p", "ReadWritePaths="+strings.Join(paths, ":"),
@@ -287,6 +290,41 @@ func (b *Backend) Active(ctx context.Context) ([]string, error) {
 	}
 	b.mu.Unlock()
 	return units, nil
+}
+
+// Usage reads cumulative CPU time and peak memory for a unit from
+// systemd's accounting (CPUAccounting=yes and MemoryAccounting=yes are
+// set on every slot unit). The Table samples this while a job runs so
+// usage can be attributed at exit, before systemd garbage-collects the
+// unit.
+func (b *Backend) Usage(unit string) (slot.Usage, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, b.systemctlBin, "show", unit,
+		"--property=CPUUsageNSec", "--property=MemoryPeak")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return slot.Usage{}, fmt.Errorf("systemd: show %s: %w: %s", unit, err, tail(out))
+	}
+	var u slot.Usage
+	for _, line := range strings.Split(string(out), "\n") {
+		name, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
+		}
+		switch name {
+		case "CPUUsageNSec":
+			ns, err := strconv.ParseInt(value, 10, 64)
+			if err == nil && ns > 0 {
+				u.CPUSeconds = float64(ns) / 1e9
+			}
+		case "MemoryPeak":
+			if bytes, err := strconv.ParseUint(value, 10, 64); err == nil {
+				u.PeakMemBytes = bytes
+			}
+		}
+	}
+	return u, nil
 }
 
 // tail returns the last ~2KB of combined command output for error

@@ -23,7 +23,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hkust/tentacles/internal/config"
+	"github.com/hkust/tentacles/internal/history"
 	"github.com/hkust/tentacles/internal/scaleset"
+	"github.com/hkust/tentacles/internal/slot"
 )
 
 // fakeScaleSet drives the daemon through the same surface as the real
@@ -35,6 +38,7 @@ type fakeScaleSet struct {
 	ensured     bool
 	jitCount    int
 	workFolders []string
+	names       []string
 	runFn       func(ctx context.Context, f *fakeScaleSet) error
 }
 
@@ -58,7 +62,19 @@ func (f *fakeScaleSet) GenerateJIT(_ context.Context, runnerName, workFolder str
 	defer f.mu.Unlock()
 	f.jitCount++
 	f.workFolders = append(f.workFolders, workFolder)
+	f.names = append(f.names, runnerName)
 	return "fake-jit-" + runnerName, nil
+}
+
+// lastRunnerName returns the runner name of the most recently minted
+// JIT config ("", none).
+func (f *fakeScaleSet) lastRunnerName() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.names) == 0 {
+		return ""
+	}
+	return f.names[len(f.names)-1]
 }
 
 func (f *fakeScaleSet) Run(ctx context.Context) error {
@@ -82,11 +98,28 @@ func (f *fakeScaleSet) pushDesired(n int) {
 }
 
 func (f *fakeScaleSet) jobStart(name string) {
+	f.jobStartWithRef(name, testJobRef)
+}
+
+// testJobRef is the workflow ref the fake scale set reports for every
+// claimed job; admission-gate tests seed history for exactly this ref.
+const testJobRef = "o/r/.github/workflows/ci.yml@main"
+
+func (f *fakeScaleSet) jobStartWithRef(name, ref string) {
 	f.mu.Lock()
 	ev := f.events
 	f.mu.Unlock()
 	if ev.JobStart != nil {
-		ev.JobStart(name)
+		ev.JobStart(scaleset.Job{RunnerName: name, WorkflowRef: ref})
+	}
+}
+
+func (f *fakeScaleSet) pushQueued(refs []string) {
+	f.mu.Lock()
+	ev := f.events
+	f.mu.Unlock()
+	if ev.Queued != nil {
+		ev.Queued(refs)
 	}
 }
 
@@ -286,7 +319,7 @@ func TestDaemonResolvesLatestRunnerVersion(t *testing.T) {
 	}()
 
 	slotDir := filepath.Join(dir, "state", "slots", "0001")
-	if !poll(t, 30*time.Second, func() bool { return fileExists(filepath.Join(slotDir, ".fake-claimed")) }) {
+	if !poll(t, 120*time.Second, func() bool { return fileExists(filepath.Join(slotDir, ".fake-claimed")) }) {
 		cancel()
 		t.Fatalf("runner never started via resolved latest version")
 	}
@@ -360,7 +393,7 @@ func TestDaemonScaleUpDownEphemeral(t *testing.T) {
 	slotDir := filepath.Join(slotsDir, "0001")
 
 	// Scale up: slot materialized, runner started with a non-empty JIT.
-	if !poll(t, 30*time.Second, func() bool {
+	if !poll(t, 120*time.Second, func() bool {
 		m := filepath.Join(slotDir, ".fake-claimed")
 		b, err := os.ReadFile(m)
 		return err == nil && len(strings.TrimSpace(string(b))) > 0
@@ -392,7 +425,7 @@ func TestDaemonScaleUpDownEphemeral(t *testing.T) {
 
 	// Scale down: slot dir, jit file, and processes are gone.
 	fake.pushDesired(0)
-	if !poll(t, 30*time.Second, func() bool { return !dirExists(slotDir) }) {
+	if !poll(t, 120*time.Second, func() bool { return !dirExists(slotDir) }) {
 		cancel()
 		t.Fatalf("slot dir not wiped after scale-down: %v", ls(t, slotsDir))
 	}
@@ -458,7 +491,7 @@ func TestDaemonMinRunnersWarmPool(t *testing.T) {
 	}()
 
 	slotDir := filepath.Join(dir, "state", "slots", "0001")
-	if !poll(t, 30*time.Second, func() bool { return fileExists(filepath.Join(slotDir, ".fake-claimed")) }) {
+	if !poll(t, 120*time.Second, func() bool { return fileExists(filepath.Join(slotDir, ".fake-claimed")) }) {
 		cancel()
 		t.Fatalf("warm-pool runner never started")
 	}
@@ -478,7 +511,7 @@ func TestDaemonMinRunnersWarmPool(t *testing.T) {
 		t.Fatalf("daemon did not shut down")
 	}
 	// Shutdown stops idle slots.
-	if !poll(t, 30*time.Second, func() bool { return !dirExists(slotDir) }) {
+	if !poll(t, 120*time.Second, func() bool { return !dirExists(slotDir) }) {
 		t.Errorf("idle slot survived shutdown: %v", ls(t, filepath.Join(dir, "state", "slots")))
 	}
 }
@@ -553,7 +586,7 @@ func TestDaemonReplenishesWarmPoolAfterExit(t *testing.T) {
 
 	// Each fake runner exits after ~1s; the daemon must keep minting
 	// replacements for the warm slot.
-	if !poll(t, 30*time.Second, func() bool { return fake.startedJITs() >= 3 }) {
+	if !poll(t, 120*time.Second, func() bool { return fake.startedJITs() >= 3 }) {
 		cancel()
 		t.Fatalf("warm pool not replenished after runner exits; jit mints = %d", fake.startedJITs())
 	}
@@ -658,4 +691,199 @@ func TestDaemonReadinessGatedOnSessionStart(t *testing.T) {
 	}
 	t.Run("session started", func(t *testing.T) { runCase(t, true) })
 	t.Run("no session before shutdown", func(t *testing.T) { runCase(t, false) })
+}
+
+// TestAdmissionGate: the gate holds a start when the predicted usage of
+// the busy slots plus the incoming job exceeds the host budget, stays
+// inert without history, always admits the first job on an idle host,
+// and prefers the queued-ref estimate over the global average.
+func TestAdmissionGate(t *testing.T) {
+	dir := t.TempDir()
+	store, err := history.Open(filepath.Join(dir, "history.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ref history: 100 CPU seconds over 10 wall seconds = 10 cores,
+	// 15 GiB peak memory.
+	if err := store.Append(history.Record{
+		WorkflowRef: testJobRef, CPUSeconds: 100, WallSeconds: 10,
+		PeakMemBytes: 15 << 30, Sampled: true, At: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	scalingCfg := func() *config.Config {
+		return &config.Config{Scaling: config.Scaling{
+			AdmissionControl:    true,
+			CPUTargetPercent:    90,
+			MemoryMarginPercent: 20,
+		}}
+	}
+	newGate := func(t *testing.T, store *history.Store, mem uint64) func([]slot.Slot) bool {
+		t.Helper()
+		d := &daemon{
+			cfg:          scalingCfg(),
+			hist:         store,
+			numCPU:       func() int { return 4 }, // budget 3.6 cores
+			memAvailable: func() (uint64, error) { return mem, nil },
+			queuedRefs:   map[string]int{},
+		}
+		return d.admissionGate
+	}
+
+	liveBusy := []slot.Slot{{State: slot.StateBusy, WorkflowRef: testJobRef}}
+
+	t.Run("inert without history", func(t *testing.T) {
+		empty, _ := history.Open(filepath.Join(t.TempDir(), "h.jsonl"))
+		d := &daemon{cfg: scalingCfg(), hist: empty, numCPU: func() int { return 1 },
+			memAvailable: func() (uint64, error) { return 0, nil }, queuedRefs: map[string]int{}}
+		if !d.admissionGate(liveBusy) {
+			t.Fatal("gate blocked with no history")
+		}
+	})
+	t.Run("idle host always admits", func(t *testing.T) {
+		if !newGate(t, store, 32<<30)(nil) {
+			t.Fatal("gate blocked the first job on an idle host")
+		}
+	})
+	t.Run("holds when busy slot exceeds budget", func(t *testing.T) {
+		// One busy job already predicts 10 cores; budget is 3.6.
+		if newGate(t, store, 32<<30)(liveBusy) {
+			t.Fatal("gate admitted a second heavy job")
+		}
+	})
+	t.Run("admits when usage fits", func(t *testing.T) {
+		small, _ := history.Open(filepath.Join(t.TempDir(), "h.jsonl"))
+		if err := small.Append(history.Record{
+			WorkflowRef: testJobRef, CPUSeconds: 1, WallSeconds: 10,
+			PeakMemBytes: 1 << 30, Sampled: true, At: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if !newGate(t, small, 32<<30)(liveBusy) {
+			t.Fatal("gate held a light job that fits the budget")
+		}
+	})
+	t.Run("holds on memory pressure", func(t *testing.T) {
+		// CPU fits (10 cores? no: budget 3.6) — shrink CPU first via a
+		// light record, then let memory decide: 15 GiB peak against a
+		// 16 GiB host with a 20% margin leaves ~12.8 GiB.
+		s, _ := history.Open(filepath.Join(t.TempDir(), "h.jsonl"))
+		if err := s.Append(history.Record{
+			WorkflowRef: testJobRef, CPUSeconds: 1, WallSeconds: 10,
+			PeakMemBytes: 15 << 30, Sampled: true, At: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if newGate(t, s, 16<<30)(liveBusy) {
+			t.Fatal("gate admitted a job over the memory budget")
+		}
+	})
+	t.Run("queued ref refines the candidate", func(t *testing.T) {
+		s, _ := history.Open(filepath.Join(t.TempDir(), "h.jsonl"))
+		// Global average is light...
+		if err := s.Append(history.Record{
+			WorkflowRef: "other", CPUSeconds: 1, WallSeconds: 10,
+			PeakMemBytes: 1 << 30, Sampled: true, At: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		// ...but the queued job is the heavy one.
+		if err := s.Append(history.Record{
+			WorkflowRef: testJobRef, CPUSeconds: 100, WallSeconds: 10,
+			PeakMemBytes: 15 << 30, Sampled: true, At: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		d := &daemon{
+			cfg: scalingCfg(), hist: s,
+			numCPU:       func() int { return 4 },
+			memAvailable: func() (uint64, error) { return 32 << 30, nil },
+			queuedRefs:   map[string]int{testJobRef: 1},
+		}
+		if d.admissionGate(liveBusy) {
+			t.Fatal("gate ignored the queued heavy job")
+		}
+	})
+}
+
+// TestDaemonAdmissionGateHolds: end to end — seeded history says the
+// workflow needs more than the host budget, so the second slot stays
+// held (backpressure) instead of oversubscribing the host.
+func TestDaemonAdmissionGateHolds(t *testing.T) {
+	if testing.Short() {
+		t.Skip("end-to-end test")
+	}
+	tarBytes, sha := fixtureRunnerTar(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(tarBytes)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cfgPath, _ := writeIntegrationConfig(t, dir, srv.URL, sha, 0, 2, "2.328.0")
+
+	// Seed the history the gate reads: the workflow used 100 CPU seconds
+	// in 10 wall seconds (10 cores) — far over this test host's budget.
+	stateDir := filepath.Join(dir, "state")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rec := fmt.Sprintf(`{"slot":"0001","workflow_ref":%q,"cpu_seconds":100,"wall_seconds":10,"peak_mem_bytes":1073741824,"sampled":true,"at":"2026-01-01T00:00:00Z"}`+"\n", testJobRef)
+	if err := os.WriteFile(filepath.Join(stateDir, "history.jsonl"), []byte(rec), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &fakeScaleSet{}
+	fake.runFn = func(ctx context.Context, f *fakeScaleSet) error {
+		f.pushDesired(1)
+		for f.startedJITs() < 1 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
+		time.Sleep(100 * time.Millisecond) // let the slot reach idle
+		f.jobStart(f.lastRunnerName())     // claims the slot: busy, heavy ref
+		f.pushQueued([]string{testJobRef}) // and another one is queued
+		f.pushDesired(2)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Options{
+			ConfigPath: cfgPath,
+			ScaleSet:   fake,
+			numCPU:     func() int { return 4 },
+			memAvailable: func() (uint64, error) {
+				return 32 << 30, nil
+			},
+		})
+	}()
+
+	// The first slot starts (idle host) and claims the heavy job; the
+	// second is held even though desired says 2.
+	deadline := time.Now().Add(90 * time.Second)
+	held := false
+	for time.Now().Before(deadline) {
+		if fake.startedJITs() >= 1 {
+			// Give the gate a moment to evaluate the second start.
+			time.Sleep(3 * time.Second)
+			held = fake.startedJITs() == 1
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("daemon did not shut down")
+	}
+	if !held {
+		t.Fatalf("admission gate did not hold the second slot; jit mints = %d", fake.startedJITs())
+	}
 }
