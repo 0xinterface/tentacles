@@ -169,6 +169,7 @@ type slotRec struct {
 	claimAt      time.Time // local time of the claim
 	usageAtClaim Usage     // sampler reading at claim time
 	lastUsage    Usage     // most recent sampler reading
+	sampledOK    bool      // at least one sampler reading succeeded
 }
 
 // Table is the concrete Manager: it allocates slot IDs, materializes and
@@ -269,6 +270,7 @@ func (t *Table) sampleLoop() {
 			}
 			t.mu.Lock()
 			tg.rec.lastUsage = u
+			tg.rec.sampledOK = true
 			t.mu.Unlock()
 		}
 	}
@@ -628,7 +630,7 @@ func (t *Table) ObserveExit(id ID, err error) {
 			PeakMemBytes:     rec.lastUsage.PeakMemBytes,
 			WallSeconds:      wallSeconds,
 			QueueWaitSeconds: rec.queueWait,
-			Sampled:          t.opts.usageSampler != nil,
+			Sampled:          rec.sampledOK,
 		})
 	}
 

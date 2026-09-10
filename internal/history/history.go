@@ -14,8 +14,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -208,9 +208,10 @@ func (s *Store) rotateLocked() error {
 	if err != nil {
 		return fmt.Errorf("history: stat %s: %w", s.path, err)
 	}
-	// Rough line-size bound (a record is a few hundred bytes); the
-	// exact line count is checked while rewriting.
-	if fi.Size() < int64(limit)*256 {
+	// Cheap pre-check: a record is at least ~250 bytes, so a file this
+	// small cannot hold `limit` lines. The exact line count is checked
+	// while rewriting.
+	if fi.Size() < int64(limit)*250 {
 		return nil
 	}
 	f, err := os.Open(s.path)
@@ -245,52 +246,35 @@ func (s *Store) rotateLocked() error {
 	return os.Rename(tmp, s.path)
 }
 
-// replayTail decodes the newest n records from r.
+// replayTail decodes the newest n records from r. The whole file is
+// decoded: records have no size bound (long workflow refs), so a byte
+// window could start mid-line and a single torn fragment after a crash
+// must not discard the records around it. Malformed lines are skipped.
 func replayTail(r *os.File, n int) ([]Record, error) {
-	info, err := r.Stat()
-	if err != nil {
+	if _, err := r.Seek(0, 0); err != nil {
 		return nil, err
 	}
-	// Read at most ~256 bytes per record from the tail.
-	window := int64(n) * 256
-	if window > info.Size() {
-		window = info.Size()
-	}
-	buf := make([]byte, window)
-	if _, err := r.ReadAt(buf, info.Size()-window); err != nil && err.Error() != "EOF" {
-		return nil, err
-	}
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024) // one long line is fine
 	var out []Record
-	dec := json.NewDecoder(newLineReader(buf))
-	for dec.More() {
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
 		var rec Record
-		if err := dec.Decode(&rec); err != nil {
-			break // tolerate a torn last line
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue // tolerate a torn tail from a crash mid-append
 		}
 		out = append(out, rec)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
 	}
 	if len(out) > n {
 		out = out[len(out)-n:]
 	}
 	return out, nil
-}
-
-// newLineReader wraps a byte slice in a reader that decodes consecutive
-// JSON objects separated by newlines.
-func newLineReader(b []byte) *lineReader { return &lineReader{b: b} }
-
-type lineReader struct {
-	b   []byte
-	pos int
-}
-
-func (l *lineReader) Read(p []byte) (int, error) {
-	if l.pos >= len(l.b) {
-		return 0, io.EOF
-	}
-	n := copy(p, l.b[l.pos:])
-	l.pos += n
-	return n, nil
 }
 
 // PredictCores estimates the average CPU rate (cores) of a job of ref:

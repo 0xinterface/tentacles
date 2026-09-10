@@ -1,9 +1,11 @@
 package history
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -131,5 +133,89 @@ func TestPredictCoresFallsBackToGlobal(t *testing.T) {
 	empty, _ := Open(filepath.Join(t.TempDir(), "h.jsonl"))
 	if _, ok := empty.PredictCores("a"); ok {
 		t.Fatal("empty store predicted cores")
+	}
+}
+
+// TestStoreReplayWithLongRefs: real workflow refs (owner/repo/
+// .github/workflows/x.yml@refs/heads/feature/...) push records well
+// past a few hundred bytes. Replay must not lose records for exceeding
+// a byte-size guess, and rotation must never wipe the file empty.
+func TestStoreReplayWithLongRefs(t *testing.T) {
+	longRef := "o/r/.github/workflows/ci.yml@refs/heads/feature/" + strings.Repeat("x", 300)
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s, _ := Open(path)
+	if err := s.Append(rec(longRef, 42, 7<<28, 88, true)); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := s2.Ref(longRef)
+	if st.Count != 1 || !near(st.CPUSeconds, 42) {
+		t.Fatalf("long-ref record lost on reopen: %+v", st)
+	}
+
+	// Rotation with long records keeps the newest records instead of
+	// rewriting the file empty.
+	s2.RotateLines = 2
+	if err := s2.Append(rec(longRef, 50, 0, 90, true)); err != nil {
+		t.Fatal(err)
+	}
+	s3, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := s3.Ref(longRef); st.Count == 0 {
+		t.Fatal("rotation wiped long-ref history")
+	}
+}
+
+// TestStoreReplayOversizedFile: once the file exceeds the replay window
+// (5000 * 256B), a byte-window can start mid-line and the decoder must
+// not lose every record to one torn fragment. Drives the window overflow
+// with a raw oversized file (~1.4MB, long refs).
+func TestStoreReplayOversizedFile(t *testing.T) {
+	longRef := "o/r/.github/workflows/ci.yml@refs/heads/feature/" + strings.Repeat("x", 300)
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	var b strings.Builder
+	for range 3200 {
+		b.WriteString(fmt.Sprintf(
+			`{"slot":"0001","workflow_ref":%q,"cpu_seconds":7,"peak_mem_bytes":1000,"wall_seconds":20,"sampled":true,"at":"2026-01-01T00:00:00Z"}`+"\n", longRef))
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(path); err != nil || fi.Size() < 1<<20 {
+		t.Fatalf("fixture too small to overflow the window: %v %v", fi, err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := s.Global(); st.Count < 3000 {
+		t.Fatalf("replayed only %d of 3200 records", st.Count)
+	}
+}
+
+// TestStoreRotateKeepsNewestWithLongRefs: rotation decodes the whole
+// file, so it keeps the newest records even when every record exceeds
+// the old 256-byte guess.
+func TestStoreRotateKeepsNewestWithLongRefs(t *testing.T) {
+	longRef := "o/r/.github/workflows/ci.yml@refs/heads/feature/" + strings.Repeat("x", 300)
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s, _ := Open(path)
+	s.RotateLines = 4
+	for range 10 {
+		if err := s.Append(rec(longRef, 1, 0, 5, true)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := s2.Global(); st.Count < 2 {
+		t.Fatalf("rotation lost records: kept %d", st.Count)
 	}
 }

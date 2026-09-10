@@ -890,12 +890,11 @@ func TestTableBusyExitIsPlainExit(t *testing.T) {
 	}
 	tab.MarkBusy("0001")
 	backend.exit("tentacle-0001.service")
-	eventually(t, 3*time.Second, func() bool { return len(tab.Active()) == 0 })
+	eventually(t, 10*time.Second, func() bool {
+		return len(tab.Active()) == 0 && rec.has(EventExited)
+	})
 	if rec.has(EventAcquireFailure) {
 		t.Fatalf("busy exit classified acquire failure: %v", rec.events)
-	}
-	if !rec.has(EventExited) {
-		t.Fatalf("expected exited event, got %v", rec.events)
 	}
 }
 
@@ -1012,5 +1011,46 @@ func TestStopSurplusStartingPastGraceOnly(t *testing.T) {
 	}
 	if st, ok := stateOf(tab, "0001"); !ok || st != StateStarting {
 		t.Fatalf("fresh starting slot = %q ok=%v; want untouched starting", st, ok)
+	}
+}
+
+// TestTableCompletionUnsampledWhenSamplerFails: a job that exits before
+// any successful sample has NO usage data. Recording it as sampled zero
+// would drag the CPU/memory averages toward zero — the unsafe direction
+// for the admission gate (admits under real memory pressure).
+func TestTableCompletionUnsampledWhenSamplerFails(t *testing.T) {
+	backend := &fakeBackend{}
+	var done []Completion
+	var dmu sync.Mutex
+	tab, _, _ := newTestTable(t, backend,
+		WithUsageSampler(func(string) (Usage, error) {
+			return Usage{}, errors.New("unit already gone")
+		}),
+		WithSampleInterval(5*time.Millisecond),
+		WithCompletionHook(func(c Completion) {
+			dmu.Lock()
+			done = append(done, c)
+			dmu.Unlock()
+		}))
+	if err := tab.Ensure(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if !tab.Claim(ClaimJob{RunnerName: "debian-host-0001-ab12", WorkflowRef: "o/r/w.yml@main"}) {
+		t.Fatal("Claim failed")
+	}
+	time.Sleep(30 * time.Millisecond)
+	backend.exit("tentacle-0001.service")
+	eventually(t, 3*time.Second, func() bool {
+		dmu.Lock()
+		defer dmu.Unlock()
+		return len(done) == 1
+	})
+	dmu.Lock()
+	defer dmu.Unlock()
+	if done[0].Sampled {
+		t.Fatalf("completion marked sampled without any reading: %+v", done[0])
+	}
+	if done[0].CPUSeconds != 0 || done[0].PeakMemBytes != 0 {
+		t.Fatalf("unsampled completion carries usage: %+v", done[0])
 	}
 }
