@@ -162,3 +162,55 @@ func TestQueuedHintsExpireAndAreBounded(t *testing.T) {
 		t.Fatal("consumed hint retained")
 	}
 }
+
+// TestListenerErrorsCountedOncePerRunFailure: each failed listener run
+// increments the counter exactly once, regardless of how many internal
+// layers observe the same error.
+func TestListenerErrorsCountedOncePerRunFailure(t *testing.T) {
+	cfg := &config.Config{Observability: config.Observability{Listen: "127.0.0.1:0"}, Runtime: config.Runtime{SlotStopTimeout: time.Second}}
+	d := &daemon{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), met: metrics.NewRegistry(), backend: process.New(process.Options{}), desired: &desiredCell{}, reconCh: make(chan struct{}, 1), reconcileInterval: time.Millisecond, sessionUp: make(chan struct{})}
+	attempts := 0
+	d.ss = &fakeScaleSet{runFn: func(ctx context.Context, _ *fakeScaleSet) error {
+		attempts++
+		if attempts >= 3 {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return errors.New("boom")
+	}}
+	d.table = slot.NewTable(t.TempDir(), d.backend, func(string) error { return errors.New("unexpected materialize") }, nil, t.TempDir(), d.log)
+	d.rec = reconcile.New(d.table, 0, 0, d.log)
+	defer d.close()
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	if err := d.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if attempts < 3 {
+		t.Fatalf("listener attempted %d runs, want at least 3", attempts)
+	}
+	w := httptest.NewRecorder()
+	d.met.Handler().ServeHTTP(w, httptest.NewRequest("GET", "/metrics", nil))
+	if want := "tentacles_listener_errors_total 2\n"; !strings.Contains(w.Body.String(), want) {
+		t.Fatalf("listener errors not counted once per failure (want %s):\n%s", want, w.Body.String())
+	}
+}
+
+// TestOnCompletionCountsUnknownResult: a claimed exit without a
+// JobCompleted result is reported as "unknown", not dropped.
+func TestOnCompletionCountsUnknownResult(t *testing.T) {
+	d := &daemon{met: metrics.NewRegistry(), log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	d.onCompletion(slot.Completion{Result: "success"})
+	d.onCompletion(slot.Completion{CPUSeconds: 2, Sampled: true})
+	w := httptest.NewRecorder()
+	d.met.Handler().ServeHTTP(w, httptest.NewRequest("GET", "/metrics", nil))
+	for _, want := range []string{
+		"tentacles_jobs_completed_total{result=\"success\"} 1\n",
+		"tentacles_jobs_completed_total{result=\"unknown\"} 1\n",
+		"tentacles_job_cpu_seconds_count 1\n",
+	} {
+		if !strings.Contains(w.Body.String(), want) {
+			t.Fatalf("missing %s:\n%s", want, w.Body.String())
+		}
+	}
+}

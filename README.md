@@ -507,21 +507,22 @@ notification and listener-error metrics to assess startup and connectivity.
 |---|---|
 | `tentacles_desired_runners` | last reconciliation target; refreshed once per second |
 | `tentacles_actual_runners{state=}` | slots per state (`starting`, `idle`, `busy`, `stopping`, `failed`, `empty`) |
-| `tentacles_jobs_started_total` | JobStarted messages seen |
-| `tentacles_jobs_completed_total{result=}` | JobCompleted by result (`success`, `failure`, `canceled`, ...) |
+| `tentacles_jobs_started_total` | JobStarted messages matched to a slot (claims) |
+| `tentacles_jobs_completed_total{result=}` | claimed slot exits; `result` is the JobCompleted message's value, `unknown` when that message was missed |
 | `tentacles_acquire_failures_total` | failed/uncertain starts + never-claimed exits within acquire grace |
 | `tentacles_slot_start_seconds` | histogram of full provision time for successful starts |
-| `tentacles_listener_errors_total` | listener/session failures |
+| `tentacles_listener_errors_total` | failed listener runs, counted once per failure |
 | `tentacles_last_message_id` | last scale-set message ID processed |
 | `tentacles_job_cpu_seconds` / `tentacles_job_wall_seconds` | sampled CPU / elapsed time for completed claimed slots; see collection conditions below |
 | `tentacles_last_job_peak_memory_bytes` | most recent nonzero completed-job memory sample |
 | `tentacles_admission_holds_total` | starts held by the admission gate |
 
-Job CPU, wall-time, and peak-memory metrics are updated only when
-`scaling.admission_control` is enabled and the history store opens
-successfully. CPU and memory depend on successful systemd samples; wall
-time runs from the observed claim to slot exit. The separate job-started
-and job-completed counters count listener messages independently.
+Job CPU and peak memory depend on successful systemd samples; wall time
+runs from the observed claim to slot exit. `jobs_started_total` counts
+claims matched to a slot, and `jobs_completed_total` counts claimed slot
+exits, so neither counter drops jobs when the listener reconnects; the
+completion message's result labels the exit, or `unknown` if it never
+arrived. Listener failures are counted once per failed listener run.
 
 `_diag` shipping is on by default. Disabling it loses those files when
 the slot is removed, although runner stdout/stderr may remain in the job

@@ -236,7 +236,7 @@ func (r *Registry) render() string {
 		},
 		{
 			name:  "tentacles_jobs_completed_total",
-			help:  "Total number of completed jobs, by result.",
+			help:  "Total number of completed jobs, by reported result (\"unknown\": completion message missed).",
 			typ:   "counter",
 			lines: r.jobsCompletedLines(),
 		},
@@ -294,7 +294,7 @@ func (r *Registry) render() string {
 		},
 		{
 			name:  "tentacles_slot_start_seconds",
-			help:  "Time to start a runner slot.",
+			help:  "Provision time of successful slot starts.",
 			typ:   "histogram",
 			lines: r.slotStartLines(),
 		},

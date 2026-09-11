@@ -1056,3 +1056,57 @@ func TestTableCompletionUnsampledWhenSamplerFails(t *testing.T) {
 		t.Fatalf("unsampled completion carries usage: %+v", done[0])
 	}
 }
+
+// TestTableMarkResultLabelsCompletion: a result recorded from the
+// JobCompleted message names the slot's completion; a missed message
+// leaves the result empty (the daemon reports "unknown").
+func TestTableMarkResultLabelsCompletion(t *testing.T) {
+	backend := &fakeBackend{}
+	var mu sync.Mutex
+	var done []Completion
+	tab, _, _ := newTestTable(t, backend, WithCompletionHook(func(c Completion) {
+		mu.Lock()
+		done = append(done, c)
+		mu.Unlock()
+	}))
+	if err := tab.Ensure(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if !tab.Claim(ClaimJob{RunnerName: "debian-host-0001-ab12", WorkflowRef: "o/r/w.yml@main"}) {
+		t.Fatal("Claim failed")
+	}
+	// A result for a runner we do not track is ignored, not stored.
+	tab.MarkResult("debian-host-9999-zz99", "failure")
+	tab.MarkResult("debian-host-0001-ab12", "failure")
+	backend.exit("tentacle-0001.service")
+	eventually(t, 3*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(done) == 1
+	})
+	mu.Lock()
+	if got := done[0].Result; got != "failure" {
+		t.Fatalf("completion result = %q, want failure", got)
+	}
+	mu.Unlock()
+
+	// A second job whose completion message never arrived (listener
+	// outage) exits with an empty result instead of a stale label.
+	if err := tab.Ensure(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if !tab.Claim(ClaimJob{RunnerName: "debian-host-0001-ab12", WorkflowRef: "o/r/w.yml@main"}) {
+		t.Fatal("second Claim failed")
+	}
+	backend.exit("tentacle-0001.service")
+	eventually(t, 3*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(done) == 2
+	})
+	mu.Lock()
+	defer mu.Unlock()
+	if got := done[1].Result; got != "" {
+		t.Fatalf("unlabeled completion result = %q, want empty", got)
+	}
+}

@@ -317,30 +317,8 @@ func newDaemonContext(ctx context.Context, cfg *config.Config, log *slog.Logger,
 	}
 	if cfg.Scaling.AdmissionControl && d.hist != nil {
 		tableOpts = append(tableOpts, slot.WithGate(d.admissionGate), slot.WithReservation(d.candidateEstimate))
-		tableOpts = append(tableOpts, slot.WithCompletionHook(func(c slot.Completion) {
-			err := d.hist.Append(history.Record{
-				Slot:             string(c.ID),
-				WorkflowRef:      c.WorkflowRef,
-				RunID:            c.RunID,
-				CPUSeconds:       c.CPUSeconds,
-				PeakMemBytes:     c.PeakMemBytes,
-				WallSeconds:      c.WallSeconds,
-				QueueWaitSeconds: c.QueueWaitSeconds,
-				Sampled:          c.Sampled,
-				At:               time.Now(),
-			})
-			if err != nil {
-				log.Warn("usage history append failed", "err", err)
-			}
-			if c.Sampled {
-				d.met.ObserveJobCPU(c.CPUSeconds)
-			}
-			if c.PeakMemBytes > 0 {
-				d.met.SetJobPeakMem(c.PeakMemBytes)
-			}
-			d.met.ObserveJobWall(c.WallSeconds)
-		}))
 	}
+	tableOpts = append(tableOpts, slot.WithCompletionHook(d.onCompletion))
 	d.table = slot.NewTable(
 		filepath.Join(cfg.Paths.StateDir, "slots"),
 		d.backend,
@@ -373,7 +351,6 @@ func (d *daemon) buildEvents(requestReconcile func()) scaleset.Events {
 			requestReconcile()
 		},
 		JobStart: func(job scaleset.Job) {
-			d.met.IncJobsStarted()
 			if d.table == nil {
 				return
 			}
@@ -383,6 +360,7 @@ func (d *daemon) buildEvents(requestReconcile func()) scaleset.Events {
 				RunID:            job.WorkflowRunID,
 				QueueWaitSeconds: queueWait(job),
 			}) {
+				d.met.IncJobsStarted()
 				d.log.Info("runner busy", "runner_name", job.RunnerName, "workflow_ref", job.WorkflowRef)
 				d.consumeQueuedRef(job.WorkflowRef)
 			} else {
@@ -390,7 +368,9 @@ func (d *daemon) buildEvents(requestReconcile func()) scaleset.Events {
 			}
 		},
 		JobEnd: func(job scaleset.Job) {
-			d.met.IncJobsCompleted(job.Result)
+			if d.table != nil {
+				d.table.MarkResult(job.RunnerName, job.Result)
+			}
 			d.log.Info("job completed", "runner_name", job.RunnerName, "result", job.Result)
 		},
 		Queued: func(refs []string) {
@@ -401,7 +381,6 @@ func (d *daemon) buildEvents(requestReconcile func()) scaleset.Events {
 		},
 		Session: func(err error) {
 			if err != nil {
-				d.met.IncListenerErrors()
 				d.log.Error("listener session ended", "err", err)
 			}
 		},
@@ -643,6 +622,39 @@ func (d *daemon) onSlotEvent(event slot.Event, s slot.Slot) {
 		d.log.Info("slot stopped", "slot", s.ID, "runner_name", s.RunnerName, "unit", s.Unit)
 		d.requestReconcile()
 	}
+}
+
+// onCompletion counts one claimed slot exit and records its usage. The
+// JobCompleted message's result labels the metric; a missed message
+// (listener outage) reports "unknown" rather than dropping the job.
+func (d *daemon) onCompletion(c slot.Completion) {
+	if d.hist != nil {
+		if err := d.hist.Append(history.Record{
+			Slot:             string(c.ID),
+			WorkflowRef:      c.WorkflowRef,
+			RunID:            c.RunID,
+			CPUSeconds:       c.CPUSeconds,
+			PeakMemBytes:     c.PeakMemBytes,
+			WallSeconds:      c.WallSeconds,
+			QueueWaitSeconds: c.QueueWaitSeconds,
+			Sampled:          c.Sampled,
+			At:               time.Now(),
+		}); err != nil {
+			d.log.Warn("usage history append failed", "err", err)
+		}
+	}
+	if c.Sampled {
+		d.met.ObserveJobCPU(c.CPUSeconds)
+	}
+	if c.PeakMemBytes > 0 {
+		d.met.SetJobPeakMem(c.PeakMemBytes)
+	}
+	d.met.ObserveJobWall(c.WallSeconds)
+	result := c.Result
+	if result == "" {
+		result = "unknown"
+	}
+	d.met.IncJobsCompleted(result)
 }
 
 func (d *daemon) run(ctx context.Context) error {

@@ -192,6 +192,7 @@ type slotRec struct {
 	busySince      time.Time // set when the runner first claims a job; zero = never busy
 	provStart      time.Time // when provisioning began; drives starting-past-grace stops
 	claimed        bool      // a JobStarted was seen for this slot
+	result         string    // GitHub-reported job result (JobCompleted message), empty until it arrives
 	queueWait      float64   // GitHub-reported queue wait at claim
 	claimAt        time.Time // local time of the claim
 	usageAtClaim   Usage     // sampler reading at claim time
@@ -659,6 +660,24 @@ func (t *Table) Claim(job ClaimJob) bool {
 	return false
 }
 
+// MarkResult records the job result reported by the JobCompleted
+// scale-set message so the slot's completion carries it. Results for
+// unknown or already-exited runners are dropped: a completion already
+// counted cannot retroactively change its label.
+func (t *Table) MarkResult(runnerName, result string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if result == "" {
+		return
+	}
+	for _, rec := range t.slots {
+		if rec.RunnerName == runnerName && rec.State.Live() {
+			rec.result = result
+			return
+		}
+	}
+}
+
 // ObserveExit records a runner process exit and releases the slot: the
 // diag hook runs (best-effort), the JIT file and slot directory are
 // wiped, and the ID is freed for reuse.
@@ -702,7 +721,7 @@ func (t *Table) observeExitContext(ctx context.Context, id ID, expected *slotRec
 	var completion *Completion
 	if rec.claimed && !rec.completionSent && t.opts.completionHook != nil {
 		rec.completionSent = true
-		c := Completion{ID: id, RunnerName: rec.RunnerName, WorkflowRef: rec.WorkflowRef, RunID: rec.RunID,
+		c := Completion{ID: id, RunnerName: rec.RunnerName, WorkflowRef: rec.WorkflowRef, RunID: rec.RunID, Result: rec.result,
 			CPUSeconds: max(0, rec.lastUsage.CPUSeconds-rec.usageAtClaim.CPUSeconds), PeakMemBytes: rec.lastUsage.PeakMemBytes,
 			QueueWaitSeconds: rec.queueWait, Sampled: rec.sampledOK}
 		if !rec.claimAt.IsZero() {

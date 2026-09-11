@@ -70,7 +70,7 @@ tentacles_job_wall_seconds_bucket{le="3600"} 1
 tentacles_job_wall_seconds_bucket{le="+Inf"} 1
 tentacles_job_wall_seconds_sum 90
 tentacles_job_wall_seconds_count 1
-# HELP tentacles_jobs_completed_total Total number of completed jobs, by result.
+# HELP tentacles_jobs_completed_total Total number of completed jobs, by reported result ("unknown": completion message missed).
 # TYPE tentacles_jobs_completed_total counter
 tentacles_jobs_completed_total{result="failure"} 1
 tentacles_jobs_completed_total{result="success"} 1
@@ -86,7 +86,7 @@ tentacles_last_message_id 42
 # HELP tentacles_listener_errors_total Total number of scale-set listener loop errors.
 # TYPE tentacles_listener_errors_total counter
 tentacles_listener_errors_total 1
-# HELP tentacles_slot_start_seconds Time to start a runner slot.
+# HELP tentacles_slot_start_seconds Provision time of successful slot starts.
 # TYPE tentacles_slot_start_seconds histogram
 tentacles_slot_start_seconds_bucket{le="0.05"} 1
 tentacles_slot_start_seconds_bucket{le="0.1"} 1
@@ -163,7 +163,7 @@ tentacles_last_message_id 0
 # HELP tentacles_listener_errors_total Total number of scale-set listener loop errors.
 # TYPE tentacles_listener_errors_total counter
 tentacles_listener_errors_total 0
-# HELP tentacles_slot_start_seconds Time to start a runner slot.
+# HELP tentacles_slot_start_seconds Provision time of successful slot starts.
 # TYPE tentacles_slot_start_seconds histogram
 tentacles_slot_start_seconds_bucket{le="0.05"} 0
 tentacles_slot_start_seconds_bucket{le="0.1"} 0
