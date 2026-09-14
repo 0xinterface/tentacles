@@ -6,27 +6,48 @@
 # production locations listed in README.md, set backend=systemd, and keep
 # the version and verified sha256 together.
 
-github:
-  url: https://github.com
-  app:
-    client_id: Iv1.xxxxxxxx
-    installation_id: 12345678
-    private_key_path: testdata/dry-run.pem
-  scope:
-    kind: organization          # organization | repository
-    owner: my-org
-    repository: ""              # required if kind=repository
+pools:
+  - id: my-org
+    github:
+      url: https://github.com
+      app:
+        client_id: Iv1.xxxxxxxx
+        installation_id: 12345678
+        private_key_path: testdata/dry-run.pem
+      scope:
+        kind: organization          # organization | repository
+        owner: my-org
+        repository: ""              # required if kind=repository
+    scale_set:
+      name: debian-host             # this is runs-on
+      runner_group: Default
+      extra_labels: []              # github.com cloud: usually just the name
+    capacity:
+      min_runners: 0
+      max_runners: 4
 
-scale_set:
-  name: debian-host             # this is runs-on
-  runner_group: Default
-  extra_labels: []              # github.com cloud: usually just the name
-
+  - id: another-org
+    github:
+      url: https://github.com
+      app:
+        client_id: Iv1.xxxxxxxx      # may reuse the same App and PEM
+        installation_id: 87654321    # installation ID is organization-specific
+        private_key_path: testdata/dry-run.pem
+      scope:
+        kind: organization
+        owner: another-org
+        repository: ""
+    scale_set:
+      name: debian-host
+      runner_group: Default
+      extra_labels: []
+    capacity:
+      min_runners: 0
+      max_runners: 4
 capacity:
-  min_runners: 0
-  max_runners: 4
-  job_cpu_quota_percent: 400    # systemd CPUQuota
-  job_memory_max: 8G
+  max_runners: 4                    # hard ceiling across every pool
+  job_cpu_quota_percent: 400        # per-slot systemd CPUQuota
+  job_memory_max: 8G                # per-slot systemd MemoryMax
 
 runner:
   version: 2.337.0              # pin in production; omit to track the latest release

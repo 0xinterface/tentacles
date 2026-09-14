@@ -31,7 +31,7 @@ func TestWaitRejectsUntrustworthyObservation(t *testing.T) {
 			b := New(Options{SystemctlBin: bin})
 			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 			defer cancel()
-			if err := b.Wait(ctx, "tentacle-0001.service"); err == nil {
+			if err := b.Wait(ctx, "tentacle-default-0001.service"); err == nil {
 				t.Fatal("uncertain observation confirmed exit")
 			}
 		})
@@ -40,7 +40,7 @@ func TestWaitRejectsUntrustworthyObservation(t *testing.T) {
 
 func TestActiveRejectsMalformedOutput(t *testing.T) {
 	b, _, _ := newTestBackend(t)
-	for _, line := range []string{"garbage", "tentacle-0001.service", "tentacle-0001.service loaded nonsense running"} {
+	for _, line := range []string{"garbage", "tentacle-default-0001.service", "tentacle-0001.service loaded nonsense running"} {
 		t.Setenv("FAKE_SYSTEMCTL_LIST", line)
 		if _, err := b.Active(context.Background()); err == nil {
 			t.Errorf("accepted malformed output %q", line)
@@ -51,7 +51,7 @@ func TestActiveRejectsMalformedOutput(t *testing.T) {
 func TestWaitConfirmsCollectedUnit(t *testing.T) {
 	bin := writeFakeBin(t, t.TempDir(), "systemctl", "printf 'LoadState=not-found\\nActiveState=inactive\\n'")
 	b := New(Options{SystemctlBin: bin})
-	if err := b.Wait(context.Background(), "tentacle-0001.service"); err != nil {
+	if err := b.Wait(context.Background(), "tentacle-default-0001.service"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -62,7 +62,7 @@ func TestWaitCancelsSystemctlDescendants(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	if err := b.Wait(ctx, "tentacle-0001.service"); err != context.DeadlineExceeded {
+	if err := b.Wait(ctx, "tentacle-default-0001.service"); err != context.DeadlineExceeded {
 		t.Fatalf("Wait=%v", err)
 	}
 	if time.Since(started) > time.Second {

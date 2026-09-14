@@ -38,6 +38,8 @@ type Options struct {
 	Log *slog.Logger
 	// StopTimeout is the TimeoutStopSec value set on each slot unit.
 	StopTimeout time.Duration
+	// Namespace is the configured pool ID embedded in every transient unit.
+	Namespace string
 }
 
 // runnerCacheSubdirs are the HOME-relative shared cache locations jobs
@@ -45,12 +47,14 @@ type Options struct {
 // use the host's toolchains and shared caches.
 var runnerCacheSubdirs = []string{".cache", ".local/share/mise", "go/pkg/mod"}
 
-// Backend starts, stops, and waits on transient tentacle-<id>.service
-// units. All methods are safe for concurrent use.
+// Backend starts, stops, and waits on transient
+// tentacle-<pool>-<id>.service units. All methods are safe for concurrent
+// use.
 type Backend struct {
 	systemdRunBin string
 	systemctlBin  string
 	log           *slog.Logger
+	namespace     string
 	stopTimeout   time.Duration
 
 	mu      sync.Mutex
@@ -74,9 +78,14 @@ func New(opts Options) *Backend {
 	if opts.StopTimeout <= 0 {
 		opts.StopTimeout = 30 * time.Second
 	}
+	namespace := opts.Namespace
+	if namespace == "" {
+		namespace = "default"
+	}
 	return &Backend{
 		systemdRunBin: runBin,
 		systemctlBin:  ctlBin,
+		namespace:     namespace,
 		log:           log,
 		stopTimeout:   opts.StopTimeout,
 		started:       make(map[string]struct{}),
@@ -109,8 +118,8 @@ func (b *Backend) Start(ctx context.Context, spec runner.Spec) (retErr error) {
 	if identity.UID == 0 {
 		return fmt.Errorf("systemd: runner user must be unprivileged")
 	}
-	if !validUnit(spec.UnitName) {
-		return fmt.Errorf("systemd: invalid slot unit %q", spec.UnitName)
+	if !validUnit(b.namespace, spec.UnitName) {
+		return fmt.Errorf("systemd: invalid slot unit %q for pool %q", spec.UnitName, b.namespace)
 	}
 	if !filepath.IsAbs(spec.SlotDir) || !filepath.IsAbs(spec.JITPath) {
 		return fmt.Errorf("systemd: slot and JIT paths must be absolute")
@@ -224,16 +233,45 @@ func cachePaths(home string) []string {
 	return paths
 }
 
-func validUnit(unit string) bool {
-	if !strings.HasPrefix(unit, "tentacle-") || !strings.HasSuffix(unit, ".service") {
-		return false
+func validUnit(namespace, unit string) bool {
+	unitNamespace, ok := namespaceFromUnit(unit)
+	return ok && unitNamespace == namespace
+}
+
+// namespaceFromUnit parses from the final numeric slot suffix. A systemctl
+// glob for "org-a" also returns units from "org-a-b"; parsing the whole name
+// lets each adapter ignore valid units owned by another pool.
+func namespaceFromUnit(unit string) (string, bool) {
+	const prefix = "tentacle-"
+	const suffix = ".service"
+	if !strings.HasPrefix(unit, prefix) || !strings.HasSuffix(unit, suffix) {
+		return "", false
 	}
-	id := strings.TrimSuffix(strings.TrimPrefix(unit, "tentacle-"), ".service")
-	if id == "" {
-		return false
+	body := strings.TrimSuffix(strings.TrimPrefix(unit, prefix), suffix)
+	separator := strings.LastIndexByte(body, '-')
+	if separator <= 0 || separator == len(body)-1 {
+		return "", false
 	}
-	for _, r := range id {
+	namespace := body[:separator]
+	if !validNamespace(namespace) {
+		return "", false
+	}
+	for _, r := range body[separator+1:] {
 		if r < '0' || r > '9' {
+			return "", false
+		}
+	}
+	return namespace, true
+}
+
+func validNamespace(namespace string) bool {
+	if len(namespace) == 0 || len(namespace) > 32 {
+		return false
+	}
+	for i, r := range namespace {
+		isDigit := r >= '0' && r <= '9'
+		isLower := r >= 'a' && r <= 'z'
+		if !isDigit && !isLower && (i == 0 || r != '-') {
 			return false
 		}
 	}
@@ -245,8 +283,8 @@ func validUnit(unit string) bool {
 func (b *Backend) Stop(ctx context.Context, unit string) error {
 	ctx, cancel := context.WithTimeout(ctx, b.stopTimeout+10*time.Second)
 	defer cancel()
-	if !validUnit(unit) {
-		return fmt.Errorf("systemd: invalid slot unit %q", unit)
+	if !validUnit(b.namespace, unit) {
+		return fmt.Errorf("systemd: invalid slot unit %q for pool %q", unit, b.namespace)
 	}
 	cmd := runner.CommandContext(ctx, b.systemctlBin, "stop", unit)
 	out, err := cmd.CombinedOutput()
@@ -263,8 +301,8 @@ func (b *Backend) Stop(ctx context.Context, unit string) error {
 // Wait confirms exit only after a successful, well-formed state query.
 // Communication errors and malformed output never establish that a job ended.
 func (b *Backend) Wait(ctx context.Context, unit string) error {
-	if !validUnit(unit) {
-		return fmt.Errorf("systemd: invalid slot unit %q", unit)
+	if !validUnit(b.namespace, unit) {
+		return fmt.Errorf("systemd: invalid slot unit %q for pool %q", unit, b.namespace)
 	}
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
@@ -320,16 +358,16 @@ func (b *Backend) isActive(ctx context.Context, unit string) (string, error) {
 	}
 }
 
-// Active lists the running tentacle-*.service units on the host (used for
-// boot adoption). Command errors — e.g. no systemd running — are returned
-// honestly so the caller can decide how to treat them. The scan also
-// prunes the started set to units that are still around.
+// Active lists this pool's running transient units on the host for boot
+// adoption. Command errors are returned honestly so the caller can decide
+// how to treat them. The scan also prunes the started set.
 func (b *Backend) Active(ctx context.Context) ([]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	var stderr bytes.Buffer
+	pattern := "tentacle-" + b.namespace + "-*.service"
 	cmd := runner.CommandContext(ctx, b.systemctlBin,
-		"list-units", "tentacle-*.service", "--no-legend", "--plain", "--no-pager", "--full", "--all")
+		"list-units", pattern, "--no-legend", "--plain", "--no-pager", "--full", "--all")
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
@@ -341,8 +379,15 @@ func (b *Backend) Active(ctx context.Context) ([]string, error) {
 		if len(fields) == 0 {
 			continue
 		}
-		if len(fields) < 4 || !validUnit(fields[0]) {
+		if len(fields) < 4 {
 			return nil, fmt.Errorf("systemd: malformed list-units output")
+		}
+		namespace, ok := namespaceFromUnit(fields[0])
+		if !ok {
+			return nil, fmt.Errorf("systemd: malformed list-units output")
+		}
+		if namespace != b.namespace {
+			continue
 		}
 		switch fields[2] {
 		case "active", "activating", "deactivating", "reloading", "maintenance", "refreshing", "inactive", "failed":
@@ -369,6 +414,9 @@ func (b *Backend) Active(ctx context.Context) ([]string, error) {
 // usage can be attributed at exit, before systemd garbage-collects the
 // unit.
 func (b *Backend) Usage(unit string) (slot.Usage, error) {
+	if !validUnit(b.namespace, unit) {
+		return slot.Usage{}, fmt.Errorf("systemd: invalid slot unit %q for pool %q", unit, b.namespace)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cmd := runner.CommandContext(ctx, b.systemctlBin, "show", unit,

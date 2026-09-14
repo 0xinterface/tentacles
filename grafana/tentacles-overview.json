@@ -61,7 +61,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(tentacles_actual_runners{job=~\"$job\",state=~\"starting|idle|busy|stopping\"})",
+          "expr": "sum(tentacles_actual_runners{job=~\"$job\",pool=~\"$pool\",state=~\"starting|idle|busy|stopping\"})",
           "legendFormat": "live",
           "refId": "A"
         }
@@ -101,7 +101,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(tentacles_actual_runners{job=~\"$job\",state=\"busy\"})",
+          "expr": "sum(tentacles_actual_runners{job=~\"$job\",pool=~\"$pool\",state=\"busy\"})",
           "legendFormat": "busy",
           "refId": "A"
         }
@@ -141,7 +141,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(tentacles_desired_runners{job=~\"$job\"})",
+          "expr": "sum(tentacles_desired_runners{job=~\"$job\",pool=~\"$pool\"})",
           "legendFormat": "desired",
           "refId": "A"
         }
@@ -185,7 +185,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "100 * (sum(rate(tentacles_jobs_completed_total{job=~\"$job\",result=\"failure\"}[$__rate_interval])) / sum(rate(tentacles_jobs_completed_total{job=~\"$job\"}[$__rate_interval])))",
+          "expr": "100 * (sum(rate(tentacles_jobs_completed_total{job=~\"$job\",pool=~\"$pool\",result=\"failure\"}[$__rate_interval])) / sum(rate(tentacles_jobs_completed_total{job=~\"$job\",pool=~\"$pool\"}[$__rate_interval])))",
           "legendFormat": "failure %",
           "refId": "A"
         }
@@ -226,7 +226,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(increase(tentacles_listener_errors_total{job=~\"$job\"}[1h]))",
+          "expr": "sum(increase(tentacles_listener_errors_total{job=~\"$job\",pool=~\"$pool\"}[1h]))",
           "legendFormat": "errors",
           "refId": "A"
         }
@@ -268,7 +268,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(increase(tentacles_acquire_failures_total{job=~\"$job\"}[1h]))",
+          "expr": "sum(increase(tentacles_acquire_failures_total{job=~\"$job\",pool=~\"$pool\"}[1h]))",
           "legendFormat": "failures",
           "refId": "A"
         }
@@ -309,7 +309,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(increase(tentacles_admission_holds_total{job=~\"$job\"}[1h]))",
+          "expr": "sum(increase(tentacles_admission_holds_total{job=~\"$job\",pool=~\"$pool\"}[1h]))",
           "legendFormat": "holds",
           "refId": "A"
         }
@@ -349,8 +349,8 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "tentacles_last_job_peak_memory_bytes{job=~\"$job\"}",
-          "legendFormat": "peak",
+          "expr": "tentacles_last_job_peak_memory_bytes{job=~\"$job\",pool=~\"$pool\"}",
+          "legendFormat": "{{pool}} peak",
           "refId": "A"
         }
       ],
@@ -404,18 +404,24 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "tentacles_desired_runners{job=~\"$job\"}",
-          "legendFormat": "desired",
+          "expr": "tentacles_desired_runners{job=~\"$job\",pool=~\"$pool\"}",
+          "legendFormat": "{{pool}} desired",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "tentacles_actual_runners{job=~\"$job\",state!=\"empty\",state!=\"failed\"}",
-          "legendFormat": "{{state}}",
+          "expr": "tentacles_actual_runners{job=~\"$job\",pool=~\"$pool\",state!=\"empty\",state!=\"failed\"}",
+          "legendFormat": "{{pool}} {{state}}",
           "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "tentacles_host_max_runners{job=~\"$job\"}",
+          "legendFormat": "{{instance}} host max",
+          "refId": "C"
         }
       ],
-      "title": "Capacity: Desired vs Actual by State",
+      "title": "Capacity: Pool Demand, Actual, and Host Ceiling",
       "type": "timeseries"
     },
     {
@@ -458,8 +464,8 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "tentacles_desired_runners{job=~\"$job\"} - on(instance) sum by (instance)(tentacles_actual_runners{job=~\"$job\",state=~\"starting|idle|busy\"})",
-          "legendFormat": "deficit {{instance}}",
+          "expr": "tentacles_desired_runners{job=~\"$job\",pool=~\"$pool\"} - on(instance,pool) sum by (instance,pool)(tentacles_actual_runners{job=~\"$job\",pool=~\"$pool\",state=~\"starting|idle|busy\"})",
+          "legendFormat": "{{pool}} deficit",
           "refId": "A"
         }
       ],
@@ -514,7 +520,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum by (result)(rate(tentacles_jobs_completed_total{job=~\"$job\"}[$__rate_interval]))",
+          "expr": "sum by (result)(rate(tentacles_jobs_completed_total{job=~\"$job\",pool=~\"$pool\"}[$__rate_interval]))",
           "legendFormat": "{{result}}",
           "refId": "A"
         }
@@ -562,19 +568,19 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "histogram_quantile(0.50, sum by (le)(rate(tentacles_slot_start_seconds_bucket{job=~\"$job\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le)(rate(tentacles_slot_start_seconds_bucket{job=~\"$job\",pool=~\"$pool\"}[$__rate_interval])))",
           "legendFormat": "p50",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "histogram_quantile(0.95, sum by (le)(rate(tentacles_slot_start_seconds_bucket{job=~\"$job\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le)(rate(tentacles_slot_start_seconds_bucket{job=~\"$job\",pool=~\"$pool\"}[$__rate_interval])))",
           "legendFormat": "p95",
           "refId": "B"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "histogram_quantile(0.99, sum by (le)(rate(tentacles_slot_start_seconds_bucket{job=~\"$job\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le)(rate(tentacles_slot_start_seconds_bucket{job=~\"$job\",pool=~\"$pool\"}[$__rate_interval])))",
           "legendFormat": "p99",
           "refId": "C"
         }
@@ -622,13 +628,13 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "histogram_quantile(0.50, sum by (le)(rate(tentacles_job_cpu_seconds_bucket{job=~\"$job\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le)(rate(tentacles_job_cpu_seconds_bucket{job=~\"$job\",pool=~\"$pool\"}[$__rate_interval])))",
           "legendFormat": "p50",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "histogram_quantile(0.95, sum by (le)(rate(tentacles_job_cpu_seconds_bucket{job=~\"$job\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le)(rate(tentacles_job_cpu_seconds_bucket{job=~\"$job\",pool=~\"$pool\"}[$__rate_interval])))",
           "legendFormat": "p95",
           "refId": "B"
         }
@@ -676,13 +682,13 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "histogram_quantile(0.50, sum by (le)(rate(tentacles_job_wall_seconds_bucket{job=~\"$job\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le)(rate(tentacles_job_wall_seconds_bucket{job=~\"$job\",pool=~\"$pool\"}[$__rate_interval])))",
           "legendFormat": "p50",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "histogram_quantile(0.95, sum by (le)(rate(tentacles_job_wall_seconds_bucket{job=~\"$job\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le)(rate(tentacles_job_wall_seconds_bucket{job=~\"$job\",pool=~\"$pool\"}[$__rate_interval])))",
           "legendFormat": "p95",
           "refId": "B"
         }
@@ -721,7 +727,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum by (le)(increase(tentacles_job_wall_seconds_bucket{job=~\"$job\"}[$__interval]))",
+          "expr": "sum by (le)(increase(tentacles_job_wall_seconds_bucket{job=~\"$job\",pool=~\"$pool\"}[$__interval]))",
           "legendFormat": "{{le}}",
           "refId": "A"
         }
@@ -760,7 +766,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "exemplar": false,
-          "expr": "sum by (state)(tentacles_actual_runners{job=~\"$job\"})",
+          "expr": "sum by (state)(tentacles_actual_runners{job=~\"$job\",pool=~\"$pool\"})",
           "format": "table",
           "instant": true,
           "legendFormat": "{{state}}",
@@ -826,8 +832,8 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "tentacles_last_message_id{job=~\"$job\"}",
-          "legendFormat": "message id",
+          "expr": "tentacles_last_message_id{job=~\"$job\",pool=~\"$pool\"}",
+          "legendFormat": "{{pool}} message id",
           "refId": "A"
         }
       ],
@@ -874,7 +880,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(tentacles_jobs_started_total{job=~\"$job\"}[$__rate_interval]))",
+          "expr": "sum(rate(tentacles_jobs_started_total{job=~\"$job\",pool=~\"$pool\"}[$__rate_interval]))",
           "legendFormat": "claims/s",
           "refId": "A"
         }
@@ -931,13 +937,13 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(tentacles_admission_holds_total{job=~\"$job\"}[$__rate_interval]))",
+          "expr": "sum(rate(tentacles_admission_holds_total{job=~\"$job\",pool=~\"$pool\"}[$__rate_interval]))",
           "legendFormat": "admission holds/s",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(tentacles_acquire_failures_total{job=~\"$job\"}[$__rate_interval]))",
+          "expr": "sum(rate(tentacles_acquire_failures_total{job=~\"$job\",pool=~\"$pool\"}[$__rate_interval]))",
           "legendFormat": "acquire failures/s",
           "refId": "B"
         }
@@ -983,6 +989,25 @@
         "refresh": 2,
         "regex": "",
         "type": "query"
+      },
+      {
+        "current": { "selected": true, "text": ["All"], "value": ["$__all"] },
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "definition": "label_values(tentacles_desired_runners{job=~\"$job\"}, pool)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Runner pool",
+        "multi": true,
+        "name": "pool",
+        "options": [],
+        "query": {
+          "qryType": 1,
+          "query": "label_values(tentacles_desired_runners{job=~\"$job\"}, pool)",
+          "refId": "PrometheusVariableQueryEditor-PoolVariable"
+        },
+        "refresh": 2,
+        "regex": "",
+        "type": "query"
       }
     ]
   },
@@ -991,6 +1016,6 @@
   "timezone": "browser",
   "title": "tentacles · GitHub Actions Runner Host",
   "uid": "tentacles-overview",
-  "version": 1,
+  "version": 3,
   "weekStart": ""
 }

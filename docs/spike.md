@@ -107,9 +107,10 @@ hardening props) then comes from config as `-p` properties — no root-owned
 drop-in files to render, no dbus/cgo dependency, compiles and unit-tests
 anywhere (tests inject fake `systemd-run`/`systemctl` via `PATH`).
 
-Unit naming: `tentacle-<id>.service` (e.g. `tentacle-0001.service`) —
-`systemd-run --unit=tentacle-0001`. Transient units unload when the process
-exits; boot adoption lists `tentacle-*.service`.
+Unit naming is pool-qualified:
+`tentacle-<pool>-<id>.service` (for example,
+`tentacle-org-a-0001.service`). Each systemd adapter lists only
+`tentacle-<pool>-*.service`, preventing cross-pool boot adoption.
 
 ## Preview-API landmines
 

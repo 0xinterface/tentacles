@@ -63,13 +63,15 @@ func Load(path string) (*Config, error) {
 // disableUpdateSet and shipDiagSet report whether the operator wrote the
 // key explicitly (so an explicit false survives).
 func applyDefaults(c *Config, disableUpdateSet, shipDiagSet, admissionSet, marginSet bool) {
-	if c.GitHub.URL == "" {
-		c.GitHub.URL = DefaultGitHubURL
-	}
-	c.GitHub.URL = strings.TrimRight(c.GitHub.URL, "/")
-
-	if c.ScaleSet.RunnerGroup == "" {
-		c.ScaleSet.RunnerGroup = DefaultRunnerGroup
+	for i := range c.Pools {
+		pool := &c.Pools[i]
+		if pool.GitHub.URL == "" {
+			pool.GitHub.URL = DefaultGitHubURL
+		}
+		pool.GitHub.URL = strings.TrimRight(pool.GitHub.URL, "/")
+		if pool.ScaleSet.RunnerGroup == "" {
+			pool.ScaleSet.RunnerGroup = DefaultRunnerGroup
+		}
 	}
 
 	if c.Runner.WorkDirectory == "" {

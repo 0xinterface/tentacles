@@ -221,7 +221,7 @@ func TestAcquisitionPauseStopsOngoingEnsure(t *testing.T) {
 	b.onStart = func(runner.Spec) {
 		starts++
 		if starts == 2 {
-			b.exit("tentacle-0001.service")
+			b.exit("tentacle-default-0001.service")
 			<-failed
 		}
 	}

@@ -31,7 +31,7 @@ type Spec struct {
 	Group     string // unix group ("" = account primary group)
 	CPUQuota  string // e.g. "400%" (systemd CPUQuota syntax)
 	MemoryMax string // e.g. "8G" (systemd MemoryMax syntax)
-	UnitName  string // e.g. "tentacle-0001.service"
+	UnitName  string // e.g. "tentacle-org-a-0001.service"
 }
 
 // Backend starts and stops runner processes. Implementations:
@@ -48,7 +48,7 @@ type Backend interface {
 	// Wait returns nil only for confirmed exit. Any error is an observation
 	// failure; callers must retain the slot and retry before cleanup.
 	Wait(ctx context.Context, unit string) error
-	// Active lists currently-running unit names owned by this backend
-	// (e.g. tentacle-0001.service). Used for boot adoption.
+	// Active lists currently-running unit names owned by this pool's adapter
+	// (e.g. tentacle-org-a-0001.service). Used for boot adoption.
 	Active(ctx context.Context) ([]string, error)
 }

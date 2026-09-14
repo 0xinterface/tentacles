@@ -1,13 +1,14 @@
 # tentacles
 
-`tentacles` is a single-host supervisor for GitHub Actions runners. It
-authenticates as a GitHub App, owns one runner scale set through
-[`github.com/actions/scaleset`](https://github.com/actions/scaleset), and
+`tentacles` is a single-host supervisor for GitHub Actions runners. One
+process authenticates one or more GitHub App installations and owns one
+runner scale set per configured pool through
+[`github.com/actions/scaleset`](https://github.com/actions/scaleset). It
 starts official [`actions/runner`](https://github.com/actions/runner)
-processes with just-in-time (JIT) configuration. Every process is a
-one-job slot: after confirmed process exit, the daemon removes the slot
-directory, its work folder, and JIT files. Failed cleanup retains the slot
-ID for retry; each new slot starts from a fresh copy of the payload.
+processes with just-in-time (JIT) configuration. Every process is a one-job
+slot: after confirmed process exit, the daemon removes the slot directory,
+its work folder, and JIT files. Failed cleanup retains the pool-local slot ID
+for retry; each new slot starts from a fresh copy of the shared payload.
 
 No Docker, no microVMs, no Kubernetes, no `config.sh`, no `svc.sh`, no
 inbound webhooks.
@@ -30,15 +31,15 @@ Contents:
 
 ## Security warning
 
-> **This is not job isolation.** Jobs run as the `gha-runner` Unix user
-> directly on the host, with host toolchains, caches, and network.
-> Anyone who can queue a workflow targeting the scale set can run code
-> on this machine. The control that matters lives in GitHub, not in this
-> daemon: restrict the runner group to selected repositories, and only
-> install the App on orgs you trust.
+> **This is not job isolation.** Jobs from every configured pool run as the
+> same `gha-runner` Unix user directly on the host, with shared toolchains,
+> caches, kernel, and network. Anyone who can queue a workflow targeting any
+> pool can run code on this machine and affect later jobs from another pool.
+> Restrict each runner group to selected repositories, and configure only
+> organizations inside the same trust domain.
 
-If you cannot accept that model, this project is not the right tool. Use
-container- or VM-isolated runners instead.
+If organizations cannot trust each other's workloads, use separate hosts,
+VMs, or an isolated runner system instead.
 
 ## How it works
 
@@ -48,27 +49,27 @@ local capacity and each runner's lifetime.
 
 ```mermaid
 flowchart TD
-    accTitle: Tentacles production architecture
-    accDescr: GitHub sends scale-set demand to the root supervisor, which provisions unprivileged systemd runners from a payload template. Runners execute jobs directly from GitHub and share host toolchains and caches.
+    accTitle: Tentacles multi-pool production architecture
+    accDescr: Independent GitHub scale sets supply demand to one host scheduler, which provisions pool-namespaced systemd runners from a shared payload.
 
-    github["GitHub Actions<br/>One runner scale set"]
+    github["GitHub Actions<br/>One scale set per pool"]
 
     subgraph host["Single Linux host"]
         subgraph daemon["tentacles.service — root supervisor"]
-            listener["Scale-set adapter and listener<br/>GitHub App authentication"]
-            reconcile["Reconciler<br/>Clamp assigned jobs to min / max"]
-            slots["Slot manager and exit watchers<br/>Admission, retries, provisioning, cleanup"]
-            template[("Payload template<br/>Writable only by the supervisor")]
+            listeners["Pool adapters and listeners<br/>One App installation per pool"]
+            scheduler["Host scheduler<br/>Per-pool bounds · global ceiling · round-robin"]
+            slots["Namespaced slot tables and exit watchers<br/>Admission · retries · cleanup"]
+            template[("Shared payload template<br/>Writable only by the supervisor")]
 
-            listener -->|TotalAssignedJobs| reconcile
-            listener -->|Job claims and queue hints| slots
-            reconcile -->|Target live count| slots
+            listeners -->|Desired counts| scheduler
+            listeners -->|Pool-local claims and queue hints| slots
+            scheduler -->|One start at a time| slots
             template -->|Fresh copy per slot| slots
         end
 
         systemd["systemd<br/>Credentials, resource limits, unit state"]
-        runners["Ephemeral runner units<br/>gha-runner · one job per slot"]
-        shared[("Host toolchains and shared caches<br/>Persist across jobs")]
+        runners["Ephemeral pool-namespaced units<br/>gha-runner · one job per slot"]
+        shared[("Host toolchains and shared caches<br/>Persist across every pool")]
 
         slots -->|Start units / stop eligible surplus| systemd
         systemd -->|Launch with private JIT credentials| runners
@@ -76,29 +77,29 @@ flowchart TD
         runners -->|Use| shared
     end
 
-    github <-->|Message session and JIT requests| listener
+    github <-->|Message sessions and JIT requests| listeners
     github <-->|Job assignment and results| runners
 ```
 
-The runner units remain independent of `tentacles.service`, so a supervisor
-restart can adopt surviving jobs. Each slot gets its own work directory;
-jobs still share the runner UID, host toolchains, and caches.
+Runner units remain independent of `tentacles.service`, so a supervisor
+restart can adopt surviving jobs within their pool namespace. Each slot gets
+its own work directory; jobs still share the runner UID, host toolchains, and
+caches across pools.
 
-- The scale-set listener (the upstream `listener` package) long-polls the
-  message API. `statistics.TotalAssignedJobs` supplies the desired count.
-  Job lifecycle messages track claims and completions without incrementing
-  or decrementing that target.
-- A reconciler targets `clamp(TotalAssignedJobs, min_runners, max_runners)`
-  official runner processes, one slot per process. Admission holds and
-  start failures can leave actual below desired; busy runners can keep it
-  above desired until they exit.
-- A slot is a `systemd-run` transient unit named `tentacle-<id>.service`
-  running as the configured unprivileged user. The root supervisor writes
-  a `0600` JIT source under its private runtime directory; systemd
-  `LoadCredential` delivers a private copy to the job unit. The shell reads
-  that copy and supplies `--jitconfig` to the official runner. The value
-  remains visible in process arguments for the lifetime of `run.sh`; keep
-  this host restricted to trusted workloads and administrators.
+- Each pool has one upstream listener. Its
+  `statistics.TotalAssignedJobs` supplies that pool's desired count. Job
+  lifecycle messages affect only the matching pool.
+- Pool demand is clamped to `pools[].capacity.min_runners` and
+  `pools[].capacity.max_runners`. The host scheduler then allocates available
+  slots round-robin without starting above `capacity.max_runners`. Busy
+  runners are preserved even when demand falls.
+- A slot is a `systemd-run` transient unit named
+  `tentacle-<pool>-<id>.service`. Its state, diagnostics, and JIT source are
+  rooted under pool-qualified directories. The root supervisor writes a
+  `0600` JIT source; systemd `LoadCredential` delivers a private copy to the
+  job unit. The shell supplies `--jitconfig` to the official runner. The value
+  remains visible in process arguments for the lifetime of `run.sh`; keep this
+  host restricted to trusted workloads and administrators.
 - Workflows target the scale-set name, not `self-hosted`:
 
   ```yaml
@@ -118,18 +119,21 @@ cleaned up or retained conservatively rather than kept in `failed`.
 
 ### 1. GitHub App
 
-1. Create a GitHub App (org or repo scope). Record the client id and
-   installation id; save the private key PEM.
-2. Grant the scale-set permission with **Read and write** access:
-   - Organization scale set: organization **Self-hosted runners**
-     (`organization_self_hosted_runners`)
-   - Repository scale set: repository **Administration** (`administration`),
-     with **Metadata: Read-only**
+1. Create a GitHub App with the required scale-set permissions. Record its
+   client ID and save the private key PEM.
+2. Grant **Read and write** access for:
+   - Organization pools: organization **Self-hosted runners**
+     (`organization_self_hosted_runners`).
+   - Repository pools: repository **Administration** (`administration`),
+     with **Metadata: Read-only**.
 
    See GitHub's [App permission requirements](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/authenticate-to-the-api#authenticating-arc-with-a-github-app).
-3. Install the App on the org (or repo) that owns the scale set.
-4. For an organization scale set, restrict the runner group to selected
-   repositories only. For repository scope, use a trusted repository.
+3. Install the App separately on every organization or repository configured
+   under `pools`. Each installation has its own installation ID. Pools may
+   reuse the client ID and PEM when the same App is installable on each
+   account, or use separate Apps.
+4. Restrict every organization runner group to selected repositories. Use
+   only trusted repositories for repository-scoped pools.
 
 ### 2. Host bootstrap (one-time, as root)
 
@@ -187,17 +191,17 @@ sudo install -m 0755 tentacles /usr/local/sbin/tentacles
 sudo install -m 0600 app.pem /etc/tentacles/app.pem
 sudo install -m 0644 configs/config.example.yaml /etc/tentacles/config.yaml
 sudo install -m 0644 configs/runner.env.example /etc/tentacles/runner.env
-# edit config: App credentials, scope, capacity, absolute production paths,
+# edit config: one pools[] entry per target, App installation credentials,
+# per-pool bounds, host capacity, absolute production paths,
 # runner environment_file=/etc/tentacles/runner.env, runtime.backend=systemd
 ```
 
 The example uses development paths and a throwaway key. Set these fields
-in the installed config to match the shipped production service, alongside
-your real App credentials and scope:
+in the installed config to match the shipped production service:
 
 | Field | Production value |
 |---|---|
-| `github.app.private_key_path` | `/etc/tentacles/app.pem` |
+| `pools[].github.app.private_key_path` | `/etc/tentacles/app.pem` |
 | `runner.environment_file` | `/etc/tentacles/runner.env` |
 | `paths.state_dir` | `/var/lib/tentacles` |
 | `paths.cache_dir` | `/var/cache/tentacles` |
@@ -205,8 +209,8 @@ your real App credentials and scope:
 | `runtime.backend` | `systemd` |
 | `runtime.jit_dir` | `/run/tentacles` (default) |
 
-Keep `capacity.min_runners: 0` during bootstrap and wait to queue workflows
-until dependencies are installed. Validate the configuration:
+Keep every `pools[].capacity.min_runners: 0` during bootstrap and wait to
+queue workflows until dependencies are installed. Validate the configuration:
 
 ```sh
 sudo tentacles --config /etc/tentacles/config.yaml --dry-run
@@ -224,9 +228,9 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now tentacles
 ```
 
-The unit is `Type=notify`; systemd considers it started only after the
-listener session exists, so a broken App or network fails loudly instead
-of reporting a healthy daemon.
+The unit is `Type=notify`; systemd considers it started only after every
+configured pool has established its first listener session. A broken App,
+installation, or network therefore prevents false readiness.
 
 Once startup has prepared the verified payload, complete the host
 dependencies before queuing the first job:
@@ -235,12 +239,11 @@ dependencies before queuing the first job:
 sudo /var/lib/tentacles/template/bin/installdependencies.sh
 ```
 
-Confirm the scale set appears under the organization or repository's
-Settings, Actions, Runners, matching your configured scope.
-Then move one repository to `runs-on: debian-host` while any existing
-standing runner is still up. Retire the old `svc.sh` unit only after the
-first real job passes. Never run two agents against the same work
-directory.
+Confirm every scale set appears under its organization or repository's
+Settings, Actions, Runners, matching the configured pool. Move one repository
+per pool to its configured `runs-on` label while existing standing runners
+remain available. Retire each old `svc.sh` unit only after its first real job
+passes. Never run two agents against the same work directory.
 
 ## Configuration
 
@@ -259,20 +262,23 @@ strict: an unknown key is a startup error, not a silent no-op.
 
 | Field | Default | Notes |
 |---|---|---|
-| `github.url` | `https://github.com` | GHES roots work; scope is appended |
-| `github.app.client_id` | required | |
-| `github.app.installation_id` | required, `> 0` | |
-| `github.app.private_key_path` | required | PEM file, read at startup |
-| `github.scope.kind` | required | `organization` or `repository` |
-| `github.scope.owner` | required | |
-| `github.scope.repository` | required when kind is `repository` | |
-| `scale_set.name` | required | valid Actions label; this is `runs-on` |
-| `scale_set.runner_group` | `Default` | custom group names are resolved through GitHub at startup |
-| `scale_set.extra_labels` | `[]` | applied at scale-set creation |
-| `capacity.min_runners` | `0` | floor on total desired runners; subject to admission and start failures |
-| `capacity.max_runners` | required | target ceiling; compiled limit 32; existing busy jobs are preserved |
-| `capacity.job_cpu_quota_percent` | required | systemd `CPUQuota`, e.g. 400 |
-| `capacity.job_memory_max` | required | systemd `MemoryMax`, e.g. `8G` |
+| `pools` | required | at least one independently authenticated scale set |
+| `pools[].id` | required | unique lowercase ID matching `[a-z0-9][a-z0-9-]{0,31}`; namespaces files, units, logs, and metrics |
+| `pools[].github.url` | `https://github.com` | GHES roots work; scope is appended |
+| `pools[].github.app.client_id` | required | App client ID; may repeat when pools share an App |
+| `pools[].github.app.installation_id` | required, `> 0` | installation-specific; normally differs per organization |
+| `pools[].github.app.private_key_path` | required | PEM file, read at startup; may repeat |
+| `pools[].github.scope.kind` | required | `organization` or `repository` |
+| `pools[].github.scope.owner` | required | |
+| `pools[].github.scope.repository` | required when kind is `repository` | |
+| `pools[].scale_set.name` | required | valid Actions label; this is `runs-on` |
+| `pools[].scale_set.runner_group` | `Default` | resolved within that pool's scope |
+| `pools[].scale_set.extra_labels` | `[]` | applied at scale-set creation |
+| `pools[].capacity.min_runners` | `0` | pool floor; all floors together must fit the host ceiling |
+| `pools[].capacity.max_runners` | required | pool demand ceiling; must not exceed the host ceiling |
+| `capacity.max_runners` | required | hard host allocation ceiling across pools; compiled limit 32 |
+| `capacity.job_cpu_quota_percent` | required | per-slot systemd `CPUQuota`, e.g. 400 |
+| `capacity.job_memory_max` | required | per-slot systemd `MemoryMax`, e.g. `8G` |
 | `runner.version` | unset | `X.Y.Z` pins the payload; unset tracks the latest release |
 | `runner.download_url` | official release URL | override for mirrors |
 | `runner.sha256` | unset (required when `version` is pinned) | unless `TENTACLES_ALLOW_UNVERIFIED_PAYLOAD=1` |
@@ -281,9 +287,9 @@ strict: an unknown key is a startup error, not a silent no-op.
 | `runner.user` | `gha-runner` | |
 | `runner.group` | account primary group | |
 | `runner.environment_file` | required | systemd EnvironmentFile path |
-| `paths.state_dir` | `/var/lib/tentacles` | slots + template live here |
-| `paths.cache_dir` | `/var/cache/tentacles` | payload tarball cache |
-| `paths.log_dir` | `/var/log/tentacles` | shipped `_diag` archives |
+| `paths.state_dir` | `/var/lib/tentacles` | shared template/history plus `pools/<pool>/slots` |
+| `paths.cache_dir` | `/var/cache/tentacles` | shared payload tarball cache |
+| `paths.log_dir` | `/var/log/tentacles` | `_diag` archives under `pools/<pool>` |
 | `runtime.backend` | `systemd` | `process` for dev hosts without systemd |
 | `runtime.slot_start_timeout` | `90s` | bounds copy, JIT mint, and backend start |
 | `runtime.slot_stop_timeout` | `30s` | bounds each stop (also `TimeoutStopSec`) |
@@ -293,8 +299,8 @@ strict: an unknown key is a startup error, not a silent no-op.
 | `observability.listen` | `127.0.0.1:9090` | metrics + `/healthz` |
 | `observability.log_level` | `info` | `debug`, `warn`, `error` also accepted |
 | `observability.ship_diag` | `true` | copy `_diag` before wipe |
-| `observability.diag_max_age` | `168h` | completed archive retention |
-| `observability.diag_max_bytes` | `1073741824` | completed archive byte budget |
+| `observability.diag_max_age` | `168h` | completed archive retention per pool |
+| `observability.diag_max_bytes` | `1073741824` | completed archive byte budget per pool |
 | `scaling.admission_control` | `true` | history-based admission gate |
 | `scaling.cpu_target_percent` | `90` | share of host cores reserved by live runners |
 | `scaling.memory_margin_percent` | `20` | share of MemAvailable kept free |
@@ -303,18 +309,20 @@ strict: an unknown key is a startup error, not a silent no-op.
 ### Validation scope
 
 After strict YAML decoding, configuration validation collects errors for
-capacity bounds, required credentials and scope fields, scale-set name
+host and pool capacity bounds, duplicate pool IDs or scale-set targets,
+unsafe pool IDs, required credentials and scope fields, scale-set name
 syntax, payload pin/digest rules, paths, timeouts, and observability/scaling
-settings. It checks that the key path exists, parses the environment file
-and requires non-empty `PATH` and `HOME`, and checks for
-`/run/systemd/system` when the systemd backend is selected.
+settings. The sum of pool floors must fit `capacity.max_runners`. Validation
+also checks every key path, parses the runner environment file, requires
+non-empty `PATH` and `HOME`, and checks for `/run/systemd/system` when the
+systemd backend is selected.
 
-`--dry-run` stops there. Normal startup also creates and probes writable
-daemon directories, resolves the runner identity, prepares the payload, and
-reads the private key to initialize the GitHub client. For the systemd
-backend, it enforces a root supervisor, a non-root runner, and systemd 254+.
-App authentication and session readiness require a real startup with
-network access.
+`--dry-run` stops there. Normal startup also creates and probes the shared and
+pool-qualified daemon directories, resolves the runner identity, prepares the
+shared payload, and initializes each GitHub client. For the systemd backend,
+it enforces a root supervisor, a non-root runner, and systemd 254+. App
+authentication and session readiness require a real startup with network
+access.
 
 Configuration is loaded once; restart after edits. Existing scale sets
 are reused without updating their labels or `disable_update` setting, so
@@ -338,58 +346,53 @@ only works after `eval "$(mise activate bash)"`, fix this file instead.
 
 ## Scaling semantics
 
-- Desired = `statistics.TotalAssignedJobs`, then
-  `desired = clamp(desired, min_runners, max_runners)`. Before the first
-  statistics message, desired starts at `min_runners`. Cancellation and
+- Each pool derives desired from `statistics.TotalAssignedJobs`, clamped into
+  its configured `[min_runners, max_runners]`. Before its first statistics
+  message, desired starts at that pool's `min_runners`. Cancellation and
   reassignment messages do not directly adjust desired.
-- `min_runners: 1` targets one total runner, which can wait idle when
-  there are no jobs. A busy runner satisfies that floor; it does not add
-  an extra idle runner. Admission holds and start failures can delay
-  reaching the floor. With the default `0`, no outstanding jobs, and
-  successful stop/exit observation and cleanup, the daemon scales to zero
-  processes and slot directories.
-- Starts are sequential in v1. A slot being provisioned counts toward
-  actual, so reconcile cannot overshoot the cap.
-- Scale-down stops the oldest eligible slots: `idle`, or `starting` once
-  they pass the acquire grace. Busy slots are never stopped, no matter
-  how far desired drops.
-- Reconcile runs at boot, on desired-count messages, normal slot exits or
-  stops, a 30-second safety tick, and acquisition retry timers. Failed
-  provisioning is retried with backoff without waiting for GitHub.
-- **Admission control** (on by default): systemd accounting is sampled
-  every `scaling.sample_interval` (default 30s). At a claimed slot's exit,
-  the latest samples and elapsed time feed per-workflow moving averages in
-  `state_dir/history.jsonl`. CPU and peak-memory records can miss usage
-  after the last sample; short jobs may have no resource sample at all.
-  Before starting a slot the gate predicts the cost of all starting,
-  idle, and busy runners plus the incoming one. If that exceeds the CPU
-  target share of host cores or available-memory budget, the start is
-  held and retried on a later reconciliation. Queued jobs are identified
-  from `JobAvailable` messages, so the prediction
-  reserves the largest queued estimate in each dimension when available.
-  Queue hints expire after ten minutes and are bounded to 1,024 refs.
-  Each unclaimed slot retains its provisioning estimate; the gate charges
-  the larger of that estimate and the current queued estimate. Memory is
-  charged as predicted growth above sampled current usage, because
+- `min_runners: 1` targets one runner for that pool. A busy runner satisfies
+  the floor; it does not add another idle runner. With zero floors, no
+  outstanding jobs, and successful cleanup, the host scales to zero.
+- Reconciliation first removes per-pool surplus, then allocates free host
+  slots round-robin among pools with unmet demand. Starts are serialized and a
+  provisioning slot counts immediately, so allocation cannot overshoot the
+  host `capacity.max_runners`. If combined demand exceeds the host ceiling,
+  remaining demand stays queued at GitHub. Adopted busy jobs are preserved
+  even when a reduced configuration temporarily leaves the host above its
+  ceiling.
+- Scale-down is pool-local and stops the oldest eligible slots: `idle`, or
+  `starting` once past the acquire grace. Busy slots are never stopped.
+- Reconcile runs at boot, on any pool's desired-count message, normal slot
+  exits or stops, a 30-second safety tick, and per-pool acquisition retry
+  timers. A failing pool backs off without pausing healthy pools.
+- **Admission control** (on by default): systemd accounting is sampled every
+  `scaling.sample_interval` (default 30s). At a claimed slot's exit, the
+  latest samples and elapsed time feed pool-and-workflow moving averages in
+  `state_dir/history.jsonl`. CPU and peak-memory records can miss usage after
+  the last sample; short jobs may have no resource sample at all. Before
+  starting a slot, the gate predicts the cost of all live runners across
+  every pool plus the incoming runner. If that exceeds the CPU target or
+  available-memory budget, the start is held. Queue hints refine only the
+  requesting pool's unclaimed reservations; predictions fall back from the
+  exact pool/workflow to that pool's average, then the host average. Queue
+  hints expire after ten minutes and are bounded to 1,024 refs per pool.
+  Memory is charged as predicted growth above sampled current usage because
   `MemAvailable` already excludes resident pages. The gate stays inert
-  without usable sampled history and always admits a first runner when
-  no runners are live. The process
-  backend produces no new resource samples, but can use previously stored
-  history. If history cannot be opened, admission control is disabled;
-  if `MemAvailable` cannot be read, the memory check is skipped. These are
-  estimates, with per-runner hard limits supplied separately by systemd's
-  `CPUQuota` and `MemoryMax`.
+  without sampled history and always admits the first runner on an idle host.
+  The process backend produces no new resource samples but can use persisted
+  history. If history cannot be opened, admission control is disabled; if
+  `MemAvailable` cannot be read, the memory check is skipped. Per-runner hard
+  limits remain systemd's `CPUQuota` and `MemoryMax`.
 - Exit classification: a runner that exits before any
   JobStarted and inside the acquire grace is an acquire failure
   (metric + event, cleanup scheduled). A runner that exits after a job is a
   plain exit. An idle warm-pool runner is never torn down for being
   idle; only a surplus decision from reconcile stops it.
-- Acquisition failures use a one-second exponential backoff capped at
-  thirty seconds. Desired-count pushes respect that hold; failures cannot
-  immediately requeue themselves into an API/log storm. Natural failures
-  are also retried by the thirty-second safety tick.
-- The listener restarts with 1s, 2s, 5s, 15s, 30s backoff on failure.
-  Existing runners keep working during a reconnect.
+- Acquisition failures use an independent per-pool exponential backoff from
+  one to thirty seconds. Desired pushes respect the hold; a failing
+  installation cannot create an API/log storm or pause another pool.
+- Each listener independently restarts with 1s, 2s, 5s, 15s, 30s backoff.
+  Existing runners and other pools keep working during a reconnect.
 
 ## Payload and slot lifecycle
 
@@ -471,17 +474,17 @@ process exit. Resource history uses periodic samples, as described in
 
 The filesystem operations for each slot are:
 
-1. Exclusively create `paths.state_dir/slots/<id>` and copy the template's
-   files, modes, and symlinks into it. Pre-existing slot directories are
-   not reused for new launches.
-2. Mint a JIT config named `<scale-set>-<id>-<rand>` with the work
-   folder set from `runner.work_directory` inside the slot (default
-   `_work`), write it `0600` to `jit_dir`, and start the unit.
-3. On confirmed exit: copy `_diag` to a unique private archive under
-   `log_dir` including slot and runner identity (if `ship_diag`), unlink
-   `.runner`/`.credentials` files without following links, unlink the JIT
-   file, and delete the slot directory. Cleanup failures retain the ID
-   for retry. The next slot re-copies the template.
+1. Exclusively create
+   `paths.state_dir/pools/<pool>/slots/<id>` and copy the shared template's
+   files, modes, and symlinks into it. Pre-existing directories are not reused.
+2. Mint a JIT config named `<scale-set>-<id>-<rand>` with the work folder
+   inside that pool's slot, write it `0600` to
+   `runtime.jit_dir/<pool>/<id>.jit`, and start
+   `tentacle-<pool>-<id>.service`.
+3. On confirmed exit, copy `_diag` to a unique private archive under
+   `paths.log_dir/pools/<pool>`, unlink credential files without following
+   links, unlink the JIT file, and delete the slot directory. Cleanup failures
+   retain the pool-local ID for retry. The next slot re-copies the template.
 
 Before starting a slot the daemon checks the state filesystem: under 10%
 free it refuses new slots, records an acquisition failure, and retries
@@ -492,10 +495,9 @@ not reduced to reflect the local disk or admission hold.
 
 Logs are structured JSON via `log/slog` on stderr, so journald picks
 them up: `journalctl -u tentacles -o cat` shows the application's JSON;
-`-o json` adds journald's JSON envelope. Depending on the message, fields
-include `scale_set`, `slot`, `runner_name`, `desired`, and `err`.
-Some components nest fields under their logger group. The JIT
-payload, the PEM, and installation tokens are never logged.
+`-o json` adds journald's JSON envelope. Pool-specific messages include
+`pool` alongside fields such as `scale_set`, `slot`, `runner_name`, `desired`,
+and `err`. The JIT payload, PEM, and installation tokens are never logged.
 
 The metrics listener (default `127.0.0.1:9090`) serves Prometheus text
 format plus a liveness endpoint at `/healthz`. That endpoint returns 200
@@ -503,19 +505,22 @@ once the HTTP server is listening, including before GitHub session
 readiness and during reconnects; use the service's initial `READY=1`
 notification and listener-error metrics to assess startup and connectivity.
 
+Pool-scoped series have a bounded `pool` label equal to `pools[].id`.
+
 | Metric | Meaning |
 |---|---|
-| `tentacles_desired_runners` | last reconciliation target; refreshed once per second |
-| `tentacles_actual_runners{state=}` | slots per state (`starting`, `idle`, `busy`, `stopping`, `failed`, `empty`) |
-| `tentacles_jobs_started_total` | JobStarted messages matched to a slot (claims) |
-| `tentacles_jobs_completed_total{result=}` | claimed slot exits; `result` is the JobCompleted message's value, `unknown` when that message was missed |
-| `tentacles_acquire_failures_total` | failed/uncertain starts + never-claimed exits within acquire grace |
-| `tentacles_slot_start_seconds` | histogram of full provision time for successful starts |
-| `tentacles_listener_errors_total` | failed listener runs, counted once per failure |
-| `tentacles_last_message_id` | last scale-set message ID processed |
-| `tentacles_job_cpu_seconds` / `tentacles_job_wall_seconds` | sampled CPU / elapsed time for completed claimed slots; see collection conditions below |
-| `tentacles_last_job_peak_memory_bytes` | most recent nonzero completed-job memory sample |
-| `tentacles_admission_holds_total` | starts held by the admission gate |
+| `tentacles_desired_runners{pool=}` | pool reconciliation target; refreshed once per second |
+| `tentacles_actual_runners{pool=,state=}` | pool slots per lifecycle state |
+| `tentacles_host_max_runners` | configured host-wide allocation ceiling |
+| `tentacles_jobs_started_total{pool=}` | matched JobStarted claims |
+| `tentacles_jobs_completed_total{pool=,result=}` | claimed slot exits; `unknown` means the completion message was missed |
+| `tentacles_acquire_failures_total{pool=}` | failed/uncertain starts and fast never-claimed exits |
+| `tentacles_slot_start_seconds{pool=}` | full provision-time histogram |
+| `tentacles_listener_errors_total{pool=}` | failed listener runs |
+| `tentacles_last_message_id{pool=}` | last processed scale-set message ID |
+| `tentacles_job_cpu_seconds{pool=}` / `tentacles_job_wall_seconds{pool=}` | sampled CPU / elapsed time for completed claimed slots |
+| `tentacles_last_job_peak_memory_bytes{pool=}` | most recent nonzero completed-job memory sample |
+| `tentacles_admission_holds_total{pool=}` | starts held by the host admission gate |
 
 Job CPU and peak memory depend on successful systemd samples; wall time
 runs from the observed claim to slot exit. `jobs_started_total` counts
@@ -532,30 +537,26 @@ are skipped; ordinary errors or cancellation discard partial copies.
 Shipping stops before free space falls below the larger of 256 MiB and
 10% of the log filesystem.
 
-Age and byte retention run before and after shipping, with defaults of
-seven days and 1 GiB. There is no periodic pruning when shipping is idle
-or disabled. Only recognized, marked completed archives are pruned;
-legacy archives and staging left by a crash need operator cleanup, as
-described in [production readiness](docs/production-readiness.md).
-Ordinary diagnostic errors are logged and allow slot removal to continue.
-If the overall cleanup deadline expires, the slot remains reserved until
-the worker finishes, with failed cleanup retried later.
+Age and byte retention run before and after shipping independently in each
+pool's diagnostic directory, with defaults of seven days and 1 GiB per pool.
+There is no periodic pruning when shipping is idle or disabled. Only
+recognized, marked completed archives are pruned; legacy archives and staging
+left by a crash need operator cleanup, as described in
+[production readiness](docs/production-readiness.md). Ordinary diagnostic
+errors allow slot removal to continue. If the cleanup deadline expires, the
+pool-local slot ID remains reserved until the worker finishes.
 
 ## systemd integration
 
-- The daemon unit is `Type=notify`. `READY=1` goes out only after: config
-  validated, payload prepared or matching template reused, GitHub client
-  created, scale set ensured, boot adoption done, and the listener session
-  created. If the session never comes up, the daemon never
-  reports ready; systemd restarts it until the network or credentials
-  are fixed.
-- Slot units are transient: the daemon execs
-  `systemd-run --unit=tentacle-<id>` with `-p` properties from config
-  (`User`, `Group`, `CPUQuota`, `MemoryMax`, `EnvironmentFile`,
-  `TimeoutStopSec`, hardening). There are no root-owned drop-in files,
-  and tests inject fake binaries via `PATH`.
-  `configs/systemd/tentacle@.service` is a disabled legacy example;
-  `tentacle@<id>` units are unsupported and are not adopted.
+- The daemon unit is `Type=notify`. `READY=1` goes out only after config
+  validation, shared payload preparation, every scale set ensure, every
+  pool-qualified boot adoption, and every pool's first listener session. If
+  one installation never connects, the daemon never reports ready.
+- Slot units are transient:
+  `systemd-run --unit=tentacle-<pool>-<id>` receives `User`, `Group`,
+  `CPUQuota`, `MemoryMax`, `EnvironmentFile`, `TimeoutStopSec`, credentials,
+  and hardening properties from config. There are no rendered drop-ins or
+  supported manual template units.
 - Shared caches survive the hardening. `ProtectHome=read-only` would
   otherwise make `mise` and Go module caches read-only, which breaks
   real jobs. The daemon adds `.cache`, `.local/share/mise`, and
@@ -568,61 +569,61 @@ the worker finishes, with failed cleanup retried later.
   payload copy is complete. JIT source files and the template stay owned
   by the supervisor. Unprivileged polkit/user-manager deployment is not
   implemented.
-- Boot adoption: on start the daemon lists
-  `tentacle-*.service` units and `slots/*` directories. A running unit
-  with a matching directory is adopted as busy and its runner name is
-  recovered from the slot's `.runner` file, so an in-flight job keeps
-  correlating with `JobStarted`. A directory without a unit is wiped. A
-  unit without a directory is stopped. Only then does the listener
-  start. Failed discovery or malformed slot entries abort startup before
-  readiness or allocation. A transient exit-observation failure keeps the
-  slot live and retries; it never permits teardown. A daemon restart
-  preserves running systemd jobs. Adoption marks even previously idle
-  units busy conservatively, so they may remain above the desired count
-  until they run a job and exit.
-- Graceful shutdown: SIGTERM attempts to stop idle slots and starting
-  slots past acquire grace within the shutdown deadline. Busy runners
-  continue independently and any survivors are recovered by boot adoption.
-  Session deletion is best-effort with a five-second timeout. The scale
-  set itself is never deleted.
+- Boot adoption runs independently per pool. The backend lists only
+  `tentacle-<pool>-*.service` and matches those units against
+  `paths.state_dir/pools/<pool>/slots/*`. A running unit with a matching
+  directory is adopted as busy; a directory without a unit is wiped; a unit
+  without a directory is stopped. Cross-pool units are never considered.
+  Every pool completes adoption before any listener starts. Discovery errors
+  abort startup before readiness or allocation. Transient observation
+  failures retain the slot. Adoption conservatively marks surviving units
+  busy, so they may remain above current demand until they finish and exit.
+- Graceful shutdown attempts to stop idle and eligible starting slots in every
+  pool. Busy runners continue independently and are recovered by pool-aware
+  boot adoption. Each listener deletes its session best-effort with a
+  five-second timeout. Scale sets are never deleted.
 
 ## Failure modes and troubleshooting
 
 | Symptom | Detection | What happens |
 |---|---|---|
-| Listener 401/403 | `tentacles_listener_errors_total` climbs | session fails, backoff, retry. Do not flap scale-set creation |
-| Session drop | listener error | reconnect with backoff; runners keep working |
-| JIT generate fails | acquire failure metric, log | desired stays unsatisfied; retried with acquisition backoff |
-| `run.sh` exits with no job, fast | acquire failure metric | cleanup scheduled; runner acquisition retried with backoff; GitHub controls job reassignment |
-| Start hangs | `slot_start_timeout` (90s) | retain uncertain launches; wipe only after confirmed exit or a proven pre-launch failure |
-| systemd observation fails | warning; slot still live | retry observation with backoff; preserve files/capacity |
-| Cleanup exceeds deadline | stopping slot remains | reserve ID until worker ends; retry failed cleanup later |
-| Job canceled | `jobs_completed_total{result="canceled"}` | no scaling action; statistics drive desired |
-| Daemon restart mid-job (systemd) | boot adoption log lines | running unit adopted as busy, job untouched |
-| Disk nearly full | disk-watermark error and acquire-failure counter | no new slots until 10% free again; listener stays up |
-| Host reboot | leftover dirs wiped at boot | GitHub times out or requeues the job |
-| Payload sha mismatch | startup error | no slots start; fix `runner.sha256` or the mirror |
-| `mise`/PATH broken in jobs | first job fails | operational: fix `runner.env`; keep a canary workflow |
+| Listener 401/403 | `tentacles_listener_errors_total{pool=}` climbs | that pool backs off and retries; other pools continue |
+| Session drop | pool listener error | that pool reconnects; existing runners keep working |
+| JIT generate fails | pool acquire-failure metric, log | pool demand stays unsatisfied and retries with backoff |
+| `run.sh` exits with no job, fast | pool acquire-failure metric | cleanup scheduled; GitHub controls reassignment |
+| Start hangs | `slot_start_timeout` (90s) | retain uncertain launch until exit is confirmed |
+| systemd observation fails | warning; slot still live | retry observation; preserve files and host capacity |
+| Cleanup exceeds deadline | stopping slot remains | reserve that pool's ID until cleanup finishes |
+| Job canceled | `jobs_completed_total{pool=,result="canceled"}` | no scaling action; statistics drive desired |
+| Daemon restart mid-job | pool-qualified adoption log | running unit adopted as busy, job untouched |
+| Disk nearly full | pool acquire-failure counter | no new slots on the host until 10% is free |
+| Host reboot | leftover pool directories wiped at boot | GitHub times out or requeues the job |
+| Payload sha mismatch | startup error | no pool starts; fix `runner.sha256` or the mirror |
+| `mise`/PATH broken in jobs | first job fails | fix the shared `runner.env`; keep canaries per pool |
 
 Debugging recipes:
 
-- A slot died strangely: `ls /var/log/tentacles/` for the `_diag`
-  archive of that run, and `journalctl -u tentacles --since -1h`.
-- Warm pool missing: check `tentacles_actual_runners{state="idle"}`,
-  then the total live count: busy runners also satisfy `min_runners`.
-  Check the acquire-failure counter. A high failure rate usually means a
-  bad `runner.env` or a blocked egress path. If neither fires, check
-  `tentacles_admission_holds_total`: with admission control on, a busy
-  heavy job holds new starts until it exits — that is backpressure, not
-  a fault.
-- Suspected leak: `systemctl list-units --all 'tentacle-*.service'` and
-  `ls /var/lib/tentacles/slots/`. Check logs for uncertain launches,
-  observation errors, or cleanup retries. Boot adoption scans units and
-  directories on restart; malformed entries or discovery errors require
+- A slot died strangely: inspect
+  `/var/log/tentacles/pools/<pool>/` and
+  `journalctl -u tentacles --since -1h`.
+- A warm pool is missing: check
+  `tentacles_actual_runners{pool="<pool>",state="idle"}` and the same pool's
+  busy count. Then check its acquire failures and admission holds. The host
+  may be full because another pool is using `capacity.max_runners`.
+- A unit leaked: run
+  `systemctl list-units --all 'tentacle-<pool>-*.service'` and inspect
+  `/var/lib/tentacles/pools/<pool>/slots/`. Pool-qualified boot adoption scans
+  both after restart; malformed entries or discovery errors require
   investigation before startup can continue.
 
 ## Upgrades
 
+- **Multi-pool configuration cutover**: top-level `github`, `scale_set`, and
+  `capacity.min_runners` are no longer accepted. Before installing this
+  version, drain all legacy `tentacle-<id>.service` jobs, stop the old daemon,
+  verify no legacy unit remains, remove the empty
+  `paths.state_dir/slots` directory, and rewrite the configuration using
+  `pools`. Legacy unnamespaced jobs cannot be adopted safely.
 - **Daemon**: build the new binary, `systemctl restart tentacles`.
   For the systemd backend, boot adoption recovers surviving jobs; graceful
   shutdown attempts to stop idle slots and replacements follow desired
@@ -647,22 +648,22 @@ Debugging recipes:
 tentacles/
   cmd/tentacles/        entry point: flags, signals; no business logic
   internal/
-    config/              YAML load (strict), validation, dirs
-    app/                 wiring and the run loop
+    config/              strict multi-pool YAML, validation, directories
+    app/                 pool wiring, listeners, host scheduler, run loop
     scaleset/            the only importer of actions/scaleset
-    reconcile/           desired vs actual
-    slot/                slot table: allocate, start, stop, wipe, adopt
-    payload/             download, verify, extract the runner tarball
+    reconcile/           desired-count clamping
+    slot/                namespaced slot tables: start, stop, wipe, adopt
+    payload/             shared runner download, verify, and extraction
     runner/              JIT write, exec spec, backend contract
-    systemd/             transient-unit backend, sd_notify
+    systemd/             pool-scoped transient units, sd_notify
     process/             plain-child backend for tests and dev hosts
     env/                 EnvironmentFile parsing
-    history/             persisted per-workflow usage estimates
+    history/             persisted pool/workflow usage estimates
     cleanup/             safe credential unlinking
-    logship/             _diag copy before wipe
-    metrics/             hand-rolled Prometheus exposition
+    logship/             pool-qualified _diag copy before wipe
+    metrics/             pool-labeled Prometheus exposition
     version/             build-time version string
-  configs/               example config, systemd units
+  configs/               example config and supervisor service unit
   scripts/               host dependency bootstrap
   testdata/              dry-run PEM, fake runner
 ```
@@ -670,14 +671,15 @@ tentacles/
 Rules that hold the design together:
 
 - `internal/scaleset` is the only package importing
-  `github.com/actions/scaleset`. Upstream types do not leak past it.
-- Provisioning is an interface (`runner.Backend`). Production is the
-  systemd backend; tests use the process backend plus
-  `testdata/fake-runner/run.sh`, a stub agent that fails without a JIT
-  value, writes a claimed marker, and exits after `FAKE_RUNNER_SLEEP`
-  seconds with `FAKE_RUNNER_EXIT_CODE`.
-- The systemd backend execs `systemd-run`/`systemctl`; tests inject fake
-  binaries via `PATH`, so the whole daemon tests on macOS too.
+  `github.com/actions/scaleset`. The app creates one adapter per pool; upstream
+  types do not leak past that seam.
+- The host scheduler is the only starter. It sees every pool before allocating
+  one slot, which keeps the global ceiling and admission budget authoritative.
+- Provisioning is an interface (`runner.Backend`). Production creates one
+  pool-namespaced systemd adapter per pool; tests use fakes or the process
+  backend plus `testdata/fake-runner/run.sh`.
+- The systemd adapter scopes both transient-unit creation and boot discovery
+  to its pool namespace. Tests inject fake binaries through `PATH`.
 
 Testing:
 
@@ -690,14 +692,13 @@ go run ./cmd/tentacles --config configs/config.example.yaml --dry-run
 go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 ```
 
-The app tests include an end-to-end daemon run with a fake scale set,
-the process backend, and the fake runner: scale up from a queued job,
-JIT delivery, `_diag` shipping, scale-down to zero, warm-pool
-replenishment after a runner dies, and readiness gating. CI runs build,
-vet, formatting, race tests, and example validation on Ubuntu and macOS
-with Actions pinned to full SHAs (`.github/workflows/ci.yml`). Linux CI
-also runs the vulnerability scan, privileged identity tests, real systemd
-smoke test, and service-unit validation.
+The app tests cover end-to-end scale-up, JIT delivery, diagnostics, scale-down,
+warm-pool replenishment, all-pool readiness, round-robin host allocation, the
+global ceiling, and pool namespace separation. CI runs build, vet, formatting,
+race tests, and example validation on Ubuntu and macOS with Actions pinned to
+full SHAs (`.github/workflows/ci.yml`). Linux CI also runs the vulnerability
+scan, privileged identity tests, real systemd smoke test, and service-unit
+validation.
 
 Before trusting the host with real workloads, run the live integration
 checks against a real App and disposable repository, followed by a
@@ -708,9 +709,10 @@ executable systemd smoke test and detailed canary/soak procedure are in
 
 ## Known limitations
 
-- **No isolation.** The warning at the top is the contract. GitHub's
-  runner-group restriction is the only access control.
-- **Single host, single scale set, one App installation.** This is not a
+- **No isolation.** Every pool shares one Unix identity, host, caches, kernel,
+  and network. Pool namespaces prevent supervisor bookkeeping collisions; they
+  are not a security boundary. Configure only mutually trusted organizations.
+- **Single host.** Multiple scale sets share one scheduler, but this is not a
   multi-host scheduler.
 - **Linux x86-64 payload by default.** Release resolution and the default
   download URL select `linux-x64`. macOS CI uses fake runners; it does not
@@ -734,35 +736,36 @@ executable systemd smoke test and detailed canary/soak procedure are in
 - **Shared caches are a residue channel.** `~/.cache`, mise state, and
   `~/go/pkg/mod` are shared across jobs because that is the point of a
   shared host. Accepted under the trusted-org constraint.
-- **Sequential starts.** Slot creation is serial in v1; a cold scale-up
-  of N slots takes roughly N times one provision.
+- **Sequential starts.** Slot creation is serial across all pools; a cold
+  scale-up of N slots takes roughly N times one provision.
 
 ## Acceptance criteria
 
-Items 1 to 4 are design properties; 5 to 10 are verified by tests or
+Items 1 to 4 are design properties; 5 to 11 are verified by tests or
 pending live verification.
 
-1. A Debian host with only `tentacles.service` persistent executes
-   `runs-on: debian-host` workflows. (Quickstart; needs live check.)
-2. Authentication is a GitHub App; no PAT in config or docs.
-3. No Docker, no microVM, no Kubernetes at runtime.
-4. No `config.sh` / `svc.sh` anywhere in the path.
-5. With `min_runners: 0`, no assigned jobs, and successful exit observation
-   and cleanup, there are zero `run.sh` processes and zero slot directories.
-   (Normal convergence tested; retained/adopted slots follow the rules above.)
-6. Concurrent jobs up to `max_runners` each get their own slot directory
-   and unit. (Tested.)
-7. After confirmed exit and successful cleanup, the configured work folder,
-   JIT files, and slot tree are gone. `_diag` reaches `log_dir` when shipping
-   succeeds and is then subject to retention. Cleanup failures retain the
-   slot ID for retry. (Tested, including safe credential unlinking.)
-8. `mise`-installed `node` is visible to jobs via `runner.env`, and
-   shared caches are writable under the systemd sandbox. (Cache writes
-   verified with real systemd; end-to-end `node -v` pending live check.)
-9. Listener and daemon restarts leak no scale sets or runners. (Boot
-   adoption tested offline; live restart pending.)
-10. The isolation limitation and runner-group control are documented.
-    (This file.)
+1. A Debian host with only `tentacles.service` persistent executes workflows
+   from every configured organization pool. (Quickstart; needs live checks.)
+2. Authentication uses GitHub Apps and installation IDs; no PAT in config.
+3. No Docker, microVM, or Kubernetes runtime dependency.
+4. No `config.sh` or `svc.sh` in the runner path.
+5. With all pool floors at zero, no assigned jobs, and successful cleanup,
+   there are zero `run.sh` processes and zero pool slot directories.
+6. Combined live allocation never exceeds host `capacity.max_runners`;
+   available slots are shared round-robin among pools with unmet bounded
+   demand. (Tested.)
+7. Every runner gets a pool-qualified unit, state directory, JIT source, and
+   diagnostic destination. Boot discovery cannot adopt another pool's unit.
+   (Tested.)
+8. After confirmed exit and cleanup, the work folder, JIT file, and slot tree
+   are gone. Cleanup failures retain only that pool's slot ID. (Tested.)
+9. `mise` tools and shared caches remain available under systemd hardening.
+   (Cache writes verified with real systemd; end-to-end `node -v` pending.)
+10. Listeners reconnect independently; daemon restarts preserve and adopt
+    namespaced busy runners without creating scale sets. (Offline adoption
+    tested; live restart pending.)
+11. The cross-pool trust requirement and absence of workload isolation are
+    documented. (This file.)
 
 Upstream API findings and backend design rationale are in
 [the integration notes](docs/spike.md). Rollout checks and recorded

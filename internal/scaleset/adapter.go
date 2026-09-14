@@ -5,13 +5,12 @@
 // this package: everything the rest of the daemon sees is the Config, the
 // Events callback surface, and the small Adapter API below.
 //
-// The adapter owns one scale set per daemon process: it resolves or creates
-// the configured scale set, runs the official listener loop (which long-polls
-// the scale-set message API and refreshes the session), translates listener
-// callbacks into Events, and mints JIT configs. The desired runner count is
-// driven exclusively by statistics.TotalAssignedJobs, clamped into
-// [MinRunners, MaxRunners]; job lifecycle messages are used only for
-// busy-marking and metrics.
+// Each adapter owns one scale set: it resolves or creates the configured set,
+// runs its official listener loop, translates callbacks into Events, and mints
+// JIT configs. A daemon may compose multiple adapters behind its host
+// scheduler. The desired count is driven exclusively by
+// statistics.TotalAssignedJobs, clamped into [MinRunners, MaxRunners]; job
+// lifecycle messages are used only for busy-marking and metrics.
 package scaleset
 
 import (

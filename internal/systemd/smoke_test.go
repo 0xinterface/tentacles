@@ -43,7 +43,7 @@ func TestRealSystemdSmoke(t *testing.T) {
 	if err := os.Chmod(root, 0755); err != nil {
 		t.Fatal(err)
 	}
-	unit := "tentacle-" + strconv.FormatInt(time.Now().UnixNano(), 10) + ".service"
+	unit := "tentacle-default-" + strconv.FormatInt(time.Now().UnixNano(), 10) + ".service"
 	t.Logf("isolated unit %s", unit)
 	backend := New(Options{StopTimeout: 5 * time.Second})
 	attempted := false

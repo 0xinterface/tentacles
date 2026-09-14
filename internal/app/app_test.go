@@ -104,6 +104,7 @@ func (f *fakeScaleSet) jobStart(name string) {
 // testJobRef is the workflow ref the fake scale set reports for every
 // claimed job; admission-gate tests seed history for exactly this ref.
 const testJobRef = "o/r/.github/workflows/ci.yml@main"
+const testPoolID = "test"
 
 func (f *fakeScaleSet) jobStartWithRef(name, ref string) {
 	f.mu.Lock()
@@ -226,22 +227,25 @@ func writeIntegrationConfig(t *testing.T, dir, tarURL, sha string, minRunners, m
 	}
 	listenAddr := freePort(t)
 	stateDir := filepath.Join(dir, "state")
-	cfg := fmt.Sprintf(`github:
-  url: https://github.com
-  app:
-    client_id: Iv1.testing
-    installation_id: 12345678
-    private_key_path: %s
-  scope:
-    kind: organization
-    owner: test-org
-
-scale_set:
-  name: test-host
-  runner_group: default
+	cfg := fmt.Sprintf(`pools:
+  - id: test
+    github:
+      url: https://github.com
+      app:
+        client_id: Iv1.testing
+        installation_id: 12345678
+        private_key_path: %s
+      scope:
+        kind: organization
+        owner: test-org
+    scale_set:
+      name: test-host
+      runner_group: default
+    capacity:
+      min_runners: %d
+      max_runners: %d
 
 capacity:
-  min_runners: %d
   max_runners: %d
   job_cpu_quota_percent: 100
   job_memory_max: 1G
@@ -273,7 +277,7 @@ observability:
   log_level: warn
   ship_diag: true
 `,
-		genPEM(t, dir), minRunners, maxRunners, version, tarURL, sha,
+		genPEM(t, dir), minRunners, maxRunners, maxRunners, version, tarURL, sha,
 		currentUser(t), envFile,
 		stateDir, filepath.Join(dir, "cache"), filepath.Join(dir, "logs"),
 		filepath.Join(dir, "jit"), listenAddr)
@@ -315,10 +319,10 @@ func TestDaemonResolvesLatestRunnerVersion(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(ctx, Options{ConfigPath: cfgPath, ScaleSet: fake, releasesURL: releaseSrv.URL})
+		done <- Run(ctx, Options{ConfigPath: cfgPath, ScaleSets: map[string]ScaleSet{testPoolID: fake}, releasesURL: releaseSrv.URL})
 	}()
 
-	slotDir := filepath.Join(dir, "state", "slots", "0001")
+	slotDir := filepath.Join(dir, "state", "pools", testPoolID, "slots", "0001")
 	if !poll(t, 120*time.Second, func() bool { return fileExists(filepath.Join(slotDir, ".fake-claimed")) }) {
 		cancel()
 		t.Fatalf("runner never started via resolved latest version")
@@ -385,11 +389,11 @@ func TestDaemonScaleUpDownEphemeral(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(ctx, Options{ConfigPath: cfgPath, ScaleSet: fake})
+		done <- Run(ctx, Options{ConfigPath: cfgPath, ScaleSets: map[string]ScaleSet{testPoolID: fake}})
 	}()
 
 	stateDir := filepath.Join(dir, "state")
-	slotsDir := filepath.Join(stateDir, "slots")
+	slotsDir := filepath.Join(stateDir, "pools", testPoolID, "slots")
 	slotDir := filepath.Join(slotsDir, "0001")
 
 	// Scale up: slot materialized, runner started with a non-empty JIT.
@@ -404,7 +408,7 @@ func TestDaemonScaleUpDownEphemeral(t *testing.T) {
 	t.Logf("slot 0001 running")
 
 	// JIT file exists with 0600 while the slot is live.
-	jitPath := filepath.Join(dir, "jit", "0001.jit")
+	jitPath := filepath.Join(dir, "jit", testPoolID, "0001.jit")
 	if fi, err := os.Stat(jitPath); err != nil {
 		t.Errorf("jit file missing while slot live: %v", err)
 	} else if fi.Mode().Perm() != 0o600 {
@@ -418,7 +422,7 @@ func TestDaemonScaleUpDownEphemeral(t *testing.T) {
 	} else {
 		b, _ := io.ReadAll(out.Body)
 		out.Body.Close()
-		if want := "tentacles_slot_start_seconds_count 1"; !strings.Contains(string(b), want) {
+		if want := `tentacles_slot_start_seconds_count{pool="test"} 1`; !strings.Contains(string(b), want) {
 			t.Errorf("metrics missing %q (double-counted start?)", want)
 		}
 	}
@@ -435,14 +439,14 @@ func TestDaemonScaleUpDownEphemeral(t *testing.T) {
 
 	// Diagnostics were shipped before the wipe.
 	if !poll(t, 5*time.Second, func() bool {
-		for _, e := range ls(t, filepath.Join(dir, "logs")) {
+		for _, e := range ls(t, filepath.Join(dir, "logs", "pools", testPoolID)) {
 			if strings.Contains(e, "0001-") {
 				return true
 			}
 		}
 		return false
 	}) {
-		t.Errorf("no diag dir shipped: %v", ls(t, filepath.Join(dir, "logs")))
+		t.Errorf("no diag dir shipped: %v", ls(t, filepath.Join(dir, "logs", "pools", testPoolID)))
 	}
 
 	// Graceful shutdown.
@@ -487,10 +491,10 @@ func TestDaemonMinRunnersWarmPool(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(ctx, Options{ConfigPath: cfgPath, ScaleSet: fake})
+		done <- Run(ctx, Options{ConfigPath: cfgPath, ScaleSets: map[string]ScaleSet{testPoolID: fake}})
 	}()
 
-	slotDir := filepath.Join(dir, "state", "slots", "0001")
+	slotDir := filepath.Join(dir, "state", "pools", testPoolID, "slots", "0001")
 	if !poll(t, 120*time.Second, func() bool { return fileExists(filepath.Join(slotDir, ".fake-claimed")) }) {
 		cancel()
 		t.Fatalf("warm-pool runner never started")
@@ -512,7 +516,7 @@ func TestDaemonMinRunnersWarmPool(t *testing.T) {
 	}
 	// Shutdown stops idle slots.
 	if !poll(t, 120*time.Second, func() bool { return !dirExists(slotDir) }) {
-		t.Errorf("idle slot survived shutdown: %v", ls(t, filepath.Join(dir, "state", "slots")))
+		t.Errorf("idle slot survived shutdown: %v", ls(t, filepath.Join(dir, "state", "pools", testPoolID, "slots")))
 	}
 }
 
@@ -581,7 +585,9 @@ func TestDaemonReplenishesWarmPoolAfterExit(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- Run(ctx, Options{ConfigPath: cfgPath, ScaleSet: fake}) }()
+	go func() {
+		done <- Run(ctx, Options{ConfigPath: cfgPath, ScaleSets: map[string]ScaleSet{testPoolID: fake}})
+	}()
 
 	// Each fake runner exits after ~1s; the daemon must keep minting
 	// replacements for the warm slot.
@@ -641,7 +647,9 @@ func TestDaemonReadinessGatedOnSessionStart(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		done := make(chan error, 1)
-		go func() { done <- Run(ctx, Options{ConfigPath: cfgPath, ScaleSet: fake}) }()
+		go func() {
+			done <- Run(ctx, Options{ConfigPath: cfgPath, ScaleSets: map[string]ScaleSet{testPoolID: fake}})
+		}()
 
 		if fireSession {
 			if !poll(t, 15*time.Second, func() bool {
@@ -665,7 +673,7 @@ func TestDaemonReadinessGatedOnSessionStart(t *testing.T) {
 				}
 				defer out.Body.Close()
 				b, _ := io.ReadAll(out.Body)
-				return strings.Contains(string(b), "tentacles_last_message_id 7")
+				return strings.Contains(string(b), `tentacles_last_message_id{pool="test"} 7`)
 			}) {
 				t.Error("tentacles_last_message_id not exposed after MessageID event")
 			}
@@ -692,114 +700,98 @@ func TestDaemonReadinessGatedOnSessionStart(t *testing.T) {
 	t.Run("no session before shutdown", func(t *testing.T) { runCase(t, false) })
 }
 
-// TestAdmissionGate: the gate holds a start when the predicted usage of
-// the busy slots plus the incoming job exceeds the host budget, stays
-// inert without history, always admits the first job on an idle host,
-// and prefers the queued-ref estimate over the global average.
 func TestAdmissionGate(t *testing.T) {
-	dir := t.TempDir()
-	store, err := history.Open(filepath.Join(dir, "history.jsonl"))
+	store, err := history.Open(filepath.Join(t.TempDir(), "history.jsonl"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// ref history: 100 CPU seconds over 10 wall seconds = 10 cores,
-	// 15 GiB peak memory.
 	if err := store.Append(history.Record{
-		WorkflowRef: testJobRef, CPUSeconds: 100, WallSeconds: 10,
+		Pool: testPoolID, WorkflowRef: testJobRef, CPUSeconds: 100, WallSeconds: 10,
 		PeakMemBytes: 15 << 30, Sampled: true, At: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	scalingCfg := func() *config.Config {
+	scalingConfig := func() *config.Config {
 		return &config.Config{Scaling: config.Scaling{
 			AdmissionControl:    true,
 			CPUTargetPercent:    90,
 			MemoryMarginPercent: 20,
 		}}
 	}
-	newGate := func(t *testing.T, store *history.Store, mem uint64) func([]slot.Slot) bool {
-		t.Helper()
-		d := &daemon{
-			cfg:          scalingCfg(),
+	newGate := func(store *history.Store, memory uint64, queued map[string]int) func([]slot.Slot) bool {
+		host := &daemon{
+			cfg:          scalingConfig(),
 			hist:         store,
-			numCPU:       func() int { return 4 }, // budget 3.6 cores
-			memAvailable: func() (uint64, error) { return mem, nil },
-			queuedRefs:   map[string]int{},
+			numCPU:       func() int { return 4 },
+			memAvailable: func() (uint64, error) { return memory, nil },
 		}
-		return d.admissionGate
+		pool := &poolRuntime{
+			host:       host,
+			cfg:        config.Pool{ID: testPoolID},
+			queuedRefs: queued,
+			queuedAt:   make(map[string]time.Time),
+		}
+		return func(live []slot.Slot) bool {
+			return host.admissionGate(pool, live)
+		}
 	}
-
-	liveBusy := []slot.Slot{{State: slot.StateBusy, WorkflowRef: testJobRef}}
+	liveBusy := []slot.Slot{{
+		Pool:        testPoolID,
+		State:       slot.StateBusy,
+		WorkflowRef: testJobRef,
+	}}
 
 	t.Run("inert without history", func(t *testing.T) {
-		empty, _ := history.Open(filepath.Join(t.TempDir(), "h.jsonl"))
-		d := &daemon{cfg: scalingCfg(), hist: empty, numCPU: func() int { return 1 },
-			memAvailable: func() (uint64, error) { return 0, nil }, queuedRefs: map[string]int{}}
-		if !d.admissionGate(liveBusy) {
+		empty, _ := history.Open(filepath.Join(t.TempDir(), "empty.jsonl"))
+		if !newGate(empty, 0, map[string]int{})(liveBusy) {
 			t.Fatal("gate blocked with no history")
 		}
 	})
 	t.Run("idle host always admits", func(t *testing.T) {
-		if !newGate(t, store, 32<<30)(nil) {
+		if !newGate(store, 32<<30, map[string]int{})(nil) {
 			t.Fatal("gate blocked the first job on an idle host")
 		}
 	})
 	t.Run("holds when busy slot exceeds budget", func(t *testing.T) {
-		// One busy job already predicts 10 cores; budget is 3.6.
-		if newGate(t, store, 32<<30)(liveBusy) {
+		if newGate(store, 32<<30, map[string]int{})(liveBusy) {
 			t.Fatal("gate admitted a second heavy job")
 		}
 	})
 	t.Run("admits when usage fits", func(t *testing.T) {
-		small, _ := history.Open(filepath.Join(t.TempDir(), "h.jsonl"))
+		small, _ := history.Open(filepath.Join(t.TempDir(), "small.jsonl"))
 		if err := small.Append(history.Record{
-			WorkflowRef: testJobRef, CPUSeconds: 1, WallSeconds: 10,
+			Pool: testPoolID, WorkflowRef: testJobRef, CPUSeconds: 1, WallSeconds: 10,
 			PeakMemBytes: 1 << 30, Sampled: true, At: time.Now(),
 		}); err != nil {
 			t.Fatal(err)
 		}
-		if !newGate(t, small, 32<<30)(liveBusy) {
+		if !newGate(small, 32<<30, map[string]int{})(liveBusy) {
 			t.Fatal("gate held a light job that fits the budget")
 		}
 	})
 	t.Run("holds on memory pressure", func(t *testing.T) {
-		// CPU fits (10 cores? no: budget 3.6) — shrink CPU first via a
-		// light record, then let memory decide: 15 GiB peak against a
-		// 16 GiB host with a 20% margin leaves ~12.8 GiB.
-		s, _ := history.Open(filepath.Join(t.TempDir(), "h.jsonl"))
-		if err := s.Append(history.Record{
-			WorkflowRef: testJobRef, CPUSeconds: 1, WallSeconds: 10,
+		memoryHeavy, _ := history.Open(filepath.Join(t.TempDir(), "memory.jsonl"))
+		if err := memoryHeavy.Append(history.Record{
+			Pool: testPoolID, WorkflowRef: testJobRef, CPUSeconds: 1, WallSeconds: 10,
 			PeakMemBytes: 15 << 30, Sampled: true, At: time.Now(),
 		}); err != nil {
 			t.Fatal(err)
 		}
-		if newGate(t, s, 16<<30)(liveBusy) {
+		if newGate(memoryHeavy, 16<<30, map[string]int{})(liveBusy) {
 			t.Fatal("gate admitted a job over the memory budget")
 		}
 	})
-	t.Run("queued ref refines the candidate", func(t *testing.T) {
-		s, _ := history.Open(filepath.Join(t.TempDir(), "h.jsonl"))
-		// Global average is light...
-		if err := s.Append(history.Record{
-			WorkflowRef: "other", CPUSeconds: 1, WallSeconds: 10,
-			PeakMemBytes: 1 << 30, Sampled: true, At: time.Now(),
-		}); err != nil {
-			t.Fatal(err)
+	t.Run("queued ref refines candidate", func(t *testing.T) {
+		mixed, _ := history.Open(filepath.Join(t.TempDir(), "mixed.jsonl"))
+		for _, record := range []history.Record{
+			{Pool: testPoolID, WorkflowRef: "other", CPUSeconds: 1, WallSeconds: 10, PeakMemBytes: 1 << 30, Sampled: true, At: time.Now()},
+			{Pool: testPoolID, WorkflowRef: testJobRef, CPUSeconds: 100, WallSeconds: 10, PeakMemBytes: 15 << 30, Sampled: true, At: time.Now()},
+		} {
+			if err := mixed.Append(record); err != nil {
+				t.Fatal(err)
+			}
 		}
-		// ...but the queued job is the heavy one.
-		if err := s.Append(history.Record{
-			WorkflowRef: testJobRef, CPUSeconds: 100, WallSeconds: 10,
-			PeakMemBytes: 15 << 30, Sampled: true, At: time.Now(),
-		}); err != nil {
-			t.Fatal(err)
-		}
-		d := &daemon{
-			cfg: scalingCfg(), hist: s,
-			numCPU:       func() int { return 4 },
-			memAvailable: func() (uint64, error) { return 32 << 30, nil },
-			queuedRefs:   map[string]int{testJobRef: 1},
-		}
-		if d.admissionGate(liveBusy) {
+		if newGate(mixed, 32<<30, map[string]int{testJobRef: 1})(liveBusy) {
 			t.Fatal("gate ignored the queued heavy job")
 		}
 	})
@@ -827,7 +819,7 @@ func TestDaemonAdmissionGateHolds(t *testing.T) {
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	rec := fmt.Sprintf(`{"slot":"0001","workflow_ref":%q,"cpu_seconds":100,"wall_seconds":10,"peak_mem_bytes":1073741824,"sampled":true,"at":"2026-01-01T00:00:00Z"}`+"\n", testJobRef)
+	rec := fmt.Sprintf(`{"pool":"test","slot":"0001","workflow_ref":%q,"cpu_seconds":100,"wall_seconds":10,"peak_mem_bytes":1073741824,"sampled":true,"at":"2026-01-01T00:00:00Z"}`+"\n", testJobRef)
 	if err := os.WriteFile(filepath.Join(stateDir, "history.jsonl"), []byte(rec), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -855,7 +847,7 @@ func TestDaemonAdmissionGateHolds(t *testing.T) {
 	go func() {
 		done <- Run(ctx, Options{
 			ConfigPath: cfgPath,
-			ScaleSet:   fake,
+			ScaleSets:  map[string]ScaleSet{testPoolID: fake},
 			numCPU:     func() int { return 4 },
 			memAvailable: func() (uint64, error) {
 				return 32 << 30, nil

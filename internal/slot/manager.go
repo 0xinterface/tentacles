@@ -27,12 +27,14 @@ const (
 	defaultCleanupTimeout = 60 * time.Second
 	defaultStartTimeout   = 90 * time.Second
 	defaultWorkDir        = "_work"
+	defaultNamespace      = "default"
 
 	maxSlotID = 9999
 )
 
 // tableOptions holds the tunables for a Table.
 type tableOptions struct {
+	namespace          string
 	startAllowed       func() bool
 	reservation        func() (float64, uint64)
 	acquireGrace       time.Duration
@@ -54,6 +56,11 @@ type tableOptions struct {
 	completionHook     func(Completion)
 	materializeContext func(context.Context, string) error
 	diagContext        func(context.Context, Slot) error
+}
+
+// WithNamespace assigns the pool ID used in every backend unit name.
+func WithNamespace(namespace string) TableOption {
+	return func(o *tableOptions) { o.namespace = namespace }
 }
 
 // WithStartAllowed checks an acquisition pause before every new launch.
@@ -238,6 +245,7 @@ func NewTable(root string, backend runner.Backend, materialize func(dst string) 
 		log = slog.Default()
 	}
 	o := tableOptions{
+		namespace:      defaultNamespace,
 		acquireGrace:   defaultAcquireGrace,
 		stopTimeout:    defaultStopTimeout,
 		cleanupTimeout: defaultCleanupTimeout,
@@ -432,7 +440,7 @@ func (t *Table) startOne(ctx context.Context) ID {
 		return ""
 	}
 	t0 := time.Now()
-	rec := &slotRec{Slot: Slot{ID: id, Dir: filepath.Join(t.root, string(id)), Unit: unitName(id), State: StateStarting}, provStart: t0}
+	rec := &slotRec{Slot: Slot{Pool: t.opts.namespace, ID: id, Dir: filepath.Join(t.root, string(id)), Unit: unitName(t.opts.namespace, id), State: StateStarting}, provStart: t0}
 	if t.opts.reservation != nil {
 		rec.ReservedCores, rec.ReservedMemBytes = t.opts.reservation()
 	}
@@ -928,11 +936,12 @@ func (t *Table) Adopt(ctx context.Context, units []string) error {
 		if tracked {
 			continue
 		}
-		if running[unitName(id)] {
+		if running[unitName(t.opts.namespace, id)] {
 			rec := &slotRec{Slot: Slot{
+				Pool:       t.opts.namespace,
 				ID:         id,
 				Dir:        dir,
-				Unit:       unitName(id),
+				Unit:       unitName(t.opts.namespace, id),
 				RunnerName: readRunnerName(dir),
 				State:      StateBusy,
 				StartedAt:  time.Now(),
@@ -945,7 +954,7 @@ func (t *Table) Adopt(ctx context.Context, units []string) error {
 			continue
 		}
 		t.log.Warn("wiping orphan slot directory", "slot", id)
-		rec := &slotRec{Slot: Slot{ID: id, Dir: dir, Unit: unitName(id), RunnerName: readRunnerName(dir), State: StateStopping}}
+		rec := &slotRec{Slot: Slot{Pool: t.opts.namespace, ID: id, Dir: dir, Unit: unitName(t.opts.namespace, id), RunnerName: readRunnerName(dir), State: StateStopping}}
 		t.mu.Lock()
 		t.slots[id] = rec
 		t.mu.Unlock()
@@ -956,7 +965,7 @@ func (t *Table) Adopt(ctx context.Context, units []string) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		id, ok := idFromUnit(u)
+		id, ok := idFromUnit(t.opts.namespace, u)
 		if !ok {
 			continue
 		}
@@ -1004,17 +1013,14 @@ func (t *Table) emit(event Event, s Slot) {
 	}
 }
 
-// unitName maps a slot ID to its backend unit name, e.g. "0001" →
-// "tentacle-0001.service".
-func unitName(id ID) string {
-	return "tentacle-" + string(id) + ".service"
+// unitName maps a pool namespace and slot ID to a backend unit name.
+func unitName(namespace string, id ID) string {
+	return "tentacle-" + namespace + "-" + string(id) + ".service"
 }
 
-// idFromUnit extracts the slot ID from a unit name, e.g.
-// "tentacle-0001.service" → "0001". It returns false for names that are
-// not ours.
-func idFromUnit(unit string) (ID, bool) {
-	const prefix = "tentacle-"
+// idFromUnit extracts a slot ID from this table's namespaced unit name.
+func idFromUnit(namespace, unit string) (ID, bool) {
+	prefix := "tentacle-" + namespace + "-"
 	const suffix = ".service"
 	if !strings.HasPrefix(unit, prefix) || !strings.HasSuffix(unit, suffix) {
 		return "", false

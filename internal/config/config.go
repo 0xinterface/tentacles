@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/0xinterface/tentacles/internal/env"
@@ -63,8 +64,7 @@ const MaxCPUQuotaPercent = 100 * 1024
 
 // Config is the root of the tentacles YAML document.
 type Config struct {
-	GitHub        GitHub        `yaml:"github"`
-	ScaleSet      ScaleSet      `yaml:"scale_set"`
+	Pools         []Pool        `yaml:"pools"`
 	Capacity      Capacity      `yaml:"capacity"`
 	Runner        Runner        `yaml:"runner"`
 	Paths         Paths         `yaml:"paths"`
@@ -80,14 +80,23 @@ const (
 	DefaultSampleInterval      = 30 * time.Second
 )
 
-// GitHub holds the GitHub App credentials and the target scope.
+// Pool identifies one independently authenticated GitHub runner scale set.
+// All pools share the host payload, runner identity, and capacity scheduler.
+type Pool struct {
+	ID       string       `yaml:"id"`
+	GitHub   GitHub       `yaml:"github"`
+	ScaleSet ScaleSet     `yaml:"scale_set"`
+	Capacity PoolCapacity `yaml:"capacity"`
+}
+
+// GitHub holds the GitHub App credentials and target scope for one pool.
 type GitHub struct {
 	URL   string `yaml:"url"`
 	App   App    `yaml:"app"`
 	Scope Scope  `yaml:"scope"`
 }
 
-// App is the GitHub App used for authentication.
+// App is the GitHub App installation used for authentication.
 type App struct {
 	ClientID       string `yaml:"client_id"`
 	InstallationID int64  `yaml:"installation_id"`
@@ -101,17 +110,23 @@ type Scope struct {
 	Repository string `yaml:"repository"`
 }
 
-// ScaleSet describes the GitHub Actions runner scale set to own.
+// ScaleSet describes one GitHub Actions runner scale set.
 type ScaleSet struct {
 	Name        string   `yaml:"name"`
 	RunnerGroup string   `yaml:"runner_group"`
 	ExtraLabels []string `yaml:"extra_labels"`
 }
 
-// Capacity bounds how many runner processes the host may run and their
-// per-slot resource limits.
+// PoolCapacity bounds one pool's requested runners. The host-wide ceiling
+// remains Capacity.MaxRunners.
+type PoolCapacity struct {
+	MinRunners int `yaml:"min_runners"`
+	MaxRunners int `yaml:"max_runners"`
+}
+
+// Capacity bounds total runner processes on the host and their per-slot
+// resource limits.
 type Capacity struct {
-	MinRunners         int    `yaml:"min_runners"`
 	MaxRunners         int    `yaml:"max_runners"`
 	JobCPUQuotaPercent int    `yaml:"job_cpu_quota_percent"`
 	JobMemoryMax       string `yaml:"job_memory_max"`
@@ -170,6 +185,8 @@ var (
 	// labelRe matches a GitHub Actions runner label: letters, digits,
 	// underscore first, then dots, dashes and underscores.
 	labelRe = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]*$`)
+	// poolIDRe keeps pool IDs safe in paths, systemd unit names, and labels.
+	poolIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
 	// versionRe matches a bare X.Y.Z release version.
 	versionRe = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
 	// sha256Re matches a 64-character lowercase or uppercase hex digest.
@@ -188,12 +205,9 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf(format, args...))
 	}
 
-	// Capacity.
+	// Host capacity.
 	if c.Capacity.MaxRunners < 1 {
 		fail("capacity.max_runners must be >= 1 (got %d)", c.Capacity.MaxRunners)
-	}
-	if c.Capacity.MinRunners > c.Capacity.MaxRunners {
-		fail("capacity.min_runners (%d) must be <= capacity.max_runners (%d)", c.Capacity.MinRunners, c.Capacity.MaxRunners)
 	}
 	if c.Capacity.MaxRunners > HardCapMaxRunners {
 		fail("capacity.max_runners (%d) exceeds the hard cap of %d", c.Capacity.MaxRunners, HardCapMaxRunners)
@@ -205,36 +219,40 @@ func (c *Config) Validate() error {
 		fail("capacity.job_memory_max must not be empty")
 	}
 
-	// GitHub App credentials.
-	if c.GitHub.App.InstallationID <= 0 {
-		fail("github.app.installation_id must be > 0 (got %d)", c.GitHub.App.InstallationID)
+	if len(c.Pools) == 0 {
+		fail("pools must contain at least one runner pool")
 	}
-	if c.GitHub.App.ClientID == "" {
-		fail("github.app.client_id must not be empty")
-	}
-	if c.GitHub.App.PrivateKeyPath == "" {
-		fail("github.app.private_key_path must not be empty")
-	} else if _, err := os.Stat(c.GitHub.App.PrivateKeyPath); err != nil {
-		fail("github.app.private_key_path %q is not readable: %v", c.GitHub.App.PrivateKeyPath, err)
-	}
-
-	// Scope.
-	switch c.GitHub.Scope.Kind {
-	case "organization":
-	case "repository":
-		if c.GitHub.Scope.Repository == "" {
-			fail("github.scope.repository must be set when scope.kind is %q", c.GitHub.Scope.Kind)
+	ids := make(map[string]int, len(c.Pools))
+	targets := make(map[string]int, len(c.Pools))
+	totalMin := 0
+	for i, pool := range c.Pools {
+		errs = append(errs, validatePool(i, pool, c.Capacity.MaxRunners)...)
+		totalMin += pool.Capacity.MinRunners
+		if previous, ok := ids[pool.ID]; ok {
+			fail("pools[%d].id %q duplicates pools[%d].id", i, pool.ID, previous)
+		} else {
+			ids[pool.ID] = i
 		}
-	default:
-		fail("github.scope.kind must be %q or %q (got %q)", "organization", "repository", c.GitHub.Scope.Kind)
+		target := strings.Join([]string{
+			pool.GitHub.URL,
+			pool.GitHub.Scope.Kind,
+			pool.GitHub.Scope.Owner,
+			pool.GitHub.Scope.Repository,
+			pool.ScaleSet.RunnerGroup,
+			pool.ScaleSet.Name,
+		}, "\x00")
+		if previous, ok := targets[target]; ok {
+			fail("pools[%d] duplicates the GitHub scale-set target of pools[%d]", i, previous)
+		} else {
+			targets[target] = i
+		}
 	}
-	if c.GitHub.Scope.Owner == "" {
-		fail("github.scope.owner must not be empty")
-	}
-
-	// Scale set.
-	if !labelRe.MatchString(c.ScaleSet.Name) {
-		fail("scale_set.name %q is not a valid Actions label (must match %s)", c.ScaleSet.Name, labelRe.String())
+	if totalMin > c.Capacity.MaxRunners {
+		fail(
+			"sum of pools[].capacity.min_runners (%d) exceeds capacity.max_runners (%d)",
+			totalMin,
+			c.Capacity.MaxRunners,
+		)
 	}
 
 	// Runner payload. An unset version means "track the latest
@@ -334,41 +352,144 @@ func (c *Config) Validate() error {
 	return errors.Join(errs...)
 }
 
-// EnsureDirs creates the daemon's directory tree: state, cache, logs,
-// the slot and template subdirectories, and the runtime JIT dir (tmpfs
-// in production). Directories are created 0755 (JIT: 0700) with MkdirAll and
-// then probed for writability: MkdirAll alone succeeds on existing
-// read-only directories.
-func (c *Config) EnsureDirs() error {
-	dirs := []string{
-		c.Paths.StateDir,
-		c.Paths.CacheDir,
-		c.Paths.LogDir,
-		filepath.Join(c.Paths.StateDir, "slots"),
-		filepath.Join(c.Paths.StateDir, "template"),
-		c.Runtime.JitDir,
+func validatePool(index int, pool Pool, hostMax int) []error {
+	errs := []error{}
+	path := fmt.Sprintf("pools[%d]", index)
+	fail := func(format string, args ...any) {
+		errs = append(errs, fmt.Errorf(path+"."+format, args...))
 	}
-	for _, d := range dirs {
-		if d == "" {
+
+	if !poolIDRe.MatchString(pool.ID) {
+		fail("id %q must match %s", pool.ID, poolIDRe.String())
+	}
+	if pool.Capacity.MinRunners < 0 {
+		fail("capacity.min_runners must be >= 0 (got %d)", pool.Capacity.MinRunners)
+	}
+	if pool.Capacity.MaxRunners < 1 {
+		fail("capacity.max_runners must be >= 1 (got %d)", pool.Capacity.MaxRunners)
+	}
+	if pool.Capacity.MinRunners > pool.Capacity.MaxRunners {
+		fail(
+			"capacity.min_runners (%d) must be <= capacity.max_runners (%d)",
+			pool.Capacity.MinRunners,
+			pool.Capacity.MaxRunners,
+		)
+	}
+	if hostMax > 0 && pool.Capacity.MaxRunners > hostMax {
+		fail(
+			"capacity.max_runners (%d) must be <= host capacity.max_runners (%d)",
+			pool.Capacity.MaxRunners,
+			hostMax,
+		)
+	}
+	if pool.GitHub.URL == "" {
+		fail("github.url must not be empty")
+	}
+	if pool.GitHub.App.InstallationID <= 0 {
+		fail("github.app.installation_id must be > 0 (got %d)", pool.GitHub.App.InstallationID)
+	}
+	if pool.GitHub.App.ClientID == "" {
+		fail("github.app.client_id must not be empty")
+	}
+	if pool.GitHub.App.PrivateKeyPath == "" {
+		fail("github.app.private_key_path must not be empty")
+	} else if _, err := os.Stat(pool.GitHub.App.PrivateKeyPath); err != nil {
+		fail("github.app.private_key_path %q is not readable: %v", pool.GitHub.App.PrivateKeyPath, err)
+	}
+
+	switch pool.GitHub.Scope.Kind {
+	case "organization":
+	case "repository":
+		if pool.GitHub.Scope.Repository == "" {
+			fail(
+				"github.scope.repository must be set when scope.kind is %q",
+				pool.GitHub.Scope.Kind,
+			)
+		}
+	default:
+		fail(
+			"github.scope.kind must be %q or %q (got %q)",
+			"organization",
+			"repository",
+			pool.GitHub.Scope.Kind,
+		)
+	}
+	if pool.GitHub.Scope.Owner == "" {
+		fail("github.scope.owner must not be empty")
+	}
+	if !labelRe.MatchString(pool.ScaleSet.Name) {
+		fail(
+			"scale_set.name %q is not a valid Actions label (must match %s)",
+			pool.ScaleSet.Name,
+			labelRe.String(),
+		)
+	}
+	return errs
+}
+
+// PoolStateDir is the private state root for one configured pool.
+func (c *Config) PoolStateDir(id string) string {
+	return filepath.Join(c.Paths.StateDir, "pools", id)
+}
+
+// PoolSlotsDir is the slot-table root for one configured pool.
+func (c *Config) PoolSlotsDir(id string) string {
+	return filepath.Join(c.PoolStateDir(id), "slots")
+}
+
+// PoolJITDir is the root-only JIT source directory for one configured pool.
+func (c *Config) PoolJITDir(id string) string {
+	return filepath.Join(c.Runtime.JitDir, id)
+}
+
+// PoolLogDir is the diagnostic archive directory for one configured pool.
+func (c *Config) PoolLogDir(id string) string {
+	return filepath.Join(c.Paths.LogDir, "pools", id)
+}
+
+// EnsureDirs creates the shared daemon directories and isolated state, JIT,
+// and diagnostic directories for every configured pool.
+func (c *Config) EnsureDirs() error {
+	type dirSpec struct {
+		path string
+		mode os.FileMode
+	}
+	dirs := []dirSpec{
+		{path: c.Paths.StateDir, mode: 0o755},
+		{path: c.Paths.CacheDir, mode: 0o755},
+		{path: c.Paths.LogDir, mode: 0o755},
+		{path: filepath.Join(c.Paths.StateDir, "template"), mode: 0o755},
+		{path: c.Runtime.JitDir, mode: 0o700},
+	}
+	for _, pool := range c.Pools {
+		dirs = append(
+			dirs,
+			dirSpec{path: c.PoolSlotsDir(pool.ID), mode: 0o755},
+			dirSpec{path: c.PoolJITDir(pool.ID), mode: 0o700},
+			dirSpec{path: c.PoolLogDir(pool.ID), mode: 0o755},
+		)
+	}
+	for _, dir := range dirs {
+		if dir.path == "" {
 			return fmt.Errorf("cannot create directory: empty path")
 		}
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			return fmt.Errorf("create directory %s: %w", d, err)
+		if err := os.MkdirAll(dir.path, dir.mode); err != nil {
+			return fmt.Errorf("create directory %s: %w", dir.path, err)
 		}
-		if d == c.Runtime.JitDir {
-			info, err := os.Lstat(d)
+		if dir.mode == 0o700 {
+			info, err := os.Lstat(dir.path)
 			if err != nil {
 				return err
 			}
 			if !info.IsDir() {
-				return fmt.Errorf("JIT directory must be a real directory: %s", d)
+				return fmt.Errorf("JIT directory must be a real directory: %s", dir.path)
 			}
-			if err := os.Chmod(d, 0700); err != nil {
+			if err := os.Chmod(dir.path, dir.mode); err != nil {
 				return err
 			}
 		}
-		if err := probeWritable(d); err != nil {
-			return fmt.Errorf("directory %s is not writable: %w", d, err)
+		if err := probeWritable(dir.path); err != nil {
+			return fmt.Errorf("directory %s is not writable: %w", dir.path, err)
 		}
 	}
 	return nil

@@ -20,14 +20,14 @@ import (
 // Start-argument test.
 func sampleSpec() runner.Spec {
 	return runner.Spec{
-		SlotDir:   "/var/lib/tentacles/slots/0001",
-		JITPath:   "/run/tentacles/0001.jit",
+		SlotDir:   "/var/lib/tentacles/pools/default/slots/0001",
+		JITPath:   "/run/tentacles/default/0001.jit",
 		EnvFile:   "/etc/tentacles/runner.env",
 		User:      "gha-runner",
 		Group:     "gha-runner",
 		CPUQuota:  "400%",
 		MemoryMax: "8G",
-		UnitName:  "tentacle-0001.service",
+		UnitName:  "tentacle-default-0001.service",
 	}
 }
 
@@ -145,14 +145,14 @@ func TestStartGoldenArgVector(t *testing.T) {
 	want := []string{
 		"--collect",
 		"--expand-environment=no",
-		"--unit", "tentacle-0001.service",
+		"--unit", "tentacle-default-0001.service",
 		"--description", "GitHub Actions runner slot",
 		"-p", "Type=exec",
 		"-p", "User=gha-runner",
 		"-p", "Group=gha-runner",
-		"-p", "WorkingDirectory=/var/lib/tentacles/slots/0001",
+		"-p", "WorkingDirectory=/var/lib/tentacles/pools/default/slots/0001",
 		"-p", "EnvironmentFile=/etc/tentacles/runner.env",
-		"-p", "LoadCredential=jit:/run/tentacles/0001.jit",
+		"-p", "LoadCredential=jit:/run/tentacles/default/0001.jit",
 		"-p", "CPUQuota=400%",
 		"-p", "MemoryMax=8G",
 		"-p", "Nice=5",
@@ -165,7 +165,7 @@ func TestStartGoldenArgVector(t *testing.T) {
 		"-p", "MemoryAccounting=yes",
 		"-p", "ProtectSystem=strict",
 		"-p", "ProtectHome=read-only",
-		"-p", `ReadWritePaths="/var/lib/tentacles/slots/0001" "/tmp"`,
+		"-p", `ReadWritePaths="/var/lib/tentacles/pools/default/slots/0001" "/tmp"`,
 		"-p", "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
 		"-p", "LockPersonality=yes",
 		"/bin/sh", "-c", `jit=$(cat "$CREDENTIALS_DIRECTORY/jit") || exit; exec ./run.sh --jitconfig "$jit"`,
@@ -239,7 +239,7 @@ func TestUsageReadsAccounting(t *testing.T) {
 	t.Setenv("FAKE_SYSTEMCTL_CPU_NSEC", "25000000000") // 25s
 	t.Setenv("FAKE_SYSTEMCTL_MEM_PEAK", "536870912")
 	t.Setenv("FAKE_SYSTEMCTL_MEM_CURRENT", "268435456")
-	u, err := b.Usage("tentacle-0001.service")
+	u, err := b.Usage("tentacle-default-0001.service")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +260,7 @@ func TestUsageErrorPropagates(t *testing.T) {
 	b, _, _ := newTestBackend(t)
 	t.Setenv("FAKE_SYSTEMCTL_EXIT", "1")
 	t.Setenv("FAKE_SYSTEMCTL_STDERR", "failed to show unit")
-	if _, err := b.Usage("tentacle-0001.service"); err == nil {
+	if _, err := b.Usage("tentacle-default-0001.service"); err == nil {
 		t.Fatal("expected error from failed systemctl show")
 	}
 }
@@ -285,7 +285,7 @@ func TestStartErrorIncludesStderrTail(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	if !strings.Contains(err.Error(), "tentacle-0001.service") {
+	if !strings.Contains(err.Error(), "tentacle-default-0001.service") {
 		t.Errorf("error missing unit name: %v", err)
 	}
 	if !strings.Contains(err.Error(), "Operation refused") {
@@ -296,16 +296,16 @@ func TestStartErrorIncludesStderrTail(t *testing.T) {
 func TestStopArgvAndError(t *testing.T) {
 	b, _, ctlLog := newTestBackend(t)
 
-	if err := b.Stop(context.Background(), "tentacle-0001.service"); err != nil {
+	if err := b.Stop(context.Background(), "tentacle-default-0001.service"); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
-	if want := "stop\ntentacle-0001.service\n"; readLog(t, ctlLog) != want {
+	if want := "stop\ntentacle-default-0001.service\n"; readLog(t, ctlLog) != want {
 		t.Fatalf("Stop argv = %q, want %q", readLog(t, ctlLog), want)
 	}
 
 	t.Setenv("FAKE_SYSTEMCTL_EXIT", "1")
 	t.Setenv("FAKE_SYSTEMCTL_STDERR", "Failed to stop unit: Connection timed out")
-	err := b.Stop(context.Background(), "tentacle-0001.service")
+	err := b.Stop(context.Background(), "tentacle-default-0001.service")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -317,10 +317,10 @@ func TestStopArgvAndError(t *testing.T) {
 func TestWaitHappyPath(t *testing.T) {
 	b, _, ctlLog := newTestBackend(t)
 
-	if err := b.Wait(context.Background(), "tentacle-0001.service"); err != nil {
+	if err := b.Wait(context.Background(), "tentacle-default-0001.service"); err != nil {
 		t.Fatalf("Wait: %v", err)
 	}
-	if want := "show\ntentacle-0001.service\n--property=LoadState\n--property=ActiveState\n"; readLog(t, ctlLog) != want {
+	if want := "show\ntentacle-default-0001.service\n--property=LoadState\n--property=ActiveState\n"; readLog(t, ctlLog) != want {
 		t.Fatalf("Wait argv = %q, want %q", readLog(t, ctlLog), want)
 	}
 }
@@ -332,12 +332,12 @@ func TestWaitUsesStateObservation(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := b.Wait(ctx, "tentacle-0001.service"); err != nil {
+	if err := b.Wait(ctx, "tentacle-default-0001.service"); err != nil {
 		t.Fatalf("Wait fallback: %v", err)
 	}
 
 	log := readLog(t, ctlLog)
-	want := "show\ntentacle-0001.service\n--property=LoadState\n--property=ActiveState\n"
+	want := "show\ntentacle-default-0001.service\n--property=LoadState\n--property=ActiveState\n"
 	if log != want {
 		t.Fatalf("Wait fallback argv = %q, want %q", log, want)
 	}
@@ -354,7 +354,7 @@ func TestWaitPollsUntilGone(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := b.Wait(ctx, "tentacle-0001.service"); err != nil {
+	if err := b.Wait(ctx, "tentacle-default-0001.service"); err != nil {
 		t.Fatalf("Wait fallback: %v", err)
 	}
 	log := readLog(t, ctlLog)
@@ -370,23 +370,45 @@ func TestWaitContextCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 	defer cancel()
-	err := b.Wait(ctx, "tentacle-0001.service")
+	err := b.Wait(ctx, "tentacle-default-0001.service")
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Wait fallback err = %v, want context.DeadlineExceeded", err)
 	}
 }
 
 func TestActiveParsesLegendOutput(t *testing.T) {
-	b, _, _ := newTestBackend(t)
+	b, _, controlLog := newTestBackend(t)
 	t.Setenv("FAKE_SYSTEMCTL_LIST",
-		"tentacle-0001.service loaded active running GitHub Actions runner slot\n"+
-			"tentacle-0002.service loaded active running GitHub Actions runner slot\n")
+		"tentacle-default-0001.service loaded active running GitHub Actions runner slot\n"+
+			"tentacle-default-0002.service loaded active running GitHub Actions runner slot\n")
 
 	got, err := b.Active(context.Background())
 	if err != nil {
 		t.Fatalf("Active: %v", err)
 	}
-	want := []string{"tentacle-0001.service", "tentacle-0002.service"}
+	want := []string{"tentacle-default-0001.service", "tentacle-default-0002.service"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Active = %v, want %v", got, want)
+	}
+	if args := readLog(t, controlLog); !strings.Contains(args, "tentacle-default-*.service\n") {
+		t.Fatalf("Active did not scope discovery to its namespace:\n%s", args)
+	}
+}
+
+func TestActiveSkipsOverlappingPoolNamespace(t *testing.T) {
+	backend, _, _ := newTestBackend(t)
+	backend.namespace = "org-a"
+	t.Setenv(
+		"FAKE_SYSTEMCTL_LIST",
+		"tentacle-org-a-0001.service loaded active running org-a runner\n"+
+			"tentacle-org-a-b-0001.service loaded active running org-a-b runner\n",
+	)
+
+	got, err := backend.Active(context.Background())
+	if err != nil {
+		t.Fatalf("Active: %v", err)
+	}
+	want := []string{"tentacle-org-a-0001.service"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Active = %v, want %v", got, want)
 	}

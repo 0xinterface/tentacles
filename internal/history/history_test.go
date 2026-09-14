@@ -12,7 +12,7 @@ import (
 
 func rec(ref string, cpu float64, mem uint64, wall float64, sampled bool) Record {
 	return Record{
-		Slot: "0001", WorkflowRef: ref, CPUSeconds: cpu,
+		Pool: "test", Slot: "0001", WorkflowRef: ref, CPUSeconds: cpu,
 		PeakMemBytes: mem, WallSeconds: wall, Sampled: sampled,
 		At: time.Now(),
 	}
@@ -27,7 +27,7 @@ func TestStoreStatsAndEWMA(t *testing.T) {
 		t.Fatal(err)
 	}
 	const ref = "o/r/w.yml@main"
-	if st := s.Ref(ref); st.Count != 0 {
+	if st := s.Ref("test", ref); st.Count != 0 {
 		t.Fatalf("unknown ref stats = %+v, want zero", st)
 	}
 	if err := s.Append(rec(ref, 10, 1<<28, 60, true)); err != nil {
@@ -36,7 +36,7 @@ func TestStoreStatsAndEWMA(t *testing.T) {
 	if err := s.Append(rec(ref, 20, 3<<28, 90, true)); err != nil {
 		t.Fatal(err)
 	}
-	st := s.Ref(ref)
+	st := s.Ref("test", ref)
 	// EWMA alpha 0.25 weights the newest sample: after 10 then 20 the
 	// average sits at 0.25*20 + 0.75*10.
 	wantCPU := 0.25*20 + 0.75*10 // 12.5
@@ -63,7 +63,7 @@ func TestStoreUnsampledRecordsSkipCPUMem(t *testing.T) {
 	if err := s.Append(rec(ref, 0, 0, 45, false)); err != nil {
 		t.Fatal(err)
 	}
-	st := s.Ref(ref)
+	st := s.Ref("test", ref)
 	if st.Count != 1 {
 		t.Fatalf("count = %d", st.Count)
 	}
@@ -86,7 +86,7 @@ func TestStorePersistsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st := s2.Ref(ref)
+	st := s2.Ref("test", ref)
 	if st.Count != 1 || !near(st.CPUSeconds, 30) || st.PeakMemBytes != 2<<30 {
 		t.Fatalf("reopened stats = %+v", st)
 	}
@@ -117,21 +117,21 @@ func TestPredictCoresFallsBackToGlobal(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "history.jsonl")
 	s, _ := Open(path)
 	// Only ref A has history.
-	if err := s.Append(Record{WorkflowRef: "a", CPUSeconds: 20, WallSeconds: 10, Sampled: true, At: time.Now()}); err != nil {
+	if err := s.Append(Record{Pool: "test", WorkflowRef: "a", CPUSeconds: 20, WallSeconds: 10, Sampled: true, At: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
-	cores, ok := s.PredictCores("a")
+	cores, ok := s.PredictCores("test", "a")
 	if !ok || !near(cores, 2) {
 		t.Fatalf("a cores = %v ok=%v, want 2", cores, ok)
 	}
 	// Unknown ref falls back to the global average.
-	cores, ok = s.PredictCores("unknown")
+	cores, ok = s.PredictCores("test", "unknown")
 	if !ok || !near(cores, 2) {
 		t.Fatalf("fallback cores = %v ok=%v, want 2", cores, ok)
 	}
 	// No history at all: inert.
 	empty, _ := Open(filepath.Join(t.TempDir(), "h.jsonl"))
-	if _, ok := empty.PredictCores("a"); ok {
+	if _, ok := empty.PredictCores("test", "a"); ok {
 		t.Fatal("empty store predicted cores")
 	}
 }
@@ -151,7 +151,7 @@ func TestStoreReplayWithLongRefs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st := s2.Ref(longRef)
+	st := s2.Ref("test", longRef)
 	if st.Count != 1 || !near(st.CPUSeconds, 42) {
 		t.Fatalf("long-ref record lost on reopen: %+v", st)
 	}
@@ -166,7 +166,7 @@ func TestStoreReplayWithLongRefs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st := s3.Ref(longRef); st.Count == 0 {
+	if st := s3.Ref("test", longRef); st.Count == 0 {
 		t.Fatal("rotation wiped long-ref history")
 	}
 }
@@ -217,5 +217,26 @@ func TestStoreRotateKeepsNewestWithLongRefs(t *testing.T) {
 	}
 	if st := s2.Global(); st.Count < 2 {
 		t.Fatalf("rotation lost records: kept %d", st.Count)
+	}
+}
+
+func TestHistorySeparatesIdenticalRefsAcrossPools(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "history.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const ref = "shared/repo/.github/workflows/ci.yml@main"
+	for _, record := range []Record{
+		{Pool: "org-a", WorkflowRef: ref, CPUSeconds: 10, WallSeconds: 10, Sampled: true, At: time.Now()},
+		{Pool: "org-b", WorkflowRef: ref, CPUSeconds: 100, WallSeconds: 10, Sampled: true, At: time.Now()},
+	} {
+		if err := store.Append(record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	coresA, okA := store.PredictCores("org-a", ref)
+	coresB, okB := store.PredictCores("org-b", ref)
+	if !okA || !okB || !near(coresA, 1) || !near(coresB, 10) {
+		t.Fatalf("pool predictions crossed: org-a=%v/%v org-b=%v/%v", coresA, okA, coresB, okB)
 	}
 }

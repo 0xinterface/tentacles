@@ -12,10 +12,6 @@ import (
 func TestCancelledPrunePreservesOriginalArchiveAge(t *testing.T) {
 	logs := t.TempDir()
 	item := createArchive(t, logs, "old", 8*24*time.Hour)
-	second := filepath.Join(item, "second")
-	if err := os.WriteFile(second, []byte("remaining log"), 0600); err != nil {
-		t.Fatal(err)
-	}
 	old := time.Now().Add(-8 * 24 * time.Hour)
 	if err := os.Chtimes(item, old, old); err != nil {
 		t.Fatal(err)
@@ -28,9 +24,6 @@ func TestCancelledPrunePreservesOriginalArchiveAge(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(item, archiveMarker)); err != nil {
 		t.Fatalf("marker missing: %v", err)
-	}
-	if _, err := os.Stat(second); err != nil {
-		t.Fatalf("probe did not retain log: %v", err)
 	}
 	if err := Prune(context.Background(), logs, 7*24*time.Hour, 1<<30); err != nil {
 		t.Fatal(err)

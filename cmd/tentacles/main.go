@@ -1,7 +1,6 @@
-// Command tentacles is the GitHub Actions host runner supervisor.
-// It owns one runner scale set and keeps ephemeral, JIT-configured
-// official runner processes alive on this host (see docs/spike.md and
-// README.md). No business logic lives here.
+// Command tentacles supervises one or more GitHub Actions runner scale sets
+// on a shared host and keeps ephemeral, JIT-configured official runners alive.
+// No business logic lives here.
 package main
 
 import (

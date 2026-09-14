@@ -2,9 +2,7 @@
 //
 // The exposition is hand-rolled on purpose: the daemon avoids third-party
 // metrics clients, so the registry owns a small Prometheus text-format
-// renderer (version 0.0.4) with a fixed, documented metric set. All methods
-// are safe for concurrent use; the rendered output is sorted and stable so
-// tests (and humans) can diff it exactly.
+// renderer with one bounded pool label from configuration.
 package metrics
 
 import (
@@ -15,12 +13,8 @@ import (
 	"sync"
 )
 
-// slotStartBuckets are the le (less-than-or-equal) boundaries of the
-// tentacles_slot_start_seconds histogram.
 var slotStartBuckets = [...]float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60}
 
-// jobCPUBuckets and jobWallBuckets bound typical per-job CPU time and
-// wall-clock spans (seconds).
 var (
 	jobCPUBuckets  = []float64{1, 5, 10, 30, 60, 120, 300, 600, 1800, 3600}
 	jobWallBuckets = []float64{5, 15, 30, 60, 120, 300, 600, 1200, 1800, 3600}
@@ -28,30 +22,28 @@ var (
 
 // Registry is the daemon-wide metrics registry.
 type Registry struct {
-	mu sync.Mutex
-
-	desired       int
-	actual        map[string]int
-	jobsStarted   uint64
-	jobsCompleted map[string]uint64
-	acquireFails  uint64
-	listenerErrs  uint64
-	lastMessageID int64
-
-	admissionHolds uint64
-
-	jobCPU  *histogram
-	jobWall *histogram
-
-	slotStartCount uint64
-	slotStartSum   float64
-	// slotStartBuckets holds one count per slotStartBuckets entry, plus a
-	// final +Inf bucket.
-	slotStartBuckets []uint64
-	lastJobPeakMem   uint64
+	mu             sync.Mutex
+	hostMaxRunners int
+	pools          map[string]*poolMetrics
 }
 
-// histogram is a fixed-bucket cumulative histogram.
+type poolMetrics struct {
+	desired        int
+	actual         map[string]int
+	jobsStarted    uint64
+	jobsCompleted  map[string]uint64
+	acquireFails   uint64
+	listenerErrs   uint64
+	lastMessageID  int64
+	admissionHolds uint64
+	jobCPU         *histogram
+	jobWall        *histogram
+	slotStartCount uint64
+	slotStartSum   float64
+	slotStarts     []uint64
+	lastJobPeakMem uint64
+}
+
 type histogram struct {
 	buckets []float64
 	counts  []uint64
@@ -60,136 +52,160 @@ type histogram struct {
 }
 
 func newHistogram(buckets []float64) *histogram {
-	return &histogram{buckets: buckets, counts: make([]uint64, len(buckets))}
+	return &histogram{
+		buckets: buckets,
+		counts:  make([]uint64, len(buckets)),
+	}
 }
 
-func (h *histogram) observe(v float64) {
+func newPoolMetrics() *poolMetrics {
+	return &poolMetrics{
+		actual:        make(map[string]int),
+		jobsCompleted: make(map[string]uint64),
+		jobCPU:        newHistogram(jobCPUBuckets),
+		jobWall:       newHistogram(jobWallBuckets),
+		slotStarts:    make([]uint64, len(slotStartBuckets)+1),
+	}
+}
+
+func (h *histogram) observe(value float64) {
 	h.count++
-	h.sum += v
-	for i, le := range h.buckets {
-		if v <= le {
+	h.sum += value
+	for i, upper := range h.buckets {
+		if value <= upper {
 			h.counts[i]++
 		}
 	}
 }
 
-func (h *histogram) lines(name string) []string {
+func (h *histogram) lines(name, pool string) []string {
+	label := `pool="` + escapeLabel(pool) + `"`
 	lines := make([]string, 0, len(h.buckets)+3)
-	for i, le := range h.buckets {
-		lines = append(lines, name+"_bucket{le=\""+formatFloat(le)+"\"} "+formatFloat(float64(h.counts[i])))
+	for i, upper := range h.buckets {
+		lines = append(
+			lines,
+			name+`_bucket{`+label+`,le="`+formatFloat(upper)+`"} `+
+				formatFloat(float64(h.counts[i])),
+		)
 	}
-	lines = append(lines, name+"_bucket{le=\"+Inf\"} "+formatFloat(float64(h.count)))
-	lines = append(lines, name+"_sum "+formatFloat(h.sum))
-	lines = append(lines, name+"_count "+formatFloat(float64(h.count)))
+	lines = append(
+		lines,
+		name+`_bucket{`+label+`,le="+Inf"} `+formatFloat(float64(h.count)),
+		name+"_sum{"+label+"} "+formatFloat(h.sum),
+		name+"_count{"+label+"} "+formatFloat(float64(h.count)),
+	)
 	return lines
 }
 
 // NewRegistry returns an empty registry.
 func NewRegistry() *Registry {
-	return &Registry{
-		actual:           make(map[string]int),
-		jobsCompleted:    make(map[string]uint64),
-		slotStartBuckets: make([]uint64, len(slotStartBuckets)+1),
-		jobCPU:           newHistogram(jobCPUBuckets),
-		jobWall:          newHistogram(jobWallBuckets),
+	return &Registry{pools: make(map[string]*poolMetrics)}
+}
+
+// RegisterPool creates the fixed zero-valued series for one configured pool.
+func (r *Registry) RegisterPool(pool string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.poolLocked(pool)
+}
+
+// SetHostMaxRunners records the global scheduler ceiling.
+func (r *Registry) SetHostMaxRunners(value int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.hostMaxRunners = value
+}
+
+func (r *Registry) poolLocked(pool string) *poolMetrics {
+	stats := r.pools[pool]
+	if stats == nil {
+		stats = newPoolMetrics()
+		r.pools[pool] = stats
 	}
+	return stats
 }
 
-// SetDesired records the last desired runner count.
-func (r *Registry) SetDesired(n int) {
+func (r *Registry) SetDesired(pool string, value int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.desired = n
+	r.poolLocked(pool).desired = value
 }
 
-// SetActual records how many runner slots are in the given state. A state
-// shows up in the exposition once it has been set here.
-func (r *Registry) SetActual(state string, n int) {
+func (r *Registry) SetActual(pool, state string, value int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.actual[state] = n
+	r.poolLocked(pool).actual[state] = value
 }
 
-// IncJobsStarted counts one started job.
-func (r *Registry) IncJobsStarted() {
+func (r *Registry) IncJobsStarted(pool string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.jobsStarted++
+	r.poolLocked(pool).jobsStarted++
 }
 
-// IncJobsCompleted counts one completed job under the given result label.
-// Unknown result labels are allowed and produce their own series.
-func (r *Registry) IncJobsCompleted(result string) {
+func (r *Registry) IncJobsCompleted(pool, result string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.jobsCompleted[result]++
+	r.poolLocked(pool).jobsCompleted[result]++
 }
 
-// IncAcquireFailures counts one runner acquire failure.
-func (r *Registry) IncAcquireFailures() {
+func (r *Registry) IncAcquireFailures(pool string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.acquireFails++
+	r.poolLocked(pool).acquireFails++
 }
 
-// IncListenerErrors counts one listener loop error.
-func (r *Registry) IncListenerErrors() {
+func (r *Registry) IncListenerErrors(pool string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.listenerErrs++
+	r.poolLocked(pool).listenerErrs++
 }
 
-// SetLastMessageID records the ID of the last processed scale-set message.
-func (r *Registry) SetLastMessageID(id int64) {
+func (r *Registry) SetLastMessageID(pool string, id int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.lastMessageID = id
+	r.poolLocked(pool).lastMessageID = id
 }
 
-// ObserveSlotStart records how long a slot took to start, in seconds.
-func (r *Registry) ObserveSlotStart(seconds float64) {
+func (r *Registry) ObserveSlotStart(pool string, seconds float64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.slotStartCount++
-	r.slotStartSum += seconds
-	for i, le := range slotStartBuckets {
-		if seconds <= le {
-			r.slotStartBuckets[i]++
+	stats := r.poolLocked(pool)
+	stats.slotStartCount++
+	stats.slotStartSum += seconds
+	for i, upper := range slotStartBuckets {
+		if seconds <= upper {
+			stats.slotStarts[i]++
 		}
 	}
-	r.slotStartBuckets[len(slotStartBuckets)]++ // +Inf
+	stats.slotStarts[len(slotStartBuckets)]++
 }
 
-// IncAdmissionHolds counts one slot start held back by the admission gate.
-func (r *Registry) IncAdmissionHolds() {
+func (r *Registry) IncAdmissionHolds(pool string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.admissionHolds++
+	r.poolLocked(pool).admissionHolds++
 }
 
-// ObserveJobCPU records the measured CPU seconds of one finished job.
-func (r *Registry) ObserveJobCPU(seconds float64) {
+func (r *Registry) ObserveJobCPU(pool string, seconds float64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.jobCPU.observe(seconds)
+	r.poolLocked(pool).jobCPU.observe(seconds)
 }
 
-// ObserveJobWall records the wall-clock seconds of one finished job.
-func (r *Registry) ObserveJobWall(seconds float64) {
+func (r *Registry) ObserveJobWall(pool string, seconds float64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.jobWall.observe(seconds)
+	r.poolLocked(pool).jobWall.observe(seconds)
 }
 
-// SetJobPeakMem records the peak memory of the most recent finished job.
-func (r *Registry) SetJobPeakMem(b uint64) {
+func (r *Registry) SetJobPeakMem(pool string, bytes uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.lastJobPeakMem = b
+	r.poolLocked(pool).lastJobPeakMem = bytes
 }
 
-// Handler returns an HTTP handler serving the registry in Prometheus text
-// exposition format (version 0.0.4).
+// Handler serves the registry in Prometheus text exposition format.
 func (r *Registry) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
@@ -197,7 +213,6 @@ func (r *Registry) Handler() http.Handler {
 	})
 }
 
-// family is one Prometheus metric family in exposition order.
 type family struct {
 	name  string
 	help  string
@@ -205,184 +220,243 @@ type family struct {
 	lines []string
 }
 
-// render produces the full exposition. Families are emitted in sorted name
-// order; samples within a family are sorted by their label values.
 func (r *Registry) render() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	pools := r.poolNames()
 
 	families := []family{
 		{
 			name: "tentacles_acquire_failures_total",
 			help: "Total number of times a runner failed to acquire its assigned job.",
 			typ:  "counter",
-			lines: []string{
-				"tentacles_acquire_failures_total " + formatFloat(float64(r.acquireFails)),
-			},
+			lines: r.scalarLines("tentacles_acquire_failures_total", pools, func(stats *poolMetrics) float64 {
+				return float64(stats.acquireFails)
+			}),
 		},
 		{
 			name:  "tentacles_actual_runners",
-			help:  "Current number of runner slots by lifecycle state.",
+			help:  "Current number of runner slots by pool and lifecycle state.",
 			typ:   "gauge",
-			lines: r.actualLines(),
+			lines: r.actualLines(pools),
 		},
 		{
 			name: "tentacles_desired_runners",
-			help: "Current desired number of runner slots.",
+			help: "Current desired number of runner slots by pool.",
+			typ:  "gauge",
+			lines: r.scalarLines("tentacles_desired_runners", pools, func(stats *poolMetrics) float64 {
+				return float64(stats.desired)
+			}),
+		},
+		{
+			name: "tentacles_host_max_runners",
+			help: "Configured maximum number of runners on this host.",
 			typ:  "gauge",
 			lines: []string{
-				"tentacles_desired_runners " + formatFloat(float64(r.desired)),
+				"tentacles_host_max_runners " + formatFloat(float64(r.hostMaxRunners)),
 			},
 		},
 		{
 			name:  "tentacles_jobs_completed_total",
-			help:  "Total number of completed jobs, by reported result (\"unknown\": completion message missed).",
+			help:  "Total number of completed jobs by pool and reported result.",
 			typ:   "counter",
-			lines: r.jobsCompletedLines(),
+			lines: r.jobsCompletedLines(pools),
 		},
 		{
 			name: "tentacles_jobs_started_total",
-			help: "Total number of started jobs.",
+			help: "Total number of started jobs by pool.",
 			typ:  "counter",
-			lines: []string{
-				"tentacles_jobs_started_total " + formatFloat(float64(r.jobsStarted)),
-			},
+			lines: r.scalarLines("tentacles_jobs_started_total", pools, func(stats *poolMetrics) float64 {
+				return float64(stats.jobsStarted)
+			}),
 		},
 		{
 			name: "tentacles_last_message_id",
-			help: "ID of the last processed scale-set message.",
+			help: "ID of the last processed scale-set message by pool.",
 			typ:  "gauge",
-			lines: []string{
-				"tentacles_last_message_id " + formatFloat(float64(r.lastMessageID)),
-			},
+			lines: r.scalarLines("tentacles_last_message_id", pools, func(stats *poolMetrics) float64 {
+				return float64(stats.lastMessageID)
+			}),
 		},
 		{
 			name: "tentacles_listener_errors_total",
-			help: "Total number of scale-set listener loop errors.",
+			help: "Total number of scale-set listener loop errors by pool.",
 			typ:  "counter",
-			lines: []string{
-				"tentacles_listener_errors_total " + formatFloat(float64(r.listenerErrs)),
-			},
+			lines: r.scalarLines("tentacles_listener_errors_total", pools, func(stats *poolMetrics) float64 {
+				return float64(stats.listenerErrs)
+			}),
 		},
 		{
 			name: "tentacles_admission_holds_total",
-			help: "Total number of slot starts held back by the admission gate.",
+			help: "Total number of slot starts held by the admission gate by pool.",
 			typ:  "counter",
-			lines: []string{
-				"tentacles_admission_holds_total " + formatFloat(float64(r.admissionHolds)),
-			},
+			lines: r.scalarLines("tentacles_admission_holds_total", pools, func(stats *poolMetrics) float64 {
+				return float64(stats.admissionHolds)
+			}),
 		},
 		{
-			name:  "tentacles_job_cpu_seconds",
-			help:  "CPU seconds consumed by finished jobs.",
-			typ:   "histogram",
-			lines: r.jobCPU.lines("tentacles_job_cpu_seconds"),
+			name: "tentacles_job_cpu_seconds",
+			help: "CPU seconds consumed by finished jobs.",
+			typ:  "histogram",
+			lines: r.histogramLines("tentacles_job_cpu_seconds", pools, func(stats *poolMetrics) *histogram {
+				return stats.jobCPU
+			}),
 		},
 		{
-			name:  "tentacles_job_wall_seconds",
-			help:  "Wall-clock seconds of finished jobs.",
-			typ:   "histogram",
-			lines: r.jobWall.lines("tentacles_job_wall_seconds"),
+			name: "tentacles_job_wall_seconds",
+			help: "Wall-clock seconds of finished jobs.",
+			typ:  "histogram",
+			lines: r.histogramLines("tentacles_job_wall_seconds", pools, func(stats *poolMetrics) *histogram {
+				return stats.jobWall
+			}),
 		},
 		{
 			name: "tentacles_last_job_peak_memory_bytes",
-			help: "Peak memory of the most recent finished job.",
+			help: "Peak memory of the most recent finished job by pool.",
 			typ:  "gauge",
-			lines: []string{
-				"tentacles_last_job_peak_memory_bytes " + formatFloat(float64(r.lastJobPeakMem)),
-			},
+			lines: r.scalarLines("tentacles_last_job_peak_memory_bytes", pools, func(stats *poolMetrics) float64 {
+				return float64(stats.lastJobPeakMem)
+			}),
 		},
 		{
 			name:  "tentacles_slot_start_seconds",
 			help:  "Provision time of successful slot starts.",
 			typ:   "histogram",
-			lines: r.slotStartLines(),
+			lines: r.slotStartLines(pools),
 		},
 	}
-
 	sort.Slice(families, func(i, j int) bool { return families[i].name < families[j].name })
 
-	var b strings.Builder
-	for _, f := range families {
-		if len(f.lines) == 0 {
+	var builder strings.Builder
+	for _, metricFamily := range families {
+		if len(metricFamily.lines) == 0 {
 			continue
 		}
-		b.WriteString("# HELP ")
-		b.WriteString(f.name)
-		b.WriteByte(' ')
-		b.WriteString(f.help)
-		b.WriteByte('\n')
-		b.WriteString("# TYPE ")
-		b.WriteString(f.name)
-		b.WriteByte(' ')
-		b.WriteString(f.typ)
-		b.WriteByte('\n')
-		for _, l := range f.lines {
-			b.WriteString(l)
-			b.WriteByte('\n')
+		builder.WriteString("# HELP ")
+		builder.WriteString(metricFamily.name)
+		builder.WriteByte(' ')
+		builder.WriteString(metricFamily.help)
+		builder.WriteByte('\n')
+		builder.WriteString("# TYPE ")
+		builder.WriteString(metricFamily.name)
+		builder.WriteByte(' ')
+		builder.WriteString(metricFamily.typ)
+		builder.WriteByte('\n')
+		for _, line := range metricFamily.lines {
+			builder.WriteString(line)
+			builder.WriteByte('\n')
 		}
 	}
-	return b.String()
+	return builder.String()
 }
 
-// actualLines returns one sample per state that has been set, sorted by
-// state name. No states set means no samples and no family header.
-func (r *Registry) actualLines() []string {
-	if len(r.actual) == 0 {
-		return nil
+func (r *Registry) poolNames() []string {
+	names := make([]string, 0, len(r.pools))
+	for name := range r.pools {
+		names = append(names, name)
 	}
-	states := make([]string, 0, len(r.actual))
-	for s := range r.actual {
-		states = append(states, s)
-	}
-	sort.Strings(states)
-	lines := make([]string, 0, len(states))
-	for _, s := range states {
-		lines = append(lines, "tentacles_actual_runners{state=\""+escapeLabel(s)+"\"} "+formatFloat(float64(r.actual[s])))
+	sort.Strings(names)
+	return names
+}
+
+func (r *Registry) scalarLines(
+	name string,
+	pools []string,
+	value func(*poolMetrics) float64,
+) []string {
+	lines := make([]string, 0, len(pools))
+	for _, pool := range pools {
+		lines = append(
+			lines,
+			name+`{pool="`+escapeLabel(pool)+`"} `+formatFloat(value(r.pools[pool])),
+		)
 	}
 	return lines
 }
 
-// jobsCompletedLines returns one sample per result that has been seen,
-// sorted by result name.
-func (r *Registry) jobsCompletedLines() []string {
-	if len(r.jobsCompleted) == 0 {
-		return nil
-	}
-	results := make([]string, 0, len(r.jobsCompleted))
-	for res := range r.jobsCompleted {
-		results = append(results, res)
-	}
-	sort.Strings(results)
-	lines := make([]string, 0, len(results))
-	for _, res := range results {
-		lines = append(lines, "tentacles_jobs_completed_total{result=\""+escapeLabel(res)+"\"} "+formatFloat(float64(r.jobsCompleted[res])))
+func (r *Registry) actualLines(pools []string) []string {
+	lines := make([]string, 0, len(pools)*6)
+	for _, pool := range pools {
+		stats := r.pools[pool]
+		states := make([]string, 0, len(stats.actual))
+		for state := range stats.actual {
+			states = append(states, state)
+		}
+		sort.Strings(states)
+		for _, state := range states {
+			lines = append(
+				lines,
+				`tentacles_actual_runners{pool="`+escapeLabel(pool)+`",state="`+
+					escapeLabel(state)+`"} `+formatFloat(float64(stats.actual[state])),
+			)
+		}
 	}
 	return lines
 }
 
-// slotStartLines returns the histogram bucket lines, then _sum and _count.
-func (r *Registry) slotStartLines() []string {
-	lines := make([]string, 0, len(slotStartBuckets)+3)
-	for i, le := range slotStartBuckets {
-		lines = append(lines, "tentacles_slot_start_seconds_bucket{le=\""+formatFloat(le)+"\"} "+formatFloat(float64(r.slotStartBuckets[i])))
+func (r *Registry) jobsCompletedLines(pools []string) []string {
+	lines := []string{}
+	for _, pool := range pools {
+		stats := r.pools[pool]
+		results := make([]string, 0, len(stats.jobsCompleted))
+		for result := range stats.jobsCompleted {
+			results = append(results, result)
+		}
+		sort.Strings(results)
+		for _, result := range results {
+			lines = append(
+				lines,
+				`tentacles_jobs_completed_total{pool="`+escapeLabel(pool)+`",result="`+
+					escapeLabel(result)+`"} `+formatFloat(float64(stats.jobsCompleted[result])),
+			)
+		}
 	}
-	lines = append(lines, "tentacles_slot_start_seconds_bucket{le=\"+Inf\"} "+formatFloat(float64(r.slotStartBuckets[len(slotStartBuckets)])))
-	lines = append(lines, "tentacles_slot_start_seconds_sum "+formatFloat(r.slotStartSum))
-	lines = append(lines, "tentacles_slot_start_seconds_count "+formatFloat(float64(r.slotStartCount)))
 	return lines
 }
 
-// formatFloat renders v as the shortest decimal that round-trips, which is
-// exactly how Prometheus itself formats sample values.
-func formatFloat(v float64) string {
-	return strconv.FormatFloat(v, 'g', -1, 64)
+func (r *Registry) histogramLines(
+	name string,
+	pools []string,
+	selectHistogram func(*poolMetrics) *histogram,
+) []string {
+	lines := []string{}
+	for _, pool := range pools {
+		lines = append(lines, selectHistogram(r.pools[pool]).lines(name, pool)...)
+	}
+	return lines
 }
 
-// escapeLabel escapes a label value per the Prometheus text format.
-func escapeLabel(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `"`, `\"`)
-	s = strings.ReplaceAll(s, "\n", `\n`)
-	return s
+func (r *Registry) slotStartLines(pools []string) []string {
+	lines := make([]string, 0, len(pools)*(len(slotStartBuckets)+3))
+	for _, pool := range pools {
+		stats := r.pools[pool]
+		label := `pool="` + escapeLabel(pool) + `"`
+		for i, upper := range slotStartBuckets {
+			lines = append(
+				lines,
+				`tentacles_slot_start_seconds_bucket{`+label+`,le="`+
+					formatFloat(upper)+`"} `+formatFloat(float64(stats.slotStarts[i])),
+			)
+		}
+		lines = append(
+			lines,
+			`tentacles_slot_start_seconds_bucket{`+label+`,le="+Inf"} `+
+				formatFloat(float64(stats.slotStarts[len(slotStartBuckets)])),
+			"tentacles_slot_start_seconds_sum{"+label+"} "+formatFloat(stats.slotStartSum),
+			"tentacles_slot_start_seconds_count{"+label+"} "+
+				formatFloat(float64(stats.slotStartCount)),
+		)
+	}
+	return lines
+}
+
+func formatFloat(value float64) string {
+	return strconv.FormatFloat(value, 'g', -1, 64)
+}
+
+func escapeLabel(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `"`, `\"`)
+	value = strings.ReplaceAll(value, "\n", `\n`)
+	return value
 }

@@ -15,7 +15,7 @@ func TestJITScript(t *testing.T) {
 }
 
 func TestBuildCommand(t *testing.T) {
-	spec := Spec{SlotDir: "/srv/tentacles/slots/0001", JITPath: "/run/tentacles/0001.jit"}
+	spec := Spec{SlotDir: "/srv/tentacles/pools/test/slots/0001", JITPath: "/run/tentacles/test/0001.jit"}
 	cmd := BuildCommand(spec)
 	if cmd.Dir != spec.SlotDir {
 		t.Fatalf("Dir = %q, want %q", cmd.Dir, spec.SlotDir)

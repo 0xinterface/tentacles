@@ -26,6 +26,7 @@ const EWMAAlpha = 0.25
 
 // Record is one finished job's measured resource usage.
 type Record struct {
+	Pool             string    `json:"pool"`
 	Slot             string    `json:"slot"`
 	WorkflowRef      string    `json:"workflow_ref"`
 	RunID            int64     `json:"run_id,omitempty"`
@@ -48,13 +49,14 @@ type Stats struct {
 	sampledCount int64
 }
 
-// Store accumulates per-ref usage history, persisted as JSON lines.
+// Store accumulates per-pool, per-ref usage history, persisted as JSON lines.
 // All methods are safe for concurrent use.
 type Store struct {
 	mu   sync.Mutex
 	path string
 
-	refs   map[string]*Stats
+	refs   map[historyKey]*Stats
+	pools  map[string]*Stats
 	global Stats
 
 	// RotateLines caps the history file: once exceeded, the next Append
@@ -63,13 +65,23 @@ type Store struct {
 	RotateLines int
 }
 
+type historyKey struct {
+	pool string
+	ref  string
+}
+
 const defaultRotateLines = 5000
 const replayWindow = 5000 // records replayed from the tail on open
 
 // Open loads (or creates) the history file at path and replays its
 // records into the aggregate stats. A missing file starts empty.
 func Open(path string) (*Store, error) {
-	s := &Store{path: path, refs: map[string]*Stats{}, RotateLines: defaultRotateLines}
+	s := &Store{
+		path:        path,
+		refs:        make(map[historyKey]*Stats),
+		pools:       make(map[string]*Stats),
+		RotateLines: defaultRotateLines,
+	}
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return s, nil
@@ -114,32 +126,43 @@ func (s *Store) Append(r Record) error {
 	return nil
 }
 
-// Ref returns the stats for one workflow ref; the zero Stats when the
-// ref has no history.
-func (s *Store) Ref(ref string) Stats {
+// Ref returns the stats for one workflow ref in a pool.
+func (s *Store) Ref(pool, ref string) Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if st, ok := s.refs[ref]; ok {
-		return *st
+	if stats := s.refs[historyKey{pool: pool, ref: ref}]; stats != nil {
+		return *stats
 	}
 	return Stats{}
 }
 
-// Global returns the stats across all workflow refs.
+// Pool returns aggregate stats for one configured pool.
+func (s *Store) Pool(pool string) Stats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if stats := s.pools[pool]; stats != nil {
+		return *stats
+	}
+	return Stats{}
+}
+
+// Global returns stats across all pools and workflow refs.
 func (s *Store) Global() Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.global
 }
 
-// PredictCPU estimates the CPU seconds a job of ref will consume:
-// the ref's own average when known, else the global average. The bool
-// reports whether any sampled history exists at all.
-func (s *Store) PredictCPU(ref string) (float64, bool) {
+// PredictCPU estimates CPU seconds from the workflow, then pool, then host
+// history. The bool reports whether sampled history exists at any level.
+func (s *Store) PredictCPU(pool, ref string) (float64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if st, ok := s.refs[ref]; ok && st.sampledCount > 0 {
-		return st.CPUSeconds, true
+	if stats := s.refs[historyKey{pool: pool, ref: ref}]; stats != nil && stats.sampledCount > 0 {
+		return stats.CPUSeconds, true
+	}
+	if stats := s.pools[pool]; stats != nil && stats.sampledCount > 0 {
+		return stats.CPUSeconds, true
 	}
 	if s.global.sampledCount > 0 {
 		return s.global.CPUSeconds, true
@@ -147,12 +170,15 @@ func (s *Store) PredictCPU(ref string) (float64, bool) {
 	return 0, false
 }
 
-// PredictMem estimates peak memory for a job of ref, like PredictCPU.
-func (s *Store) PredictMem(ref string) (uint64, bool) {
+// PredictMem estimates peak memory using the same fallback as PredictCPU.
+func (s *Store) PredictMem(pool, ref string) (uint64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if st, ok := s.refs[ref]; ok && st.sampledCount > 0 {
-		return st.PeakMemBytes, true
+	if stats := s.refs[historyKey{pool: pool, ref: ref}]; stats != nil && stats.sampledCount > 0 {
+		return stats.PeakMemBytes, true
+	}
+	if stats := s.pools[pool]; stats != nil && stats.sampledCount > 0 {
+		return stats.PeakMemBytes, true
 	}
 	if s.global.sampledCount > 0 {
 		return s.global.PeakMemBytes, true
@@ -160,16 +186,23 @@ func (s *Store) PredictMem(ref string) (uint64, bool) {
 	return 0, false
 }
 
-// absorb folds one record into the per-ref and global aggregates.
+// absorb folds one record into its workflow, pool, and host aggregates.
 // Callers hold s.mu.
-func (s *Store) absorb(r Record) {
-	st := s.refs[r.WorkflowRef]
-	if st == nil {
-		st = &Stats{}
-		s.refs[r.WorkflowRef] = st
+func (s *Store) absorb(record Record) {
+	key := historyKey{pool: record.Pool, ref: record.WorkflowRef}
+	refStats := s.refs[key]
+	if refStats == nil {
+		refStats = &Stats{}
+		s.refs[key] = refStats
 	}
-	blend(st, r)
-	blend(&s.global, r)
+	poolStats := s.pools[record.Pool]
+	if poolStats == nil {
+		poolStats = &Stats{}
+		s.pools[record.Pool] = poolStats
+	}
+	blend(refStats, record)
+	blend(poolStats, record)
+	blend(&s.global, record)
 }
 
 // blend folds one record into one aggregate: sampled records feed the
@@ -277,18 +310,23 @@ func replayTail(r *os.File, n int) ([]Record, error) {
 	return out, nil
 }
 
-// PredictCores estimates the average CPU rate (cores) of a job of ref:
-// the EWMA of CPU seconds over the EWMA of wall seconds. It falls back
-// to the global average; the bool reports whether any sampled history
-// exists.
-func (s *Store) PredictCores(ref string) (float64, bool) {
+// PredictCores estimates average CPU rate using the same workflow, pool,
+// then host fallback as the other predictions.
+func (s *Store) PredictCores(pool, ref string) (float64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if st, ok := s.refs[ref]; ok && st.sampledCount > 0 && st.WallSeconds > 0 {
-		return st.CPUSeconds / st.WallSeconds, true
+	if stats := s.refs[historyKey{pool: pool, ref: ref}]; usableRate(stats) {
+		return stats.CPUSeconds / stats.WallSeconds, true
 	}
-	if s.global.sampledCount > 0 && s.global.WallSeconds > 0 {
+	if stats := s.pools[pool]; usableRate(stats) {
+		return stats.CPUSeconds / stats.WallSeconds, true
+	}
+	if usableRate(&s.global) {
 		return s.global.CPUSeconds / s.global.WallSeconds, true
 	}
 	return 0, false
+}
+
+func usableRate(stats *Stats) bool {
+	return stats != nil && stats.sampledCount > 0 && stats.WallSeconds > 0
 }

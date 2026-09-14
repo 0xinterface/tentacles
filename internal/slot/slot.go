@@ -85,9 +85,10 @@ type Completion struct {
 
 // Slot is one runner position on the host.
 type Slot struct {
+	Pool             string // configured pool ID that owns this slot
 	ID               ID
 	Dir              string
-	Unit             string // backend unit/process name, e.g. tentacle-0001.service
+	Unit             string // backend name, e.g. tentacle-org-a-0001.service
 	RunnerName       string // name registered with GitHub (JIT runner name)
 	WorkflowRef      string // workflow the current job belongs to, set on claim
 	RunID            int64

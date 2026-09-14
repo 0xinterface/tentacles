@@ -52,7 +52,7 @@ func TestAdoptRejectsNondirectoryActiveSlot(t *testing.T) {
 	b := &fakeBackend{}
 	tab := NewTable(root, b, markerMaterialize, fakeJIT, t.TempDir(), nil)
 	defer tab.Close()
-	err := tab.Adopt(context.Background(), []string{"tentacle-0001.service"})
+	err := tab.Adopt(context.Background(), []string{"tentacle-default-0001.service"})
 	if err == nil && len(tab.Active()) == 0 {
 		t.Fatal("adoption succeeded with active unit neither tracked nor stopped")
 	}
@@ -73,7 +73,7 @@ func TestAdoptHonorsDeadlineWithRunnerFIFO(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- tab.Adopt(ctx, []string{"tentacle-0001.service"}) }()
+	go func() { done <- tab.Adopt(ctx, []string{"tentacle-default-0001.service"}) }()
 	select {
 	case <-done:
 	case <-time.After(150 * time.Millisecond):
