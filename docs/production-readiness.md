@@ -76,18 +76,24 @@ Run the isolated systemd smoke test on a disposable host:
 
 ```sh
 go test -c -o /tmp/tentacles-systemd.test ./internal/systemd
-sudo env TENTACLES_SYSTEMD_SMOKE=1 /tmp/tentacles-systemd.test \
+sudo env \
+  TENTACLES_SYSTEMD_SMOKE=1 \
+  TENTACLES_SYSTEMD_SERVICE_UNIT="$PWD/configs/systemd/tentacles.service" \
+  /tmp/tentacles-systemd.test \
   -test.run '^TestRealSystemdSmoke$' -test.v -test.timeout=90s
 ```
 
-The smoke test creates a unique numeric transient unit and an isolated
-`/var/lib/tentacles-smoke-*` directory. It verifies the actual runner UID,
-credential source denial, credential delivery, writable slot and shared cache,
-read-only template, discovery from a fresh backend, and confirmed stop. It
-uses a dummy credential, calls no GitHub API, and removes its unit and directory
-after confirming exit. If exit cannot be confirmed, it reports the retained
-path instead of deleting potentially live files. The executable fixture is
-under `/var/lib` because `/run` may be mounted `noexec`.
+The smoke test starts a supervisor harness under the execution identity and
+hardening directives read from the shipped service unit. The harness creates a
+unique numeric transient slot unit and an isolated
+`/var/lib/tentacles-smoke-*` directory. It verifies the supervisor can switch
+to the actual runner UID, then checks credential source denial, credential
+delivery, writable slot and shared cache, read-only template, discovery from a
+fresh backend, and confirmed stop. It uses a dummy credential, calls no GitHub
+API, and removes its units and directory after confirming exit. If exit cannot
+be confirmed, it reports the retained path instead of deleting potentially
+live files. The executable fixture is staged under `/var/lib` because `/run`
+or `/tmp` may be mounted `noexec` or hidden by `PrivateTmp=`.
 
 ## Validation recorded on 2026-09-10
 

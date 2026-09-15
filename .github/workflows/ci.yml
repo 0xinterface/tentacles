@@ -80,7 +80,10 @@ jobs:
       - name: systemd integration
         run: |
           go test -c -o "$RUNNER_TEMP/systemd.test" ./internal/systemd
-          sudo env TENTACLES_SYSTEMD_SMOKE=1 "$RUNNER_TEMP/systemd.test" -test.run '^TestRealSystemdSmoke$' -test.v -test.timeout=90s
+          sudo env \
+            TENTACLES_SYSTEMD_SMOKE=1 \
+            TENTACLES_SYSTEMD_SERVICE_UNIT="$GITHUB_WORKSPACE/configs/systemd/tentacles.service" \
+            "$RUNNER_TEMP/systemd.test" -test.run '^TestRealSystemdSmoke$' -test.v -test.timeout=90s
       - name: service unit
         env:
           GOBIN: ${{ runner.temp }}/bin

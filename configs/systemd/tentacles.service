@@ -1,6 +1,8 @@
 # Production supervisor: root manages system units and transfers fresh slots
 # to the configured unprivileged runner account. Keep config, template, cache,
 # and JIT source files owned by root; never grant runners writes to them.
+# Leave User= and Group= unset: root is the system-service default, and the
+# hardened service must retain capabilities for runner credential switches.
 # Job services are independent transient units and survive supervisor restart.
 [Unit]
 Description=GitHub Actions host runner supervisor
@@ -9,8 +11,6 @@ Wants=network-online.target
 
 [Service]
 Type=notify
-User=root
-Group=root
 ExecStart=/usr/local/sbin/tentacles --config /etc/tentacles/config.yaml
 Restart=on-failure
 RestartSec=5
