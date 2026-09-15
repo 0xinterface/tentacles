@@ -1,11 +1,20 @@
-// Package version exposes the tentacles build version. The value is a
-// compile-time constant that packaging injects via -ldflags.
+// Package version exposes the tentacles build version.
 package version
 
-// Version is the build version of tentacles. Override at build time:
-//
-//	go build -ldflags "-X github.com/0xinterface/tentacles/internal/version.Version=v0.1.0"
+import "runtime/debug"
+
+// Version overrides the module version when set at link time.
 var Version = "dev"
 
-// String returns the build version as a plain string.
-func String() string { return Version }
+// String returns the link-time override, module version, or "dev" for a
+// local build.
+func String() string {
+	if Version != "dev" {
+		return Version
+	}
+	info, ok := debug.ReadBuildInfo()
+	if !ok || info.Main.Version == "" || info.Main.Version == "(devel)" {
+		return Version
+	}
+	return info.Main.Version
+}

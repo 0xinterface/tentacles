@@ -55,9 +55,14 @@ the supervisor is stopped; normal errors/cancellation remove their staging.
 ## Automated checks
 
 ```sh
-go build ./...
+go mod tidy -diff
+gofmt -l .
 go vet ./...
 go test -race ./...
+go install ./cmd/tentacles
+for script in scripts/*.sh testdata/fake-runner/*.sh; do sh -n "$script" || exit; done
+jq empty grafana/*.json
+go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
 go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 go run ./cmd/tentacles --config configs/config.example.yaml --dry-run
 ```
@@ -93,8 +98,6 @@ under `/var/lib` because `/run` may be mounted `noexec`.
 - Real systemd 257 smoke: passed; temporary test unit and directory removed.
 - `systemd-analyze verify`: passed on temporary service copies with only the
   daemon executable path adjusted to the freshly built binary.
-- Cleanup/logship and process packages cross-compiled for macOS arm64; native
-  macOS execution is delegated to CI.
 - Independent review: no remaining actionable safety findings after fixes.
 
 The real GitHub canary, full service cold boot with App credentials, and

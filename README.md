@@ -180,14 +180,18 @@ If the runner HOME or any daemon path changes, update the service's
 writable paths to match. Run the official payload's
 `bin/installdependencies.sh` when a runner release changes its dependencies.
 
-### 3. Build and configure
+### 3. Install and configure
 
-Go 1.26.8 or a newer supported patch release (see `go.mod`):
+Go 1.26.8 or a newer supported patch release (see `go.mod`). The current
+distribution path is `go install`; there are no packaged release artifacts:
 
 ```sh
-go build -ldflags "-X github.com/0xinterface/tentacles/internal/version.Version=v1.0.0" \
-    -o tentacles ./cmd/tentacles
-sudo install -m 0755 tentacles /usr/local/sbin/tentacles
+go install github.com/0xinterface/tentacles/cmd/tentacles@latest
+TENTACLES_BIN="$(go env GOBIN)"
+if [ -z "$TENTACLES_BIN" ]; then
+    TENTACLES_BIN="$(go env GOPATH)/bin"
+fi
+sudo install -m 0755 "$TENTACLES_BIN/tentacles" /usr/local/sbin/tentacles
 sudo install -m 0600 app.pem /etc/tentacles/app.pem
 sudo install -m 0644 configs/config.example.yaml /etc/tentacles/config.yaml
 sudo install -m 0644 configs/runner.env.example /etc/tentacles/runner.env
@@ -195,6 +199,9 @@ sudo install -m 0644 configs/runner.env.example /etc/tentacles/runner.env
 # per-pool bounds, host capacity, absolute production paths,
 # runner environment_file=/etc/tentacles/runner.env, runtime.backend=systemd
 ```
+
+Replace `@latest` with a release tag when a reproducible version is required.
+The installed binary reports the module version embedded by `go install`.
 
 The example uses development paths and a throwaway key. Set these fields
 in the installed config to match the shipped production service:
@@ -624,7 +631,8 @@ Debugging recipes:
   verify no legacy unit remains, remove the empty
   `paths.state_dir/slots` directory, and rewrite the configuration using
   `pools`. Legacy unnamespaced jobs cannot be adopted safely.
-- **Daemon**: build the new binary, `systemctl restart tentacles`.
+- **Daemon**: repeat the `go install` and `sudo install` commands above, then
+  run `systemctl restart tentacles`.
   For the systemd backend, boot adoption recovers surviving jobs; graceful
   shutdown attempts to stop idle slots and replacements follow desired
   capacity. Preserve state and history, and follow the ownership migration
@@ -662,7 +670,7 @@ tentacles/
     cleanup/             safe credential unlinking
     logship/             pool-qualified _diag copy before wipe
     metrics/             pool-labeled Prometheus exposition
-    version/             build-time version string
+    version/             module or link-time version string
   configs/               example config and supervisor service unit
   scripts/               host dependency bootstrap
   testdata/              dry-run PEM, fake runner
@@ -684,21 +692,26 @@ Rules that hold the design together:
 Testing:
 
 ```sh
-go build ./...
-go vet ./...
+go mod tidy -diff
 gofmt -l .
+go vet ./...
 go test -race ./...
-go run ./cmd/tentacles --config configs/config.example.yaml --dry-run
+go install ./cmd/tentacles
+for script in scripts/*.sh testdata/fake-runner/*.sh; do sh -n "$script" || exit; done
+jq empty grafana/*.json
+go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
 go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+go run ./cmd/tentacles --config configs/config.example.yaml --dry-run
 ```
 
 The app tests cover end-to-end scale-up, JIT delivery, diagnostics, scale-down,
 warm-pool replenishment, all-pool readiness, round-robin host allocation, the
-global ceiling, and pool namespace separation. CI runs build, vet, formatting,
-race tests, and example validation on Ubuntu and macOS with Actions pinned to
-full SHAs (`.github/workflows/ci.yml`). Linux CI also runs the vulnerability
-scan, privileged identity tests, real systemd smoke test, and service-unit
-validation.
+global ceiling, and pool namespace separation. CI has independent checks,
+race-test, and Linux integration jobs on Ubuntu 24.04. They cover module
+tidiness, formatting, vet, shell and JSON syntax, workflow linting,
+vulnerability scanning, installation, example validation, privileged identity,
+real systemd behavior, and the shipped service unit. CI does not build release
+artifacts or test unsupported operating systems.
 
 Before trusting the host with real workloads, run the live integration
 checks against a real App and disposable repository, followed by a
@@ -714,9 +727,9 @@ executable systemd smoke test and detailed canary/soak procedure are in
   are not a security boundary. Configure only mutually trusted organizations.
 - **Single host.** Multiple scale sets share one scheduler, but this is not a
   multi-host scheduler.
-- **Linux x86-64 payload by default.** Release resolution and the default
-  download URL select `linux-x64`. macOS CI uses fake runners; it does not
-  exercise an official macOS runner payload.
+- **Linux x86-64 only.** Release resolution and the default download URL
+  select `linux-x64`. CI and production target systemd-based Linux hosts;
+  other operating systems and architectures are unsupported.
 - **Process backend is for development.** It provides neither systemd
   resource limits nor restart adoption: process tracking lives only in
   memory. Stop its runners before restarting the daemon or changing

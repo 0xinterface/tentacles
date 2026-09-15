@@ -11,11 +11,9 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       # actions/checkout v5.0.0
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
@@ -23,23 +21,69 @@ jobs:
       - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00
         with:
           go-version-file: go.mod
-      - run: go build ./...
-      - run: go vet ./...
-      - run: gofmt -l . | tee /dev/stderr | (! read)
-      - run: go test -race ./...
-      - name: dry-run example config
-        run: go run ./cmd/tentacles --config configs/config.example.yaml --dry-run
-
+      - name: module files
+        run: go mod tidy -diff
+      - name: formatting
+        run: |
+          files="$(gofmt -l .)"
+          if [ -n "$files" ]; then
+            printf '%s\n' "$files"
+            exit 1
+          fi
+      - name: vet
+        run: go vet ./...
+      - name: shell syntax
+        run: |
+          for script in scripts/*.sh testdata/fake-runner/*.sh; do
+            sh -n "$script" || exit
+          done
+      - name: dashboard JSON
+        run: jq empty grafana/*.json
+      - name: workflow syntax
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
       - name: vulnerability scan
-        if: runner.os == 'Linux'
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
-      - name: privileged identity and systemd integration
-        if: runner.os == 'Linux'
+
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # actions/checkout v5.0.0
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      # actions/setup-go v6.0.0
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./...
+
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # actions/checkout v5.0.0
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      # actions/setup-go v6.0.0
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00
+        with:
+          go-version-file: go.mod
+      - name: install and smoke binary
+        env:
+          GOBIN: ${{ runner.temp }}/bin
+        run: |
+          go install ./cmd/tentacles
+          "$GOBIN/tentacles" --version
+          "$GOBIN/tentacles" --config configs/config.example.yaml --dry-run
+      - name: privileged process integration
         run: |
           go test -c -o "$RUNNER_TEMP/process.test" ./internal/process
           sudo "$RUNNER_TEMP/process.test" -test.run '^TestDistinctUIDCanWriteSlotAndReadCredential$' -test.v
+      - name: systemd integration
+        run: |
           go test -c -o "$RUNNER_TEMP/systemd.test" ./internal/systemd
           sudo env TENTACLES_SYSTEMD_SMOKE=1 "$RUNNER_TEMP/systemd.test" -test.run '^TestRealSystemdSmoke$' -test.v -test.timeout=90s
-          go build -o "$RUNNER_TEMP/tentacles" ./cmd/tentacles
-          sudo install -m 0755 "$RUNNER_TEMP/tentacles" /usr/local/sbin/tentacles
-          systemd-analyze verify configs/systemd/tentacles.service configs/systemd/tentacle@.service
+      - name: service unit
+        env:
+          GOBIN: ${{ runner.temp }}/bin
+        run: |
+          sudo install -m 0755 "$GOBIN/tentacles" /usr/local/sbin/tentacles
+          systemd-analyze verify configs/systemd/tentacles.service
