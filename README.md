@@ -358,7 +358,7 @@ strict: an unknown key is a startup error, not a silent no-op.
 | `capacity.job_memory_max` | required | per-slot systemd `MemoryMax`, e.g. `8G` |
 | `runner.version` | unset | `X.Y.Z` pins the payload; unset tracks the latest release |
 | `runner.download_url` | official release URL | override for mirrors |
-| `runner.sha256` | unset (required when `version` is pinned) | unless `TENTACLES_ALLOW_UNVERIFIED_PAYLOAD=1` |
+| `runner.sha256` | unset (required when `version` is pinned) | unless `TENTACLES_ALLOW_UNVERIFIED_PAYLOAD=1` (or `true`/`yes`/`on`) |
 | `runner.work_directory` | `_work` | JIT work folder inside the slot |
 | `runner.shared_cache_paths` | `.cache`, `.local/share/mise`, `go/pkg/mod` | HOME-relative shared caches added to each slot's `ReadWritePaths` |
 | `runner.extra_address_families` | unset | `AF_` tokens added to each slot's `RestrictAddressFamilies` on top of `AF_UNIX`, `AF_INET`, `AF_INET6` (e.g. `AF_NETLINK`); each added family increases kernel attack surface, so enable only when needed |
@@ -498,7 +498,8 @@ digest changes take effect after a restart:
 - **Pinned** (recommended for production): `runner.version` plus
   `runner.sha256` are set. Newly materialized payloads must match that
   digest. The development escape `TENTACLES_ALLOW_UNVERIFIED_PAYLOAD=1`
-  permits an omitted digest; a supplied digest is still verified.
+  (or `true`/`yes`/`on`) permits an omitted digest; a supplied digest is
+  still verified.
 - **Tracking** (`runner.version` unset): the daemon queries the GitHub
   releases API for the latest `actions/runner` release, reads the
   version from the tag and the sha256 from the release asset's digest,

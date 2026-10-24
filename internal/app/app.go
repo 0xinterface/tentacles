@@ -269,7 +269,7 @@ func newDaemonContext(
 		if cfg.Scaling.AdmissionControl && d.hist != nil {
 			tableOptions = append(
 				tableOptions,
-				slot.WithGate(func([]slot.Slot) bool {
+				slot.WithGate(func() bool {
 					return d.admissionGate(pool, d.allActive())
 				}),
 				slot.WithReservation(pool.candidateEstimate),
@@ -570,7 +570,7 @@ func (d *daemon) syncMetrics() {
 		slot.StateFailed,
 	}
 	for _, pool := range d.pools {
-		d.met.SetDesired(pool.cfg.ID, pool.table.Desired())
+		d.met.SetDesired(pool.cfg.ID, pool.desired.Load())
 		var counts [len(states)]int
 		for _, runnerSlot := range pool.table.Snapshot() {
 			for i, state := range states {

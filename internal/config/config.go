@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/0xinterface/tentacles/internal/env"
+	"github.com/0xinterface/tentacles/internal/payload"
 	"github.com/0xinterface/tentacles/internal/runner"
 )
 
@@ -21,11 +22,6 @@ import (
 // It exists so a typo cannot ask the host for a thousand runner
 // processes; raise it only with the host's resources in mind.
 const HardCapMaxRunners = 32
-
-// AllowUnverifiedPayloadEnv, when set to "1", skips the runner.sha256
-// requirement so an unverified payload can be fetched. It matches
-// internal/payload.AllowUnverifiedEnv; keep the values in lockstep.
-const AllowUnverifiedPayloadEnv = "TENTACLES_ALLOW_UNVERIFIED_PAYLOAD"
 
 // Default directories and values applied by Load when the YAML omits them.
 const (
@@ -301,9 +297,9 @@ func (c *Config) Validate() error {
 	if dynamicVersion && c.Runner.SHA256 != "" {
 		fail("runner.sha256 cannot be pinned while runner.version tracks the latest release; set runner.version too")
 	}
-	if !dynamicVersion && os.Getenv(AllowUnverifiedPayloadEnv) != "1" {
+	if !dynamicVersion && !payload.AllowUnverified() {
 		if !sha256Re.MatchString(c.Runner.SHA256) {
-			fail("runner.sha256 must be a 64-character hex digest (got %d characters); set %s=1 to allow an unverified payload", len(c.Runner.SHA256), AllowUnverifiedPayloadEnv)
+			fail("runner.sha256 must be a 64-character hex digest (got %d characters); set %s=1 to allow an unverified payload", len(c.Runner.SHA256), payload.AllowUnverifiedEnv)
 		}
 	}
 	envHome := ""

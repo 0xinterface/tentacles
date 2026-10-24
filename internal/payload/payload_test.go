@@ -469,7 +469,7 @@ func TestEnsureNoTmpLeftOnSuccess(t *testing.T) {
 	}
 }
 
-func TestCopySlot(t *testing.T) {
+func TestCopySlotIntoContext(t *testing.T) {
 	env := newTestEnv(t)
 	fixture := fixtureBytes(t)
 	wantSHA := fixtureSHA256(t)
@@ -479,11 +479,11 @@ func TestCopySlot(t *testing.T) {
 	}
 
 	slotDir := filepath.Join(env.root, "slots", "0001")
-	if err := os.MkdirAll(filepath.Dir(slotDir), 0o755); err != nil {
-		t.Fatalf("mkdir slots: %v", err)
+	if err := os.MkdirAll(slotDir, 0o755); err != nil {
+		t.Fatalf("mkdir slot: %v", err)
 	}
-	if err := env.m.CopySlot(slotDir); err != nil {
-		t.Fatalf("CopySlot: %v", err)
+	if err := env.m.CopySlotIntoContext(t.Context(), slotDir); err != nil {
+		t.Fatalf("CopySlotIntoContext: %v", err)
 	}
 	checkMode := func(rel string, want os.FileMode) {
 		t.Helper()
@@ -514,22 +514,22 @@ func TestCopySlot(t *testing.T) {
 		t.Fatalf("slot runhelper content %q, err %v", data, err)
 	}
 
-	// Refuse an existing destination.
-	if err := env.m.CopySlot(slotDir); err == nil {
-		t.Fatal("CopySlot onto existing dir: expected error, got nil")
+	// Refuse a non-empty destination.
+	if err := env.m.CopySlotIntoContext(t.Context(), slotDir); err == nil {
+		t.Fatal("CopySlotIntoContext onto populated dir: expected error, got nil")
 	}
-	// Missing parent is an error.
-	if err := env.m.CopySlot(filepath.Join(env.root, "missing-parent", "0002")); err == nil {
-		t.Fatal("CopySlot with missing parent: expected error, got nil")
+	// A missing destination is an error; the table reserves it first.
+	if err := env.m.CopySlotIntoContext(t.Context(), filepath.Join(env.root, "slots", "0002")); err == nil {
+		t.Fatal("CopySlotIntoContext without reserved directory: expected error, got nil")
 	}
 	// Template not ready is an error.
 	emptyEnv := newTestEnv(t)
 	emptySlot := filepath.Join(emptyEnv.root, "slots", "0001")
-	if err := os.MkdirAll(filepath.Dir(emptySlot), 0o755); err != nil {
-		t.Fatalf("mkdir slots: %v", err)
+	if err := os.MkdirAll(emptySlot, 0o755); err != nil {
+		t.Fatalf("mkdir empty slot: %v", err)
 	}
-	if err := emptyEnv.m.CopySlot(emptySlot); err == nil {
-		t.Fatal("CopySlot without template: expected error, got nil")
+	if err := emptyEnv.m.CopySlotIntoContext(t.Context(), emptySlot); err == nil {
+		t.Fatal("CopySlotIntoContext without template: expected error, got nil")
 	}
 }
 

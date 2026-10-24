@@ -723,7 +723,7 @@ func TestTableGateHolds(t *testing.T) {
 	backend := &fakeBackend{}
 	admit := false
 	rec := &eventRecorder{}
-	tab, _, _ := newTestTable(t, backend, WithGate(func([]Slot) bool {
+	tab, _, _ := newTestTable(t, backend, WithGate(func() bool {
 		return admit
 	}), WithEventHook(rec.hook))
 	if err := tab.Ensure(context.Background(), 1); err != nil {
@@ -796,18 +796,6 @@ func TestTableBackendStartError(t *testing.T) {
 	}
 	if !rec.has("acquire_failure") {
 		t.Fatalf("expected acquire_failure event, got %v", rec.events)
-	}
-}
-
-func TestTableSetDesired(t *testing.T) {
-	backend := &fakeBackend{}
-	tab, _, _ := newTestTable(t, backend)
-	if tab.Desired() != 0 {
-		t.Fatalf("initial desired = %d, want 0", tab.Desired())
-	}
-	tab.SetDesired(4)
-	if tab.Desired() != 4 {
-		t.Fatalf("desired = %d, want 4", tab.Desired())
 	}
 }
 
@@ -902,7 +890,7 @@ func TestCloseLeavesRunningSlotsAlone(t *testing.T) {
 
 // TestTableStartFailureLeavesNoPartialDir: a start that fails after
 // partially materializing must remove the slot directory, otherwise the
-// ID is wedged (CopySlot refuses an existing destination) until reboot.
+// ID is wedged (materialization refuses a populated destination) until reboot.
 func TestTableStartFailureLeavesNoPartialDir(t *testing.T) {
 	backend := &fakeBackend{}
 	root := t.TempDir()
@@ -1013,7 +1001,7 @@ func TestTableStartObserverOncePerStart(t *testing.T) {
 
 // TestTableWipeRemovesCredentialFiles: wipe completes when the runner
 // dropped .runner/.credentials files into the slot tree (they are
-// shredded first; see cleanup.ShredCredentials).
+// unlinked first; see cleanup.UnlinkCredentials).
 func TestTableWipeRemovesCredentialFiles(t *testing.T) {
 	backend := &fakeBackend{}
 	tab, _, _ := newTestTable(t, backend)

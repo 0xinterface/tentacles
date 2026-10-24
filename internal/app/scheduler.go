@@ -14,7 +14,6 @@ import (
 func (d *daemon) reconcilePools(ctx context.Context) error {
 	for _, pool := range d.pools {
 		desired := pool.desired.Load()
-		pool.table.SetDesired(desired)
 		live := len(pool.table.Active())
 		target := min(live, desired)
 		if err := pool.table.Ensure(ctx, target); err != nil {
