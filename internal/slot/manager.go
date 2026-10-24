@@ -54,7 +54,7 @@ type tableOptions struct {
 	workDir            string
 	usageSampler       func(unit string) (Usage, error)
 	sampleInterval     time.Duration
-	gate               func(live []Slot) bool
+	gate               func() bool
 	completionHook     func(Completion)
 	materializeContext func(context.Context, string) error
 	diagContext        func(context.Context, Slot) error
@@ -189,11 +189,11 @@ func WithSampleInterval(d time.Duration) TableOption {
 }
 
 // WithGate registers the admission gate. Before each slot start it
-// receives the live slots and reports whether the host budget can take
-// another job. A refusal is backpressure: the start is retried on a
-// later tick, and reported as EventAdmissionHold, not a failure. Nil
-// admits everything.
-func WithGate(fn func(live []Slot) bool) TableOption {
+// reports whether the host budget can take another job. The callback is
+// wired at the composition root to a host-wide view of every pool. A
+// refusal is backpressure: the start is retried on a later tick and
+// reported as EventAdmissionHold, not a failure. Nil admits everything.
+func WithGate(fn func() bool) TableOption {
 	return func(o *tableOptions) { o.gate = fn }
 }
 
@@ -225,10 +225,9 @@ type slotRec struct {
 	cleanDone      chan struct{}
 }
 
-// Table is the concrete Manager: it allocates slot IDs, materializes and
-// starts runner slots through the injected backend, and wipes them on
-// exit. It is safe for concurrent use; the reconciler is the only
-// writer, but metrics/listers may read at any time.
+// Table allocates slot IDs, materializes and starts runner slots through
+// the injected backend, and wipes them on exit. It is safe for concurrent
+// use; all state changes lock.
 type Table struct {
 	root        string
 	backend     runner.Backend
@@ -241,11 +240,10 @@ type Table struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu      sync.Mutex
-	slots   map[ID]*slotRec
-	desired int
-	closed  bool
-	ops     chan struct{}
+	mu     sync.Mutex
+	slots  map[ID]*slotRec
+	closed bool
+	ops    chan struct{}
 }
 
 // NewTable builds a slot table rooted at root (the directory that holds
@@ -334,22 +332,6 @@ func (t *Table) sampleLoop() {
 			t.mu.Unlock()
 		}
 	}
-}
-
-// Desired returns the last desired runner count pushed by the listener.
-func (t *Table) Desired() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.desired
-}
-
-// SetDesired records the desired runner count. The reconciler calls this
-// before Ensure so the value is observable even while convergence is in
-// flight.
-func (t *Table) SetDesired(n int) {
-	t.mu.Lock()
-	t.desired = n
-	t.mu.Unlock()
 }
 
 // WorkDir returns the absolute work-directory path for a slot ID (the
@@ -456,7 +438,7 @@ func (t *Table) startOne(ctx context.Context) ID {
 	}
 	// Gate before reserving the candidate: existing starting and idle slots
 	// are reservations too, but the candidate must only be charged once.
-	if t.opts.gate != nil && !t.opts.gate(t.Active()) {
+	if t.opts.gate != nil && !t.opts.gate() {
 		t.emit(EventAdmissionHold, Slot{State: StateStarting})
 		return ""
 	}
@@ -916,7 +898,9 @@ func (t *Table) wipe(ctx context.Context, snap Slot) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := cleanup.ShredCredentials(snap.Dir); err != nil {
+	// Unlink credentials before RemoveAll: a stalled or partial wipe must
+	// not leave them on disk.
+	if err := cleanup.UnlinkCredentials(snap.Dir); err != nil {
 		t.log.Warn("credential unlink failed; removing complete slot tree", "slot", snap.ID, "err", err)
 	}
 	if t.jitDir != "" {

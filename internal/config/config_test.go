@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/0xinterface/tentacles/internal/payload"
 )
 
 // baseValid returns a fully valid Config. Every path that Validate
@@ -506,19 +508,27 @@ func TestLoadMissingFile(t *testing.T) {
 
 func TestValidateSha256EnvEscape(t *testing.T) {
 	t.Run("allow unverified payload", func(t *testing.T) {
-		t.Setenv(AllowUnverifiedPayloadEnv, "1")
+		t.Setenv(payload.AllowUnverifiedEnv, "1")
 		c := baseValid(t)
 		c.Runner.SHA256 = ""
 		if err := c.Validate(); err != nil {
-			t.Fatalf("Validate() with %s=1 and empty sha256 = %v, want nil", AllowUnverifiedPayloadEnv, err)
+			t.Fatalf("Validate() with %s=1 and empty sha256 = %v, want nil", payload.AllowUnverifiedEnv, err)
+		}
+	})
+	t.Run("truthy value escapes", func(t *testing.T) {
+		t.Setenv(payload.AllowUnverifiedEnv, "true")
+		c := baseValid(t)
+		c.Runner.SHA256 = ""
+		if err := c.Validate(); err != nil {
+			t.Fatalf("Validate() with %s=true and empty sha256 = %v, want nil", payload.AllowUnverifiedEnv, err)
 		}
 	})
 	t.Run("non-1 value does not escape", func(t *testing.T) {
-		t.Setenv(AllowUnverifiedPayloadEnv, "0")
+		t.Setenv(payload.AllowUnverifiedEnv, "0")
 		c := baseValid(t)
 		c.Runner.SHA256 = ""
 		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "sha256") {
-			t.Fatalf("Validate() with %s=0 = %v, want sha256 error", AllowUnverifiedPayloadEnv, err)
+			t.Fatalf("Validate() with %s=0 = %v, want sha256 error", payload.AllowUnverifiedEnv, err)
 		}
 	})
 }
@@ -574,7 +584,7 @@ func TestExampleConfigRoundTrips(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Chdir(root) // the example's paths are repo-relative
-	t.Setenv(AllowUnverifiedPayloadEnv, "1")
+	t.Setenv(payload.AllowUnverifiedEnv, "1")
 
 	c, err := Load("configs/config.example.yaml")
 	if err != nil {
@@ -689,7 +699,7 @@ func TestValidateRejectsMalformedEnvFile(t *testing.T) {
 // fields fall back to the admission-gate defaults and an explicit
 // admission_control: false wins over the default true.
 func TestLoadScalingDefaults(t *testing.T) {
-	t.Setenv("TENTACLES_ALLOW_UNVERIFIED_PAYLOAD", "1")
+	t.Setenv(payload.AllowUnverifiedEnv, "1")
 	base := writeConfig(t, `
 pools:
   - id: o

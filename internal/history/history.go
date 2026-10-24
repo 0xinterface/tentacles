@@ -136,16 +136,6 @@ func (s *Store) Ref(pool, ref string) Stats {
 	return Stats{}
 }
 
-// Pool returns aggregate stats for one configured pool.
-func (s *Store) Pool(pool string) Stats {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if stats := s.pools[pool]; stats != nil {
-		return *stats
-	}
-	return Stats{}
-}
-
 // Global returns stats across all pools and workflow refs.
 func (s *Store) Global() Stats {
 	s.mu.Lock()
@@ -153,24 +143,8 @@ func (s *Store) Global() Stats {
 	return s.global
 }
 
-// PredictCPU estimates CPU seconds from the workflow, then pool, then host
-// history. The bool reports whether sampled history exists at any level.
-func (s *Store) PredictCPU(pool, ref string) (float64, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if stats := s.refs[historyKey{pool: pool, ref: ref}]; stats != nil && stats.sampledCount > 0 {
-		return stats.CPUSeconds, true
-	}
-	if stats := s.pools[pool]; stats != nil && stats.sampledCount > 0 {
-		return stats.CPUSeconds, true
-	}
-	if s.global.sampledCount > 0 {
-		return s.global.CPUSeconds, true
-	}
-	return 0, false
-}
-
-// PredictMem estimates peak memory using the same fallback as PredictCPU.
+// PredictMem estimates peak memory using the same workflow, pool, then
+// host fallback as PredictCores.
 func (s *Store) PredictMem(pool, ref string) (uint64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

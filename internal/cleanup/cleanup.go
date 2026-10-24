@@ -13,10 +13,12 @@ import (
 
 var credentialFiles = [...]string{".runner", ".credentials", ".credentials_rsaparams"}
 
-// ShredCredentials is retained for compatibility. It unlinks credential names
-// without opening or truncating their targets. Missing slots/files are harmless;
+// UnlinkCredentials removes credential names from a slot directory without
+// opening or following their targets. Missing slots and files are harmless;
 // other errors are joined so every credential name gets a removal attempt.
-func ShredCredentials(slotDir string) error {
+// Callers must invoke it before removing the slot tree, so a stalled or
+// partial wipe cannot leave credentials on disk.
+func UnlinkCredentials(slotDir string) error {
 	fd, err := unix.Open(filepath.Clean(slotDir), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil

@@ -111,8 +111,8 @@ func ResolveLatest(ctx context.Context, apiURL string) (string, string, error) {
 }
 
 // Manager downloads, verifies, and extracts the official runner tarball.
-// Ensure is safe for concurrent use; CopySlot may run while a different
-// version is being swapped in and copies one complete template.
+// Ensure is safe for concurrent use; CopySlotIntoContext may run while a
+// different version is being swapped in and fills one complete template.
 type Manager struct {
 	mu          chan struct{}
 	cacheDir    string
@@ -205,33 +205,6 @@ func (m *Manager) Ensure(ctx context.Context, version, sha256, downloadURL strin
 		}
 	}
 	return m.extract(ctx, cachePath, version, sha256)
-}
-
-// CopySlot copies the template directory into dst (like cp -a), preserving
-// modes and symlinks. dst must not exist; its parent must exist.
-func (m *Manager) CopySlot(dst string) error {
-	if _, err := os.Lstat(dst); err == nil {
-		return fmt.Errorf("payload: slot directory %s already exists", dst)
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("payload: stat %s: %w", dst, err)
-	}
-	parent := filepath.Dir(dst)
-	if _, err := os.Stat(parent); err != nil {
-		return fmt.Errorf("payload: slot parent %s: %w", parent, err)
-	}
-	info, err := os.Stat(m.templateDir)
-	if err != nil {
-		return fmt.Errorf("payload: template %s not ready: %w", m.templateDir, err)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("payload: template %s is not a directory", m.templateDir)
-	}
-	m.log.Info("copying payload template to slot", "from", m.templateDir, "to", dst)
-	if err := copyTree(m.templateDir, dst); err != nil {
-		return fmt.Errorf("payload: copy template to %s: %w", dst, err)
-	}
-	m.log.Info("slot materialized", "dir", dst)
-	return nil
 }
 
 // CopySlotIntoContext fills an empty directory exclusively reserved by the
@@ -338,7 +311,7 @@ func (m *Manager) verify(ctx context.Context, path, want string) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	if want == "" { // allowUnverified guaranteed by Ensure
+	if want == "" { // AllowUnverified guaranteed by Ensure
 		return true, nil
 	}
 	f, err := os.Open(path)
@@ -617,7 +590,7 @@ func safeSymlink(base, dir, linkname string) bool {
 // 64-char hex digest; empty is only allowed with AllowUnverifiedEnv.
 func checkSHA256(want string) error {
 	if want == "" {
-		if allowUnverified() {
+		if AllowUnverified() {
 			return nil
 		}
 		return fmt.Errorf("payload: sha256 checksum required (set %s=1 to allow unverified payloads)", AllowUnverifiedEnv)
@@ -631,8 +604,8 @@ func checkSHA256(want string) error {
 	return nil
 }
 
-// allowUnverified reports whether AllowUnverifiedEnv is enabled.
-func allowUnverified() bool {
+// AllowUnverified reports whether AllowUnverifiedEnv is enabled.
+func AllowUnverified() bool {
 	switch strings.ToLower(os.Getenv(AllowUnverifiedEnv)) {
 	case "1", "true", "yes", "on":
 		return true
@@ -691,11 +664,9 @@ func readMarker(path string) (version, sha256 string, ok bool, err error) {
 	return lines[0], lines[1], true, nil
 }
 
-// copyTree copies src to dst recursively, preserving modes and recreating
-// symlinks as symlinks. WalkDir does not follow symlinks, so nothing can
-// escape src.
-func copyTree(src, dst string) error { return copyTreeContext(context.Background(), src, dst) }
-
+// copyTreeContext copies src to dst recursively, preserving modes and
+// recreating symlinks as symlinks. WalkDir does not follow symlinks, so
+// nothing can escape src.
 func copyTreeContext(ctx context.Context, src, dst string) error {
 	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
 		if ctx.Err() != nil {
@@ -737,12 +708,8 @@ func copyTreeContext(ctx context.Context, src, dst string) error {
 	})
 }
 
-// copyFileMode copies one regular file and applies mode exactly (immune to
-// umask).
-func copyFileMode(srcPath, dstPath string, mode os.FileMode) error {
-	return copyFileModeContext(context.Background(), srcPath, dstPath, mode)
-}
-
+// copyFileModeContext copies one regular file and applies mode exactly
+// (immune to umask).
 func copyFileModeContext(ctx context.Context, srcPath, dstPath string, mode os.FileMode) error {
 	if err := ctx.Err(); err != nil {
 		return err

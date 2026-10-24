@@ -1,6 +1,6 @@
 module github.com/0xinterface/tentacles
 
-go 1.26.8
+go 1.26.10
 
 require (
 	github.com/actions/scaleset v0.4.0
