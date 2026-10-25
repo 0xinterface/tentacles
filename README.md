@@ -747,6 +747,11 @@ Debugging recipes:
   preview API. Read the upstream changelog before bumping; the adapter
   in `internal/scaleset` is the only place that compiles against it, so
   interface drift is contained.
+- **Automated dependency updates**: Dependabot updates `go.mod`/`go.sum`
+  and `.github/workflows/` weekly. It does not update the `go` directive in
+  `go.mod`, `runner.version`/`runner.sha256`, or the `actionlint` and
+  `govulncheck` `@version` pins in `ci.yml`; bump those manually. The
+  `actions/scaleset` preview pin is isolated in its own Dependabot group.
 
 ## Development
 
