@@ -140,8 +140,8 @@ The real GitHub canary, full service cold boot with App credentials, and
 The runner 2.337.0 linux-x64 checksum is
 `70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613`,
 verified from the [official release API](https://api.github.com/repos/actions/runner/releases/tags/v2.337.0).
-Go 1.26.8 keeps the project on its existing minor line with current patch
-fixes; see [Go release downloads](https://go.dev/dl/).
+Go follows the `go.mod` directive (currently 1.27.4; `actions/scaleset`
+v0.5.0 requires at least 1.27.3); see [Go release downloads](https://go.dev/dl/).
 
 Schedule runner upgrades, including checksum verification and a canary.
 GitHub's [minimum-version enforcement timeline](https://github.blog/changelog/2026-06-12-github-actions-minimum-version-enforcement-timeline-for-self-hosted-runners/)

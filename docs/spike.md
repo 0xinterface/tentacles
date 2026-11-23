@@ -95,7 +95,7 @@ cfg, err := c.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSett
 // cfg.EncodedJITConfig — secret; cfg.Runner.ID/Name
 ```
 
-## How run.sh consumes JIT (pinned runner 2.328.x)
+## How run.sh consumes JIT (pinned runner 2.337.x)
 
 The official agent only supports `./run.sh --jitconfig <encoded-value>` —
 value as argv. There is no `--jitconfig-file` flag and no env-var input on
