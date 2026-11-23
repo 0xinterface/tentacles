@@ -252,7 +252,7 @@ writable paths to match. Run the official payload's
 
 ### 3. Install and configure
 
-Go 1.26.8 or a newer supported patch release (see `go.mod`). The current
+Go 1.27.4 or a newer supported patch release (see `go.mod`). The current
 distribution path is `go install`; there are no packaged release artifacts:
 
 ```sh
@@ -419,7 +419,6 @@ changing those fields alone does not modify an existing scale set.
 PATH=/home/gha-runner/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
 HOME=/home/gha-runner
 MISE_DATA_DIR=/home/gha-runner/.local/share/mise
-LANG=C.UTF-8
 RUNNER_TOOL_CACHE=/home/gha-runner/.cache/hostedtoolcache
 AGENT_TOOLSDIRECTORY=/home/gha-runner/.cache/hostedtoolcache
 ```
