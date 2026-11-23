@@ -1,6 +1,6 @@
-# Integration notes — actions/scaleset v0.4.0
+# Integration notes — actions/scaleset v0.5.0
 
-Findings from reading `github.com/actions/scaleset@v0.4.0` source
+Findings from reading `github.com/actions/scaleset@v0.5.0` source
 (`client.go`, `types.go`, `listener/listener.go`, `session_client.go`,
 `examples/dockerscaleset`). Exact names, verified against the module cache.
 
@@ -35,8 +35,10 @@ token plumbing on our side.
 
 ## Listener / message loop
 
-The upstream `listener` package provides the message loop, including job
-acquisition and acknowledgments:
+The upstream `listener` package owns sessions, long-polling, and acking;
+since v0.5.0 it performs no dispatch — every fetched message (or nil on
+a long-poll timeout) is handed to the scaler, and the message is acked
+only after `Scale` returns nil:
 
 ```go
 sessionClient, err := c.MessageSessionClient(ctx, scaleSetID, owner) // owner = hostname
@@ -46,22 +48,34 @@ err := l.Run(ctx, scaler) // blocks; returns error on failure → restart with b
 
 - `MessageSessionClient` implements `listener.Client`
   (`GetMessage`, `DeleteMessage`, `AcquireJobs`, `Session`).
-- Session create/refresh/delete, `AcquireJobs`, and `DeleteMessage` acking
-  are all handled inside the listener. Process-then-ack ordering is upstream's.
+- Session create/refresh/delete and acking stay inside the listener. An
+  error from `Scale` leaves the message unacked and redelivered, so
+  `Scale` must be idempotent (events may re-fire after a redelivery).
 - `l.SetMaxRunners(n)` is concurrency-safe during `Run`.
 - `GetMessage` long-polls ~50s; nil message on 202 → loop continues (upstream).
-- On `Run` start it fires `HandleDesiredRunnerCount(ctx, session.Statistics.TotalAssignedJobs)`
-  from the initial session — desired count is always statistics-driven.
+- `Run` start delivers a synthetic message (`MessageID = -1`) carrying the
+  initial session statistics — desired count is always statistics-driven.
 
 `listener.Scaler` (what we implement):
 
 ```go
 type Scaler interface {
-    HandleJobStarted(ctx context.Context, jobInfo *scaleset.JobStarted) error
-    HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCompleted) error
-    HandleDesiredRunnerCount(ctx context.Context, count int) (int, error)
+    Scale(ctx context.Context, message *scaleset.RunnerScaleSetMessage) error
 }
 ```
+
+The adapter's `Scale` replicates the dispatch the v0.4.0 listener did
+internally:
+
+- cache `Statistics`; nil polls re-emit the desired count from the cache
+  (the listener no longer tracks statistics — idle convergence is ours)
+- acquire every `JobAvailableMessages` entry via
+  `Client.AcquireJobs(RunnerRequestIDs)` — **the service never assigns
+  unacquired jobs**, so skipping this stalls the scale set
+- forward `JobStartedMessages`/`JobCompletedMessages` for busy-marking
+  and metrics; `JobAssignedMessages` carries no consumed signal
+  (ignored, as in v0.4.0)
+- emit the clamped desired count from `TotalAssignedJobs`
 
 `RunnerScaleSetStatistic.TotalAssignedJobs` is the only scaling signal.
 `JobStarted.RunnerName`, `JobCompleted{RunnerName, Result}` for busy-marking
@@ -115,7 +129,10 @@ Unit naming is pool-qualified:
 ## Preview-API landmines
 
 - `listener.Config.Validate()` requires `MaxRunners >= 0`; `ScaleSetID != 0`.
-- `slog.DiscardHandler` in listener defaults requires Go ≥ 1.24 — we require Go 1.26.8 or a newer supported patch release.
+- v0.5.0 requires go ≥ 1.27.3 (its `go.mod` directive); ours tracks it —
+  Dependabot bumps the directive when a dependency forces a newer Go.
+- Client constructors validate credentials: an unparseable App private
+  key fails at `NewClientWithGitHubApp`, before any network I/O.
 - `CreateRunnerScaleSet` 409s on duplicate names — always Get-then-Create.
 - Everything above is behind `internal/scaleset`; upstream types must not
   leak past that package.

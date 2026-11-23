@@ -6,7 +6,7 @@
 // Events callback surface, and the small Adapter API below.
 //
 // Each adapter owns one scale set: it resolves or creates the configured set,
-// runs its official listener loop, translates callbacks into Events, and mints
+// runs the official listener loop, implements its Scaler contract, and mints
 // JIT configs. A daemon may compose multiple adapters behind its host
 // scheduler. The desired count is driven exclusively by
 // statistics.TotalAssignedJobs, clamped into [MinRunners, MaxRunners]; job
@@ -103,11 +103,26 @@ type Adapter struct {
 	// a field so tests can substitute a fake listener.Client without
 	// network access.
 	newSessionFunc func(ctx context.Context, scaleSetID int, owner string) (listener.Client, error)
+
+	// session is the message-session client of the in-flight Run. Since
+	// v0.5.0 the listener hands raw messages to Scale instead of
+	// dispatching them, so the adapter acquires available jobs through
+	// this client itself. Run sets it before starting the listener loop
+	// and clears it on return; Scale is called only from that loop, so
+	// no lock guards it.
+	session listener.Client
+
+	// lastStats caches the statistics of the last message so nil-message
+	// polls (long-poll timeouts) keep re-emitting the desired count. Run
+	// resets it; the listener's initial message always seeds it.
+	lastStats *scaleset.RunnerScaleSetStatistic
 }
 
 // New builds the adapter around a real upstream client. The upstream
-// constructor only parses the config URL and stores credentials — it makes
-// no network calls — so New is safe before the network is reachable.
+// constructor parses the config URL and validates the credentials —
+// since v0.5.0 that includes parsing the App private key, so a
+// malformed key fails here instead of at the first session — but makes
+// no network calls, so New is safe before the network is reachable.
 func New(cfg Config, ev Events, log *slog.Logger) (*Adapter, error) {
 	if log == nil {
 		log = slog.Default()
@@ -226,6 +241,13 @@ func (a *Adapter) Run(ctx context.Context) error {
 	// admission hints) without changing the official listener loop.
 	sessionClient = &watchedClient{Client: sessionClient, onMessage: a.observeMessage}
 
+	// Scale reads these for job acquisition and idle convergence; reset
+	// per Run so a reconnect starts fresh. Scale runs only on this
+	// goroutine (inside the listener loop), so no lock guards them.
+	a.lastStats = nil
+	a.session = sessionClient
+	defer func() { a.session = nil }()
+
 	var retErr error
 	defer func() {
 		if ctx.Err() != nil {
@@ -296,38 +318,93 @@ func (a *Adapter) sessionEvent(err error) {
 	}
 }
 
-// HandleDesiredRunnerCount implements listener.Scaler: it clamps the
-// statistics-driven desired count into [MinRunners, MaxRunners] and emits it
-// via ev.Desired. The clamped value is returned so the listener can record
-// it.
-func (a *Adapter) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
-	d := reconcile.Clamp(count, a.cfg.MinRunners, a.cfg.MaxRunners)
-	if a.ev.Desired != nil {
-		a.ev.Desired(d)
+// Scale implements listener.Scaler. The v0.5.0 listener performs no
+// dispatch: it hands each fetched message — or nil on a long-poll
+// timeout — to the scaler and acks only after Scale returns nil. The
+// adapter therefore owns what the v0.4.0 listener did internally:
+// caching statistics (nil polls re-emit the desired count from the
+// cache so an idle scale set keeps converging), acquiring available
+// jobs (the service never assigns unacquired jobs), forwarding job
+// lifecycle events for busy-marking and metrics, and emitting the
+// clamped desired count. JobAssignedMessages carry no signal the
+// daemon consumes and are ignored, as in v0.4.0.
+//
+// An error return leaves the message unacked and redelivered, so Scale
+// must stay idempotent: events may re-fire after a redelivery, and nil
+// entries inside a message are skipped (warn-logged) rather than
+// failed, which would redeliver the same poison message forever.
+func (a *Adapter) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage) error {
+	if msg == nil {
+		if a.lastStats != nil {
+			a.emitDesired(a.lastStats.TotalAssignedJobs)
+		}
+		return nil
 	}
-	return d, nil
-}
-
-// HandleJobStarted implements listener.Scaler. It forwards the job's
-// identity and timeline so the daemon can attribute resource usage to a
-// workflow by correlating runnerName with a slot.
-func (a *Adapter) HandleJobStarted(ctx context.Context, jobInfo *scaleset.JobStarted) error {
-	if jobInfo == nil {
-		return errors.New("scaleset: nil JobStarted message")
+	if msg.Statistics != nil {
+		a.lastStats = msg.Statistics
 	}
-	if a.ev.JobStart != nil {
-		a.ev.JobStart(job(jobInfo.JobMessageBase, jobInfo.RunnerName, ""))
+	if err := a.acquireAvailableJobs(ctx, msg.JobAvailableMessages); err != nil {
+		return err
+	}
+	for _, started := range msg.JobStartedMessages {
+		if started == nil {
+			a.logger().Warn("scaleset: skipping nil JobStarted message")
+			continue
+		}
+		if a.ev.JobStart != nil {
+			a.ev.JobStart(job(started.JobMessageBase, started.RunnerName, ""))
+		}
+	}
+	for _, completed := range msg.JobCompletedMessages {
+		if completed == nil {
+			a.logger().Warn("scaleset: skipping nil JobCompleted message")
+			continue
+		}
+		if a.ev.JobEnd != nil {
+			a.ev.JobEnd(job(completed.JobMessageBase, completed.RunnerName, completed.Result))
+		}
+	}
+	stats := msg.Statistics
+	if stats == nil {
+		stats = a.lastStats
+	}
+	if stats != nil {
+		a.emitDesired(stats.TotalAssignedJobs)
 	}
 	return nil
 }
 
-// HandleJobCompleted implements listener.Scaler.
-func (a *Adapter) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCompleted) error {
-	if jobInfo == nil {
-		return errors.New("scaleset: nil JobCompleted message")
+// emitDesired clamps the statistics-driven desired count into
+// [MinRunners, MaxRunners] and emits it via ev.Desired.
+func (a *Adapter) emitDesired(count int) {
+	d := reconcile.Clamp(count, a.cfg.MinRunners, a.cfg.MaxRunners)
+	if a.ev.Desired != nil {
+		a.ev.Desired(d)
 	}
-	if a.ev.JobEnd != nil {
-		a.ev.JobEnd(job(jobInfo.JobMessageBase, jobInfo.RunnerName, jobInfo.Result))
+}
+
+// acquireAvailableJobs claims every job waiting for the scale set via
+// the session client: the service leaves unacquired jobs unassigned, so
+// skipping this would stall the scale set. The v0.4.0 listener acquired
+// internally; v0.5.0 makes it the scaler's job.
+func (a *Adapter) acquireAvailableJobs(ctx context.Context, available []*scaleset.JobAvailable) error {
+	if len(available) == 0 {
+		return nil
+	}
+	ids := make([]int64, 0, len(available))
+	for _, ja := range available {
+		if ja != nil {
+			ids = append(ids, ja.RunnerRequestID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	if a.session == nil {
+		return errors.New("scaleset: no message session for job acquisition")
+	}
+	if _, err := a.session.AcquireJobs(ctx, ids); err != nil {
+		return fmt.Errorf("scaleset: acquire jobs: %w", err)
 	}
 	return nil
 }

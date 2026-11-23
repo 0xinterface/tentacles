@@ -743,15 +743,20 @@ Debugging recipes:
   `bin/installdependencies.sh` before running jobs on that version.
   `RUNNER_VERSION` in `scripts/install-host-deps.sh` changes
   only the printed informational version, not its package list.
-- **`actions/scaleset`**: pinned at v0.4.0 because it is a public
-  preview API. Read the upstream changelog before bumping; the adapter
-  in `internal/scaleset` is the only place that compiles against it, so
+- **`actions/scaleset`**: a public preview API, so version bumps are
+  migration work, not mechanical — v0.5.0 replaced the three-method
+  `listener.Scaler` with a single `Scale(ctx, message)` and moved job
+  acquisition, statistics caching, and dispatch into the adapter. Read
+  the upstream changelog before bumping; the adapter in
+  `internal/scaleset` is the only place that compiles against it, so
   interface drift is contained.
 - **Automated dependency updates**: Dependabot updates `go.mod`/`go.sum`
-  and `.github/workflows/` weekly. It does not update the `go` directive in
-  `go.mod`, `runner.version`/`runner.sha256`, or the `actionlint` and
-  `govulncheck` `@version` pins in `ci.yml`; bump those manually. The
-  `actions/scaleset` preview pin is isolated in its own Dependabot group.
+  and `.github/workflows/` weekly, including the `go` directive when a
+  dependency requires a newer Go (`actions/scaleset` v0.5.0 forced
+  1.27.3). It does not update `runner.version`/`runner.sha256`, or the
+  `actionlint` and `govulncheck` `@version` pins in `ci.yml`; bump those
+  manually. The `actions/scaleset` preview pin is isolated in its own
+  Dependabot group.
 
 ## Development
 
@@ -837,8 +842,8 @@ executable systemd smoke test and detailed canary/soak procedure are in
   resource limits nor restart adoption: process tracking lives only in
   memory. Stop its runners before restarting the daemon or changing
   backends against the same state directory.
-- **Preview client pin.** `actions/scaleset` v0.4.0 is a preview API;
-  the pin is deliberate and the adapter absorbs drift.
+- **Preview client.** `actions/scaleset` is a preview API; version bumps
+  are migrations absorbed entirely by the adapter.
 - **JIT value crosses `ps`.** The official `run.sh --jitconfig <value>`
   interface retains the value in arguments for the runner's lifetime.
   Credential delivery protects the source and unit definition; it does
