@@ -2,6 +2,10 @@ package scaleset
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"log/slog"
 	"sync"
@@ -16,7 +20,7 @@ import (
 // fakeSessionClient implements listener.Client offline: it long-polls with
 // (nil, nil) messages and reports a fixed TotalAssignedJobs. It also
 // implements Close so the adapter's graceful-shutdown session delete can be
-// observed.
+// observed, and AcquireJobs calls are recorded for acquisition tests.
 type fakeSessionClient struct {
 	totalAssigned int
 	getErr        error
@@ -24,8 +28,9 @@ type fakeSessionClient struct {
 	// time (nil, nil once drained).
 	messages []*scaleset.RunnerScaleSetMessage
 
-	mu     sync.Mutex
-	closed bool
+	mu       sync.Mutex
+	closed   bool
+	acquired [][]int64
 }
 
 func (f *fakeSessionClient) GetMessage(ctx context.Context, lastMessageID, maxCapacity int) (*scaleset.RunnerScaleSetMessage, error) {
@@ -43,7 +48,10 @@ func (f *fakeSessionClient) GetMessage(ctx context.Context, lastMessageID, maxCa
 func (f *fakeSessionClient) DeleteMessage(ctx context.Context, messageID int) error { return nil }
 
 func (f *fakeSessionClient) AcquireJobs(ctx context.Context, requestIDs []int64) ([]int64, error) {
-	return nil, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.acquired = append(f.acquired, requestIDs)
+	return requestIDs, nil
 }
 
 func (f *fakeSessionClient) Session() scaleset.RunnerScaleSetSession {
@@ -74,15 +82,21 @@ func fakeSession(c listener.Client) func(ctx context.Context, scaleSetID int, ow
 	return func(context.Context, int, string) (listener.Client, error) { return c, nil }
 }
 
-// TestNewOffline verifies New performs no network I/O: the upstream client
-// constructor only parses the URL and stores credentials, so a dummy PEM is
-// fine.
+// TestNewOffline verifies New performs no network I/O: the upstream
+// client constructor parses the URL and validates credentials — since
+// v0.5.0 it parses the App private key, so a real throwaway key is
+// required — without contacting GitHub.
 func TestNewOffline(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate RSA key: %v", err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
 	a, err := New(Config{
 		GitHubURL:      "https://github.com/test-org",
 		ClientID:       "Iv1.test",
 		InstallationID: 12345678,
-		PrivateKeyPEM:  "-----BEGIN RSA PRIVATE KEY-----\ndummy\n-----END RSA PRIVATE KEY-----",
+		PrivateKeyPEM:  string(pemBytes),
 		ScaleSetName:   "debian-host",
 		OwnerName:      "test-org",
 		MaxRunners:     4,
@@ -100,7 +114,7 @@ func TestNewOffline(t *testing.T) {
 	}
 }
 
-func TestHandleDesiredRunnerCountClamps(t *testing.T) {
+func TestScaleClampsDesiredCount(t *testing.T) {
 	tests := []struct {
 		name string
 		min  int
@@ -123,12 +137,12 @@ func TestHandleDesiredRunnerCountClamps(t *testing.T) {
 				cfg: Config{MinRunners: tt.min, MaxRunners: tt.max},
 				ev:  Events{Desired: func(n int) { fired = append(fired, n) }},
 			}
-			got, err := a.HandleDesiredRunnerCount(context.Background(), tt.in)
+			err := a.Scale(context.Background(), &scaleset.RunnerScaleSetMessage{
+				MessageID:  1,
+				Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: tt.in},
+			})
 			if err != nil {
-				t.Fatalf("HandleDesiredRunnerCount error: %v", err)
-			}
-			if got != tt.want {
-				t.Errorf("returned %d, want %d", got, tt.want)
+				t.Fatalf("Scale error: %v", err)
 			}
 			if len(fired) != 1 || fired[0] != tt.want {
 				t.Errorf("ev.Desired fired with %v, want [%d]", fired, tt.want)
@@ -137,7 +151,40 @@ func TestHandleDesiredRunnerCountClamps(t *testing.T) {
 	}
 }
 
-func TestHandleJobMessages(t *testing.T) {
+// TestScaleNilPollReEmitsCachedCount: nil-message polls (long-poll
+// timeouts) re-emit the desired count from the cached statistics, the
+// idle-convergence behavior the v0.4.0 listener provided internally. A
+// real message without statistics falls back to the same cache.
+func TestScaleNilPollReEmitsCachedCount(t *testing.T) {
+	var fired []int
+	a := &Adapter{
+		cfg: Config{MinRunners: 0, MaxRunners: 5},
+		ev:  Events{Desired: func(n int) { fired = append(fired, n) }},
+	}
+	if err := a.Scale(context.Background(), &scaleset.RunnerScaleSetMessage{
+		MessageID:  1,
+		Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 3},
+	}); err != nil {
+		t.Fatalf("Scale error: %v", err)
+	}
+	if err := a.Scale(context.Background(), nil); err != nil {
+		t.Fatalf("Scale(nil) error: %v", err)
+	}
+	if err := a.Scale(context.Background(), &scaleset.RunnerScaleSetMessage{MessageID: 2}); err != nil {
+		t.Fatalf("Scale error: %v", err)
+	}
+	if len(fired) != 3 || fired[0] != 3 || fired[1] != 3 || fired[2] != 3 {
+		t.Fatalf("ev.Desired fired %v, want [3 3 3]", fired)
+	}
+
+	// Before any statistics arrive, a nil poll must not fire anything.
+	fresh := &Adapter{cfg: Config{MinRunners: 0, MaxRunners: 5}}
+	if err := fresh.Scale(context.Background(), nil); err != nil {
+		t.Fatalf("Scale(nil) error: %v", err)
+	}
+}
+
+func TestScaleForwardsJobMessages(t *testing.T) {
 	var started, ended []Job
 	a := &Adapter{ev: Events{
 		JobStart: func(j Job) { started = append(started, j) },
@@ -147,24 +194,30 @@ func TestHandleJobMessages(t *testing.T) {
 	assign := time.Now()
 	finish := assign.Add(90 * time.Second)
 
-	if err := a.HandleJobStarted(context.Background(), &scaleset.JobStarted{
-		RunnerName: "debian-host-0001-x7f3",
-		JobMessageBase: scaleset.JobMessageBase{
-			JobID:            "123",
-			JobWorkflowRef:   ref,
-			WorkflowRunID:    77,
-			EventName:        "push",
-			RunnerAssignTime: assign,
-		},
+	if err := a.Scale(context.Background(), &scaleset.RunnerScaleSetMessage{
+		MessageID: 1,
+		JobStartedMessages: []*scaleset.JobStarted{{
+			RunnerName: "debian-host-0001-x7f3",
+			JobMessageBase: scaleset.JobMessageBase{
+				JobID:            "123",
+				JobWorkflowRef:   ref,
+				WorkflowRunID:    77,
+				EventName:        "push",
+				RunnerAssignTime: assign,
+			},
+		}},
 	}); err != nil {
-		t.Fatalf("HandleJobStarted error: %v", err)
+		t.Fatalf("Scale error: %v", err)
 	}
-	if err := a.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{
-		RunnerName:     "debian-host-0001-x7f3",
-		Result:         "success",
-		JobMessageBase: scaleset.JobMessageBase{JobWorkflowRef: ref, FinishTime: finish},
+	if err := a.Scale(context.Background(), &scaleset.RunnerScaleSetMessage{
+		MessageID: 2,
+		JobCompletedMessages: []*scaleset.JobCompleted{{
+			RunnerName:     "debian-host-0001-x7f3",
+			Result:         "success",
+			JobMessageBase: scaleset.JobMessageBase{JobWorkflowRef: ref, FinishTime: finish},
+		}},
 	}); err != nil {
-		t.Fatalf("HandleJobCompleted error: %v", err)
+		t.Fatalf("Scale error: %v", err)
 	}
 
 	if len(started) != 1 {
@@ -181,6 +234,38 @@ func TestHandleJobMessages(t *testing.T) {
 	e := ended[0]
 	if e.Result != "success" || e.WorkflowRef != ref || !e.FinishTime.Equal(finish) {
 		t.Errorf("JobEnd payload = %+v", e)
+	}
+}
+
+// TestScaleAcquiresAvailableJobs: v0.5.0 makes the scaler acquire
+// available jobs itself; the service never assigns unacquired jobs, so
+// every request ID must reach the session client. Nil entries are
+// skipped, and acquisition without a live session (Scale called outside
+// Run) errors instead of silently dropping jobs.
+func TestScaleAcquiresAvailableJobs(t *testing.T) {
+	fake := &fakeSessionClient{}
+	a := &Adapter{session: fake}
+	msg := &scaleset.RunnerScaleSetMessage{
+		MessageID: 5,
+		JobAvailableMessages: []*scaleset.JobAvailable{
+			{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 11}},
+			nil,
+			{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 12}},
+		},
+	}
+	if err := a.Scale(context.Background(), msg); err != nil {
+		t.Fatalf("Scale error: %v", err)
+	}
+	fake.mu.Lock()
+	got := append([][]int64(nil), fake.acquired...)
+	fake.mu.Unlock()
+	if len(got) != 1 || len(got[0]) != 2 || got[0][0] != 11 || got[0][1] != 12 {
+		t.Fatalf("AcquireJobs calls = %v, want one call with [11 12]", got)
+	}
+
+	bare := &Adapter{}
+	if err := bare.Scale(context.Background(), msg); err == nil {
+		t.Fatal("Scale without a session must error on available jobs")
 	}
 }
 
@@ -206,28 +291,45 @@ func TestQueuedRefsEmitted(t *testing.T) {
 	}
 }
 
-func TestNilMessageRejected(t *testing.T) {
-	a := &Adapter{}
-	if err := a.HandleJobStarted(context.Background(), nil); err == nil {
-		t.Error("nil JobStarted must error, got nil")
+// TestScaleSkipsNilJobEntries: the v0.5.0 listener acks only after
+// Scale returns nil, so nil entries inside a message are skipped rather
+// than failed — an error would leave the message unacked and redeliver
+// the same poison message forever. Valid entries still fire.
+func TestScaleSkipsNilJobEntries(t *testing.T) {
+	var fired []string
+	a := &Adapter{ev: Events{
+		JobStart: func(Job) { fired = append(fired, "start") },
+		JobEnd:   func(Job) { fired = append(fired, "end") },
+	}}
+	err := a.Scale(context.Background(), &scaleset.RunnerScaleSetMessage{
+		MessageID:            3,
+		JobStartedMessages:   []*scaleset.JobStarted{nil, {RunnerName: "r"}},
+		JobCompletedMessages: []*scaleset.JobCompleted{{RunnerName: "r", Result: "ok"}, nil},
+	})
+	if err != nil {
+		t.Fatalf("Scale error: %v", err)
 	}
-	if err := a.HandleJobCompleted(context.Background(), nil); err == nil {
-		t.Error("nil JobCompleted must error, got nil")
+	if len(fired) != 2 || fired[0] != "start" || fired[1] != "end" {
+		t.Fatalf("events fired %v, want one start then one end", fired)
 	}
 }
 
 // TestNilEventsSafe verifies that an Adapter with no event callbacks never
 // panics on any Scaler call or session-event path.
 func TestNilEventsSafe(t *testing.T) {
-	a := &Adapter{cfg: Config{MinRunners: 1, MaxRunners: 4}}
-	if _, err := a.HandleDesiredRunnerCount(context.Background(), 3); err != nil {
-		t.Fatalf("HandleDesiredRunnerCount error: %v", err)
+	a := &Adapter{cfg: Config{MinRunners: 1, MaxRunners: 4}, session: &fakeSessionClient{}}
+	err := a.Scale(context.Background(), &scaleset.RunnerScaleSetMessage{
+		MessageID:            1,
+		Statistics:           &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 3},
+		JobStartedMessages:   []*scaleset.JobStarted{{RunnerName: "r"}},
+		JobCompletedMessages: []*scaleset.JobCompleted{{RunnerName: "r", Result: "ok"}},
+		JobAvailableMessages: []*scaleset.JobAvailable{{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 9}}},
+	})
+	if err != nil {
+		t.Fatalf("Scale error: %v", err)
 	}
-	if err := a.HandleJobStarted(context.Background(), &scaleset.JobStarted{RunnerName: "r"}); err != nil {
-		t.Fatalf("HandleJobStarted error: %v", err)
-	}
-	if err := a.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: "r", Result: "ok"}); err != nil {
-		t.Fatalf("HandleJobCompleted error: %v", err)
+	if err := a.Scale(context.Background(), nil); err != nil {
+		t.Fatalf("Scale(nil) error: %v", err)
 	}
 
 	// Session-event paths must not panic with a nil ev.Session.
